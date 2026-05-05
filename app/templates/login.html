@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Login - Betfair Scripts Hub{% endblock %}
+{% block content %}
+<section class="login-panel">
+  <div class="login-card">
+    <div class="eyebrow">Operations</div>
+    <h1>Betfair Scripts Hub</h1>
+    <p>Run operational checks, scrapers and monitoring tools from one place.</p>
+    {% if password_missing %}
+    <div class="warning">APP_PASSWORD is not configured. Local development access is open.</div>
+    <a class="button button-primary" href="/">Continue</a>
+    {% else %}
+    <form method="post" action="/login" class="form-stack">
+      <label for="password">Shared password</label>
+      <input id="password" name="password" type="password" autofocus>
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+      <button class="button button-primary" type="submit">Sign in</button>
+    </form>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

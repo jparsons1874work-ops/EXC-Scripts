@@ -1,0 +1,28 @@
+<div class="metric-row">
+  <div class="metric">
+    <span class="metric-label">Not Matching</span>
+    <span class="metric-value">{{ cricket.mismatch_count }}</span>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Match</th>
+        <th>Betfair Time</th>
+        <th>Decimal Time</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in cricket.rows %}
+      <tr>
+        <td>{{ row.status }}</td>
+        <td>{{ row.match }}</td>
+        <td>{{ row.betfair_time }}</td>
+        <td>{{ row.decimal_time }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

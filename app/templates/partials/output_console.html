@@ -1,0 +1,7 @@
+{% if cricket %}
+  {% include "partials/cricket_time_table.html" %}
+{% endif %}
+<div class="console">{{ state.output_lines[-500:]|join('\n') if state.output_lines else 'No output yet.' }}</div>
+{% if state.message %}
+<div class="message">{{ state.message }}</div>
+{% endif %}

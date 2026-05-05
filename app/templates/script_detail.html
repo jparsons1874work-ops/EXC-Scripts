@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header">
+  <div>
+    <h1>{{ spec.name }}</h1>
+    <p>{{ spec.description }}</p>
+  </div>
+  <div id="status-badge" hx-get="/scripts/{{ spec.id }}/status" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "partials/status_badge.html" %}
+  </div>
+</header>
+
+<section class="detail-layout">
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Run Controls</h2>
+      {% if spec.long_running and window_label %}
+      <span class="meta">Allowed window: {{ window_label }}</span>
+      {% endif %}
+    </div>
+    {% if spec.long_running and not allowed %}
+    <div class="warning">This long-running script cannot be started outside its configured run window.</div>
+    {% endif %}
+    <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
+      {% if spec.needs_parameters %}
+      <label for="signal_source">Signal source</label>
+      <select id="signal_source" name="signal_source">
+        <option value="polymarket">polymarket</option>
+        <option value="kalshi">kalshi</option>
+      </select>
+      <label for="identifier">Identifier / URL / ticker</label>
+      <input id="identifier" name="identifier" type="text" placeholder="Event slug, Kalshi URL, or ticker">
+      {% endif %}
+      <button class="button button-primary" type="submit" {% if state.status == "Running" or state.status == "Stopping" %}disabled{% endif %}>Start</button>
+    </form>
+    <form method="post" action="/scripts/{{ spec.id }}/stop" class="controls">
+      <button class="button button-danger" type="submit" {% if state.status != "Running" and state.status != "Stopping" %}disabled{% endif %}>Stop</button>
+    </form>
+    <div class="script-path">{{ spec.relative_path }}</div>
+  </div>
+
+  <div class="panel output-panel" id="script-output" hx-get="/scripts/{{ spec.id }}/output" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "partials/output_console.html" %}
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Betfair Scripts Hub{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/css/app.css') }}">
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <script defer src="{{ url_for('static', path='/js/app.js') }}"></script>
+  </head>
+  <body>
+    <div class="shell">
+      {% if authenticated %}
+      <aside class="sidebar">
+        <a class="brand" href="/">
+          <span class="brand-mark"></span>
+          <span>Scripts Hub</span>
+        </a>
+        <nav class="nav">
+          {% for category in categories %}
+          <div class="nav-group">
+            <div class="nav-heading">{{ category }}</div>
+            {% for item in scripts if item.category == category %}
+            <a class="nav-link" href="/scripts/{{ item.id }}">{{ item.name }}</a>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        </nav>
+      </aside>
+      {% endif %}
+      <main class="main">
+        {% if authenticated %}
+        <div class="topbar">
+          {% if password_missing %}
+          <div class="warning">APP_PASSWORD is not configured. Local development access is open.</div>
+          {% endif %}
+          <form method="post" action="/logout">
+            <button class="button button-ghost" type="submit">Logout</button>
+          </form>
+        </div>
+        {% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>
