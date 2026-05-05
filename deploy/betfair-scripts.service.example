@@ -1,0 +1,16 @@
+[Unit]
+Description=Betfair Scripts Hub
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/betfair-scripts
+EnvironmentFile=/opt/betfair-scripts/.env
+Environment=PATH=/opt/betfair-scripts/.venv/bin
+ExecStart=/opt/betfair-scripts/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
