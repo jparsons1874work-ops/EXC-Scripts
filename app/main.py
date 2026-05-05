@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
-from app.config import APP_DIR, PROJECT_ROOT, app_password, ensure_runtime_dirs
+from app.config import APP_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
 from app.parsers import parse_cricket_time_check_output
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.runner import RUNNING, default_args_for, runner
@@ -39,6 +39,7 @@ def template_context(request: Request, **extra):
         "categories": CATEGORIES,
         "password_missing": not password_configured(),
         "authenticated": is_authenticated(request),
+        "assets": branding_assets(),
     }
     context.update(extra)
     return context

@@ -1,7 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
 <header class="page-header">
-  <div>
+  <div class="page-title-block">
+    {% if assets.logo %}
+    <img class="header-logo compact" src="{{ assets.logo }}" alt="Betfair">
+    {% endif %}
     <h1>{{ spec.name }}</h1>
     <p>{{ spec.description }}</p>
   </div>

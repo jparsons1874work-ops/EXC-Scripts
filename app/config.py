@@ -14,6 +14,7 @@ RUNTIME_DIR = PROJECT_ROOT / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
 OUTPUT_DIR = RUNTIME_DIR / "output"
 SECRET_RUNTIME_DIR = RUNTIME_DIR / "secrets"
+STATIC_IMG_DIR = APP_DIR / "static" / "img"
 
 SECRET_KEYS = (
     "BETFAIR_USERNAME",
@@ -82,3 +83,20 @@ def child_environment() -> dict[str, str]:
     env.setdefault("CHROME_PROFILE_DIR", str(OUTPUT_DIR / "chrome_profile"))
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
+
+
+def branding_assets() -> dict[str, str]:
+    """Return approved static branding asset URLs for files that exist locally."""
+    assets: dict[str, str] = {}
+    candidates = {
+        "logo": ("betfair-logo.svg", "betfair-logo.png"),
+        "arrows": ("betfair-arrows.svg", "betfair-arrows.png"),
+        "hero_bg": ("hero-bg.png",),
+        "favicon": ("favicon.ico", "favicon.png"),
+    }
+    for key, names in candidates.items():
+        for name in names:
+            if (STATIC_IMG_DIR / name).exists():
+                assets[key] = f"/static/img/{name}"
+                break
+    return assets

@@ -1,10 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
 <header class="page-header">
-  <div>
+  <div class="page-title-block">
+    {% if assets.logo %}
+    <img class="header-logo" src="{{ assets.logo }}" alt="Betfair">
+    {% endif %}
     <h1>Betfair Scripts Hub</h1>
     <p>Run operational checks, scrapers and monitoring tools from one place.</p>
   </div>
+  {% if assets.arrows %}
+  <img class="header-arrows" src="{{ assets.arrows }}" alt="" aria-hidden="true">
+  {% endif %}
 </header>
 
 {% for category in categories %}
@@ -15,7 +21,10 @@
     {% set state = states[spec.id] %}
     <a class="script-card" href="/scripts/{{ spec.id }}">
       <div class="card-top">
-        <h3>{{ spec.name }}</h3>
+        <div>
+          <span class="card-category">{{ spec.category }}</span>
+          <h3>{{ spec.name }}</h3>
+        </div>
         {% include "partials/status_badge.html" %}
       </div>
       <p>{{ spec.description }}</p>

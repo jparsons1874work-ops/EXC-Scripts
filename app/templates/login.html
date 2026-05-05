@@ -3,6 +3,14 @@
 {% block content %}
 <section class="login-panel">
   <div class="login-card">
+    <div class="login-brand">
+      {% if assets.logo %}
+      <img class="login-logo" src="{{ assets.logo }}" alt="Betfair">
+      {% else %}
+      <span class="brand-mark"></span>
+      <span class="fallback-logo-text">Betfair Scripts Hub</span>
+      {% endif %}
+    </div>
     <div class="eyebrow">Operations</div>
     <h1>Betfair Scripts Hub</h1>
     <p>Run operational checks, scrapers and monitoring tools from one place.</p>
