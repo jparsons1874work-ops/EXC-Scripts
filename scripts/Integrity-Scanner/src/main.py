@@ -24,6 +24,8 @@ alerted_matches: set[tuple[str, str]] = set()
 notifier: SlackNotifier | None = None
 consecutive_failures: int = 0
 persistent_issue_alert_sent: bool = False
+TENNIS_SLACK_ENV = "TENNIS_INTEGRITY_SLACK_WEBHOOK_URL"
+FALLBACK_SLACK_ENV = "SLACK_WEBHOOK_URL"
 
 
 def _resolve_path(preferred_relative_path: str, fallback_relative_path: str) -> str:
@@ -68,6 +70,7 @@ def load_config(config_path: str = "config/credentials.json") -> dict:
         os.path.abspath(os.path.join(script_dir, "..", config_path)),
     ]
 
+    tennis_webhook_url = os.getenv(TENNIS_SLACK_ENV, "").strip() or os.getenv(FALLBACK_SLACK_ENV, "").strip()
     env_config = {
         "betfair": {
             "username": os.getenv("BETFAIR_USERNAME", ""),
@@ -75,9 +78,9 @@ def load_config(config_path: str = "config/credentials.json") -> dict:
             "app_key": os.getenv("BETFAIR_APP_KEY", ""),
             "certs_path": os.getenv("BETFAIR_CERTS_DIR", ""),
         },
-        "slack": {"webhook_url": os.getenv("SLACK_WEBHOOK_URL", "")},
+        "slack": {"webhook_url": tennis_webhook_url},
     }
-    if all(env_config["betfair"].values()) and env_config["slack"]["webhook_url"]:
+    if all(env_config["betfair"].values()):
         return env_config
 
     config_file = next((path for path in config_candidates if os.path.exists(path)), None)
@@ -89,9 +92,11 @@ def load_config(config_path: str = "config/credentials.json") -> dict:
 
     try:
         with open(config_file, encoding="utf-8") as file_handle:
-            return json.load(file_handle)
+            config = json.load(file_handle)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in configuration file '{config_file}': {exc}") from exc
+    config.setdefault("slack", {})["webhook_url"] = tennis_webhook_url
+    return config
 
 
 def run_scan(
@@ -311,7 +316,11 @@ def main():
 
     webhook_url = slack_config.get("webhook_url")
     if not webhook_url:
-        main_logger.error("Missing required Slack config field: webhook_url")
+        main_logger.error(
+            "Missing Slack webhook for Tennis - Integrity Check. Set %s, or set %s as a backwards-compatible fallback.",
+            TENNIS_SLACK_ENV,
+            FALLBACK_SLACK_ENV,
+        )
         sys.exit(1)
 
     data_path = _resolve_path("data/integrity_list.xlsx", os.path.join("..", "data", "integrity_list.xlsx"))

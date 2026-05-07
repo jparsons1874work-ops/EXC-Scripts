@@ -26,7 +26,7 @@ class SlackNotifier:
         """
         self.webhook_url = webhook_url
         if webhook_url and not webhook_url.startswith(self.SLACK_WEBHOOK_PREFIX):
-            logger.warning("Slack webhook URL does not look valid: %s", webhook_url)
+            logger.warning("Slack webhook URL does not look valid.")
 
     def send_message(self, text: str) -> bool:
         """Send a simple text message to Slack.
@@ -218,16 +218,20 @@ class SlackNotifier:
 
 if __name__ == "__main__":
     import json
+    import os
     from datetime import datetime, timezone
 
-    # Load webhook URL from credentials
     with Path("config/credentials.json").open(encoding="utf-8") as file_handle:
         creds = json.load(file_handle)
 
-    webhook_url = creds["slack"]["webhook_url"]
+    webhook_url = (
+        os.getenv("TENNIS_INTEGRITY_SLACK_WEBHOOK_URL", "").strip()
+        or os.getenv("SLACK_WEBHOOK_URL", "").strip()
+        or creds.get("slack", {}).get("webhook_url", "")
+    )
 
-    if not webhook_url or webhook_url == "YOUR_SLACK_WEBHOOK_URL":
-        print("Please configure your Slack webhook URL in config/credentials.json")
+    if not webhook_url:
+        print("Please set TENNIS_INTEGRITY_SLACK_WEBHOOK_URL, or SLACK_WEBHOOK_URL as the fallback.")
     else:
         notifier = SlackNotifier(webhook_url)
 

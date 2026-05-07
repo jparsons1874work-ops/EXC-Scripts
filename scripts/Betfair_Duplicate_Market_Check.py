@@ -36,7 +36,7 @@ BETFAIR_APP_KEY_PLACEHOLDER = "YOUR_BETFAIR_APP_KEY"
 # Scripts/Integrity-Scanner/certs
 BETFAIR_CERTS_DIR_PLACEHOLDER = ""
 
-# Optional. Leave blank to load from local JSON or environment:
+# Optional. Leave blank to load from environment:
 SLACK_WEBHOOK_URL_PLACEHOLDER = ""
 
 BETFAIR_CERTS_DIR = Path(
@@ -173,25 +173,24 @@ def resolve_path(value: str, base_dir: Path) -> str:
     return str(path)
 
 
+def duplicate_slack_webhook_url() -> tuple[str, str]:
+    specific = os.getenv("DUPE_MATCH_SLACK_WEBHOOK_URL", "").strip()
+    if specific:
+        return specific, "DUPE_MATCH_SLACK_WEBHOOK_URL"
+    fallback = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if fallback:
+        return fallback, "SLACK_WEBHOOK_URL"
+    return "", "not configured"
+
+
 def load_config() -> Config:
     market_config_paths = [
         SCRIPT_DIR / "Betfair_Duplicate_Market_Check.local.json",
         SCRIPT_MANAGER_ROOT / "betfair_duplicate_market_check.local.json",
     ]
-    match_config_paths = [
-        SCRIPT_DIR / "Betfair_Duplicate_Match_Check.local.json",
-        SCRIPT_MANAGER_ROOT / "betfair_duplicate_match_check.local.json",
-    ]
     market_config_sources = [(str(path), read_json(path)) for path in market_config_paths]
-    match_config_sources = [(str(path), read_json(path)) for path in match_config_paths]
 
-    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-    slack_config_source = "SLACK_WEBHOOK_URL" if slack_webhook_url else ""
-    if not slack_webhook_url:
-        slack_webhook_url, slack_config_source = first_config_value_with_source(
-            [*market_config_sources, *match_config_sources],
-            [("slack", "webhook_url")],
-        )
+    slack_webhook_url, slack_config_source = duplicate_slack_webhook_url()
     if not slack_webhook_url:
         slack_webhook_url = SLACK_WEBHOOK_URL_PLACEHOLDER.strip()
         slack_config_source = "placeholders" if slack_webhook_url else "not configured"
@@ -717,8 +716,8 @@ def format_slack_message(group: DuplicateMarketGroup) -> str:
 def send_slack_message(webhook_url: str, text: str) -> None:
     if is_placeholder(webhook_url):
         raise RuntimeError(
-            "Slack webhook is not configured. Set SLACK_WEBHOOK_URL, create "
-            "Betfair_Duplicate_Market_Check.local.json, or configure the existing duplicate match checker local JSON."
+            "Slack webhook is not configured for Betfair duplicate checks. "
+            "Set DUPE_MATCH_SLACK_WEBHOOK_URL, or set SLACK_WEBHOOK_URL as a backwards-compatible fallback."
         )
     response = requests.post(webhook_url, json={"text": text}, timeout=15)
     if response.status_code >= 400:

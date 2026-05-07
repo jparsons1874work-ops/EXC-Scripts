@@ -37,7 +37,9 @@ Required values depend on which scripts you run:
 - `APP_PASSWORD` protects the app. If absent, local dev is allowed with a visible warning.
 - Betfair scripts need `BETFAIR_USERNAME`, `BETFAIR_PASSWORD`, `BETFAIR_APP_KEY`, and cert/key file paths or B64 cert values.
 - Decimal scripts need `DECIMAL_USERNAME` and `DECIMAL_PASSWORD`.
-- Slack notifications need `SLACK_WEBHOOK_URL` or bot token/channel values, depending on the script.
+- Tennis integrity Slack notifications use `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the tennis-specific value is missing.
+- Betfair duplicate match and duplicate market Slack notifications use `DUPE_MATCH_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the duplicate-specific value is missing.
+- Other Slack integrations may use `SLACK_WEBHOOK_URL` or bot token/channel values, depending on the script.
 
 ## Run Locally
 

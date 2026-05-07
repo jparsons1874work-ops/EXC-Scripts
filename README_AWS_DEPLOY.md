@@ -85,8 +85,17 @@ DECIMAL_USERNAME=
 DECIMAL_PASSWORD=
 SLACK_BOT_TOKEN=
 SLACK_CHANNEL=
+TENNIS_INTEGRITY_SLACK_WEBHOOK_URL=
+DUPE_MATCH_SLACK_WEBHOOK_URL=
 SLACK_WEBHOOK_URL=
 ```
+
+Slack webhook routing:
+
+- Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
+- Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
+- Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
+- Keep the Tennis Integrity and Duplicate Matches webhook values separate so alerts do not cross channels.
 
 Betfair certificate options:
 

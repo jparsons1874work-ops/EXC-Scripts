@@ -30,7 +30,7 @@ PROJECT_DIR = SCRIPT_DIR.parent
 # =============================================================================
 # Safer options are still supported:
 # - Environment variables: BETFAIR_USERNAME, BETFAIR_PASSWORD, BETFAIR_APP_KEY,
-#   BETFAIR_CERTS_DIR, SLACK_WEBHOOK_URL
+#   BETFAIR_CERTS_DIR, DUPE_MATCH_SLACK_WEBHOOK_URL
 # - Local ignored file: Scripts/Betfair_Duplicate_Match_Check.local.json
 #
 # If you prefer editing this file directly, replace these placeholder strings.
@@ -193,6 +193,10 @@ def configured_value(value: str) -> str:
     return stripped
 
 
+def duplicate_slack_webhook_url() -> str:
+    return os.getenv("DUPE_MATCH_SLACK_WEBHOOK_URL", "").strip() or os.getenv("SLACK_WEBHOOK_URL", "").strip()
+
+
 def resolve_path(value: str, base_dir: Path) -> str:
     if not value:
         return ""
@@ -236,11 +240,7 @@ def load_config() -> Config:
         or first_config_value(betfair_configs, [("betfair", "certs_path")])
         or str(BETFAIR_CERTS_DIR)
     )
-    slack_webhook_url = (
-        os.getenv("SLACK_WEBHOOK_URL", "").strip()
-        or configured_value(SLACK_WEBHOOK_URL_PLACEHOLDER)
-        or first_config_value(local_configs, [("slack", "webhook_url")])
-    )
+    slack_webhook_url = duplicate_slack_webhook_url()
 
     return Config(
         betfair_username=username,
@@ -646,7 +646,10 @@ def format_slack_message(pair: DuplicatePair) -> str:
 
 def send_slack_message(webhook_url: str, text: str) -> None:
     if is_placeholder(webhook_url):
-        raise RuntimeError("Slack webhook is not configured. Set SLACK_WEBHOOK_URL or a local config value.")
+        raise RuntimeError(
+            "Slack webhook is not configured for Betfair duplicate checks. "
+            "Set DUPE_MATCH_SLACK_WEBHOOK_URL, or set SLACK_WEBHOOK_URL as a backwards-compatible fallback."
+        )
     response = requests.post(webhook_url, json={"text": text}, timeout=15)
     if response.status_code >= 400:
         raise RuntimeError(f"Slack webhook failed: status={response.status_code}, body={response.text}")
