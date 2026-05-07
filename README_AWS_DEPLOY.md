@@ -28,13 +28,28 @@ sudo apt update
 sudo apt install -y git python3 python3-venv python3-pip curl ca-certificates
 ```
 
-Selenium/Chrome scripts may need browser dependencies:
+Selenium/Chrome scripts, including Cricket - Time Check Today/Tomorrow, need Google Chrome and headless browser dependencies:
 
 ```bash
-sudo apt install -y chromium-browser chromium-chromedriver
+sudo apt install -y \
+  fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 \
+  libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
+  libpango-1.0-0 libu2f-udev libvulkan1 libx11-6 libxcb1 libxcomposite1 \
+  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 wget xdg-utils
+
+wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt install -y /tmp/google-chrome.deb
+google-chrome --version
 ```
 
-Ubuntu package names vary by image. If Chromium packages are unavailable, install Google Chrome stable and ensure a matching ChromeDriver is on `PATH`.
+The cricket time checker first looks for `google-chrome`, then uses a configured or system ChromeDriver if available. If there is no `chromedriver` on `PATH`, Selenium Manager will try to manage the driver. To verify browser discovery without logging into Betfair or Decimal:
+
+```bash
+cd /opt/betfair-scripts
+/opt/betfair-scripts/.venv/bin/python scripts/exc-cric-time-check/betfair_decimal_time_checker.py --debug-browser
+```
+
+If Selenium Manager cannot fetch or start a driver on the server, install a matching ChromeDriver and set `CHROMEDRIVER_PATH` in `/opt/betfair-scripts/.env`.
 
 Install Nginx only when you are ready for the reverse proxy:
 

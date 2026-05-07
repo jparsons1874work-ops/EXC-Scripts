@@ -6,9 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
+import shutil
 import ssl
+import subprocess
 import sys
+import traceback
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -21,8 +25,9 @@ import pandas as pd
 from betfairlightweight import APIClient
 from betfairlightweight.filters import market_filter, price_projection
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver import ChromeOptions
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
@@ -106,6 +111,15 @@ DECIMAL_LEGACY_READY_ROOT_SELECTORS = (
 DECIMAL_HEADLESS = True
 DECIMAL_WAIT_SECONDS = 8
 DECIMAL_QUICK_WAIT_SECONDS = 2
+CHROME_BINARY_CANDIDATES = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "chrome",
+)
+CHROMEDRIVER_CANDIDATES = ("chromedriver",)
+SUPPORTED_LINUX_MACHINES = {"x86_64", "amd64"}
 
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
@@ -143,6 +157,10 @@ class MatchResult:
     time_matches: bool
 
 
+class DecimalScrapeError(RuntimeError):
+    """Raised when Decimal fixtures cannot be scraped reliably."""
+
+
 def validate_config() -> None:
     """Raise a friendly error if any required placeholder values remain."""
     config_values = {
@@ -172,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare Betfair Exchange and Decimal cricket fixture times."
     )
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--today", action="store_true", help="Check fixtures for today in UK time.")
     group.add_argument(
         "--tomorrow", action="store_true", help="Check fixtures for tomorrow in UK time."
@@ -183,13 +201,138 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write aligned columns for terminal viewing instead of TSV.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--debug-browser",
+        "--print-browser-env",
+        action="store_true",
+        help="Print Chrome, ChromeDriver, OS, and architecture diagnostics without logging into Betfair or Decimal.",
+    )
+    args = parser.parse_args()
+    if not args.debug_browser and not args.today and not args.tomorrow:
+        parser.error("one of --today or --tomorrow is required unless --debug-browser is used")
+    return args
 
 
 def verbose_log(enabled: bool, message: str) -> None:
     """Write a diagnostic message to stderr when verbose mode is enabled."""
     if enabled:
         print(message, file=sys.stderr)
+
+
+def run_command_text(command: list[str], timeout: int = 5) -> str:
+    """Run a diagnostic command and return one line of output without raising."""
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return f"unavailable ({type(exc).__name__}: {exc})"
+
+    output = (completed.stdout or completed.stderr or "").strip()
+    if not output:
+        return f"unavailable (exit code {completed.returncode})"
+    return output.splitlines()[0]
+
+
+def find_executable(candidates: Iterable[str]) -> str:
+    """Return the first executable found on PATH."""
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return ""
+
+
+def detect_chrome_binary() -> str:
+    """Return the configured or discovered Chrome/Chromium binary path."""
+    configured = os.getenv("CHROME_BINARY") or os.getenv("GOOGLE_CHROME_BIN") or os.getenv("CHROME_BIN")
+    if configured:
+        configured = configured.strip()
+        if os.path.isfile(configured) or shutil.which(configured):
+            return configured
+        raise RuntimeError("Google Chrome is not installed or not found. Install Chrome on the server.")
+    detected = find_executable(CHROME_BINARY_CANDIDATES)
+    if detected:
+        return detected
+    if platform.system().lower() == "windows":
+        windows_candidates = [
+            os.path.join(os.getenv("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+        for candidate in windows_candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+    raise RuntimeError("Google Chrome is not installed or not found. Install Chrome on the server.")
+
+
+def detect_chromedriver_binary() -> str:
+    """Return configured/system ChromeDriver path, or an empty string for Selenium Manager."""
+    configured = os.getenv("CHROMEDRIVER_PATH", "").strip()
+    if configured:
+        if os.path.isfile(configured) or shutil.which(configured):
+            return configured
+        raise RuntimeError(f"CHROMEDRIVER_PATH is set but not a file or executable on PATH: {configured}")
+    return find_executable(CHROMEDRIVER_CANDIDATES)
+
+
+def chrome_version(chrome_binary: str) -> str:
+    """Return detected Chrome version text."""
+    if platform.system().lower() == "windows" and os.path.isfile(chrome_binary):
+        escaped_path = chrome_binary.replace("'", "''")
+        version = run_command_text(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-Item -LiteralPath '{escaped_path}').VersionInfo.ProductVersion",
+            ]
+        )
+        if not version.startswith("unavailable"):
+            return version
+    return run_command_text([chrome_binary, "--version"])
+
+
+def browser_diagnostics(chrome_binary: str = "", chromedriver_binary: str = "") -> dict[str, str]:
+    """Collect non-secret browser and platform diagnostics."""
+    if not chrome_binary:
+        try:
+            chrome_binary = detect_chrome_binary()
+        except Exception as exc:
+            chrome_binary = f"not found ({exc})"
+    if not chromedriver_binary:
+        try:
+            chromedriver_binary = detect_chromedriver_binary() or "not found; Selenium Manager will be used"
+        except Exception as exc:
+            chromedriver_binary = f"not found ({exc})"
+
+    version = ""
+    if chrome_binary and not chrome_binary.startswith("not found"):
+        version = chrome_version(chrome_binary)
+
+    return {
+        "os": platform.platform(),
+        "system": platform.system(),
+        "machine": platform.machine() or "unknown",
+        "python": sys.version.replace("\n", " "),
+        "chrome_binary": chrome_binary or "not found",
+        "chrome_version": version or "unknown",
+        "chromedriver_binary": chromedriver_binary or "not found; Selenium Manager will be used",
+    }
+
+
+def format_browser_diagnostics(diagnostics: dict[str, str]) -> str:
+    """Format browser diagnostics for stderr/stdout."""
+    return "\n".join(f"{key}: {value}" for key, value in diagnostics.items())
+
+
+def print_browser_diagnostics() -> None:
+    """Print browser diagnostics without logging into Betfair or Decimal."""
+    print(format_browser_diagnostics(browser_diagnostics()))
 
 
 def requested_day(args: argparse.Namespace) -> date:
@@ -578,13 +721,22 @@ def fetch_betfair_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
 
 def build_chrome_driver() -> WebDriver:
     """Create a Chrome WebDriver instance."""
+    machine = (platform.machine() or "").lower()
+    if platform.system().lower() == "linux" and machine and machine not in SUPPORTED_LINUX_MACHINES:
+        raise RuntimeError(f"Unsupported Linux architecture for Chrome automation: {machine}")
+
+    chrome_binary = detect_chrome_binary()
+    chromedriver_binary = detect_chromedriver_binary()
     options = ChromeOptions()
+    options.binary_location = chrome_binary
     if DECIMAL_HEADLESS:
         options.add_argument("--headless=new")
     options.page_load_strategy = "eager"
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
     options.add_argument("--disable-background-networking")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-breakpad")
@@ -594,14 +746,23 @@ def build_chrome_driver() -> WebDriver:
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-sync")
     options.add_argument("--mute-audio")
-    options.add_argument("--window-size=1600,1200")
     options.add_experimental_option(
         "prefs",
         {
             "profile.default_content_setting_values.images": 2,
         },
     )
-    return webdriver.Chrome(options=options)
+    try:
+        if chromedriver_binary:
+            return webdriver.Chrome(service=Service(executable_path=chromedriver_binary), options=options)
+        return webdriver.Chrome(options=options)
+    except WebDriverException as exc:
+        diagnostics = format_browser_diagnostics(browser_diagnostics(chrome_binary, chromedriver_binary))
+        raise RuntimeError(
+            "ChromeDriver/Selenium Manager failed to start Chrome.\n"
+            f"{diagnostics}\n"
+            f"Root error: {exc}"
+        ) from exc
 
 
 def wait_for_first_present(
@@ -1461,7 +1622,11 @@ def fetch_decimal_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
     """Log into Decimal and scrape Legacy Developer fixture rows for the requested UK-local day."""
     verbose_log(verbose, f"Fetching Decimal fixtures for {target_day.isoformat()}")
     login_start = perf_counter()
-    driver = build_chrome_driver()
+    try:
+        driver = build_chrome_driver()
+    except Exception as exc:
+        raise DecimalScrapeError(f"Decimal browser startup failed: {exc}") from exc
+
     try:
         login_decimal(driver, verbose)
         verbose_log(verbose, f"Decimal login time: {perf_counter() - login_start:.2f}s")
@@ -1472,7 +1637,13 @@ def fetch_decimal_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
             verbose,
             f"Decimal Legacy Developer extraction time: {perf_counter() - extraction_start:.2f}s",
         )
+        if not fixtures:
+            raise DecimalScrapeError("Decimal scrape returned zero fixtures for the requested day.")
         return fixtures
+    except DecimalScrapeError:
+        raise
+    except Exception as exc:
+        raise DecimalScrapeError(f"Decimal fixture scrape failed: {exc}") from exc
     finally:
         driver.quit()
 
@@ -1541,8 +1712,83 @@ def match_fixtures(
     return results
 
 
-def print_results(results: list[MatchResult], pretty: bool = False) -> None:
+def comparison_counts(
+    betfair_fixtures: list[Fixture],
+    decimal_fixtures: list[Fixture],
+    results: list[MatchResult],
+) -> dict[str, int]:
+    """Return summary counts for the fixture comparison."""
+    matched_fixtures = sum(1 for result in results if result.decimal_fixture is not None)
+    unmatched_betfair = sum(1 for result in results if result.decimal_fixture is None)
+    return {
+        "betfair_fixtures": len(betfair_fixtures),
+        "decimal_fixtures": len(decimal_fixtures),
+        "matched_fixtures": matched_fixtures,
+        "unmatched_betfair_fixtures": unmatched_betfair,
+        "unmatched_decimal_fixtures": max(len(decimal_fixtures) - matched_fixtures, 0),
+    }
+
+
+def print_summary_counts(counts: dict[str, int], pretty: bool) -> None:
+    """Print comparison summary counts in TSV or aligned form."""
+    rows = [
+        ("Betfair Fixtures", counts["betfair_fixtures"]),
+        ("Decimal Fixtures", counts["decimal_fixtures"]),
+        ("Matched Fixtures", counts["matched_fixtures"]),
+        ("Unmatched Betfair Fixtures", counts["unmatched_betfair_fixtures"]),
+        ("Unmatched Decimal Fixtures", counts["unmatched_decimal_fixtures"]),
+    ]
+    if not pretty:
+        print("Scrape Status\tBetfair\tOK")
+        print("Scrape Status\tDecimal\tOK")
+        for label, value in rows:
+            print(f"{label}\t{value}")
+        return
+    print(f"{'Scrape Status':<26}  {'Betfair':<8}  OK")
+    print(f"{'Scrape Status':<26}  {'Decimal':<8}  OK")
+    for label, value in rows:
+        print(f"{label:<26}  {value}")
+
+
+def print_decimal_scrape_failure(
+    betfair_fixtures: list[Fixture],
+    root_error: Exception,
+    pretty: bool,
+) -> None:
+    """Print a top-level Decimal scrape failure instead of false fixture mismatches."""
+    root_message = str(root_error).replace("\n", " | ")
+    if not pretty:
+        print("Scrape Status\tBetfair\tOK")
+        print("Scrape Status\tDecimal\tFAILED")
+        print(f"Betfair Fixtures\t{len(betfair_fixtures)}")
+        print("Decimal Fixtures\t0")
+        print("Matched Fixtures\t0")
+        print(f"Unmatched Betfair Fixtures\t{len(betfair_fixtures)}")
+        print("Unmatched Decimal Fixtures\t0")
+        print("Failure\tDecimal fixture scrape failed; comparison not reliable.")
+        print(f"Root Error\t{root_message}")
+        return
+
+    print(f"{'Scrape Status':<26}  {'Betfair':<8}  OK")
+    print(f"{'Scrape Status':<26}  {'Decimal':<8}  FAILED")
+    print(f"{'Betfair Fixtures':<26}  {len(betfair_fixtures)}")
+    print(f"{'Decimal Fixtures':<26}  0")
+    print(f"{'Matched Fixtures':<26}  0")
+    print(f"{'Unmatched Betfair Fixtures':<26}  {len(betfair_fixtures)}")
+    print(f"{'Unmatched Decimal Fixtures':<26}  0")
+    print()
+    print("Decimal fixture scrape failed; comparison not reliable.")
+    print(f"Root Error: {root_message}")
+
+
+def print_results(
+    results: list[MatchResult],
+    betfair_fixtures: list[Fixture],
+    decimal_fixtures: list[Fixture],
+    pretty: bool = False,
+) -> None:
     """Print results to stdout as TSV or aligned columns."""
+    print_summary_counts(comparison_counts(betfair_fixtures, decimal_fixtures, results), pretty)
     not_matching_count = sum(
         1 for result in results
         if result.decimal_fixture is None or not result.time_matches
@@ -1615,20 +1861,33 @@ def main() -> int:
     args = parse_args()
     total_start = perf_counter()
     try:
+        if args.debug_browser:
+            print_browser_diagnostics()
+            return 0
+
         validate_config()
         target_day = requested_day(args)
         betfair_start = perf_counter()
         betfair_fixtures = fetch_betfair_fixtures(target_day, args.verbose)
         verbose_log(args.verbose, f"Betfair fetch time: {perf_counter() - betfair_start:.2f}s")
-        decimal_fixtures = fetch_decimal_fixtures(target_day, args.verbose)
+        try:
+            decimal_fixtures = fetch_decimal_fixtures(target_day, args.verbose)
+        except DecimalScrapeError as exc:
+            print_decimal_scrape_failure(betfair_fixtures, exc, pretty=args.pretty)
+            verbose_log(args.verbose, f"Total script runtime: {perf_counter() - total_start:.2f}s")
+            if args.verbose:
+                print(traceback.format_exc(limit=8), file=sys.stderr)
+            return 2
         results = match_fixtures(betfair_fixtures, decimal_fixtures, SIMILARITY_THRESHOLD)
-        print_results(results, pretty=args.pretty)
+        print_results(results, betfair_fixtures, decimal_fixtures, pretty=args.pretty)
         verbose_log(args.verbose, f"Total script runtime: {perf_counter() - total_start:.2f}s")
         return exit_code_for_results(results)
     except Exception as exc:
         verbose_log(args.verbose, f"Total script runtime: {perf_counter() - total_start:.2f}s")
         print(f"Error type: {type(exc).__name__}", file=sys.stderr)
         print(f"Error: {exc}", file=sys.stderr)
+        if args.verbose:
+            print(traceback.format_exc(limit=8), file=sys.stderr)
         return 2
 
 

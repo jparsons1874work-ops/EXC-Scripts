@@ -1,9 +1,29 @@
 <div class="metric-row">
+  {% if cricket.summary %}
+  <div class="metric">
+    <span class="metric-label">Betfair Fixtures</span>
+    <span class="metric-value">{{ cricket.summary.betfair_fixtures|default('0') }}</span>
+  </div>
+  <div class="metric">
+    <span class="metric-label">Decimal Fixtures</span>
+    <span class="metric-value">{{ cricket.summary.decimal_fixtures|default('0') }}</span>
+  </div>
+  <div class="metric">
+    <span class="metric-label">Matched</span>
+    <span class="metric-value">{{ cricket.summary.matched_fixtures|default('0') }}</span>
+  </div>
+  {% endif %}
   <div class="metric">
     <span class="metric-label">Not Matching</span>
     <span class="metric-value">{{ cricket.mismatch_count }}</span>
   </div>
 </div>
+{% if cricket.failure_message %}
+<div class="error">
+  {{ cricket.failure_message }}
+  {% if cricket.root_error %}<br>{{ cricket.root_error }}{% endif %}
+</div>
+{% else %}
 <div class="table-wrap">
   <table>
     <thead>
@@ -26,3 +46,4 @@
     </tbody>
   </table>
 </div>
+{% endif %}
