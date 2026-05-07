@@ -17,6 +17,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from difflib import SequenceMatcher
+from pathlib import Path
 from time import perf_counter
 from typing import Iterable, Optional
 from urllib.parse import urlencode
@@ -36,6 +37,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from zoneinfo import ZoneInfo
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = Path(SCRIPT_DIR).parents[1]
+DECIMAL_DEBUG_DIR = PROJECT_ROOT / "runtime" / "output" / "cricket_time_debug"
 DEFAULT_CERTS_DIR = os.getenv(
     "BETFAIR_CERTS_DIR",
     os.path.join(os.path.dirname(SCRIPT_DIR), "Integrity-Scanner", "certs"),
@@ -92,10 +95,20 @@ DECIMAL_LEGACY_DEVELOPER_SELECTORS = [
     ),
     (By.CSS_SELECTOR, "[href*='legacy' i]"),
 ]
-DECIMAL_LEGACY_ROW_SELECTOR = "a.list-group-item.list-group-item-action[data-id]"
+DECIMAL_LEGACY_ROW_SELECTOR = "a.list-group-item[data-id]"
+DECIMAL_LEGACY_CANDIDATE_SELECTOR = (
+    "a.list-group-item, .list-group-item, tr, [data-id], [data-name], "
+    "[class*='fixture' i], [class*='match' i], [class*='event' i], .card"
+)
 DECIMAL_LEGACY_TODAY_ROW_SELECTORS = (
     f"#Today_container {DECIMAL_LEGACY_ROW_SELECTOR}",
     f"#Today {DECIMAL_LEGACY_ROW_SELECTOR}",
+)
+DECIMAL_LEGACY_TOMORROW_ROW_SELECTORS = (
+    f"#Tomorrow_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#tomorrow_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#Tomorrow {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#tomorrow {DECIMAL_LEGACY_ROW_SELECTOR}",
 )
 DECIMAL_LEGACY_IN_PLAY_ROW_SELECTORS = (
     f"#running_container {DECIMAL_LEGACY_ROW_SELECTOR}",
@@ -104,8 +117,12 @@ DECIMAL_LEGACY_IN_PLAY_ROW_SELECTORS = (
 DECIMAL_LEGACY_READY_ROOT_SELECTORS = (
     "div.accordion#date",
     "#Today_container",
+    "#Tomorrow_container",
+    "#tomorrow_container",
     "#running_container",
     "#Today",
+    "#Tomorrow",
+    "#tomorrow",
     "#running",
 )
 DECIMAL_HEADLESS = True
@@ -207,6 +224,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print Chrome, ChromeDriver, OS, and architecture diagnostics without logging into Betfair or Decimal.",
     )
+    parser.add_argument(
+        "--debug-decimal",
+        action="store_true",
+        help="Print Decimal fixture scraping diagnostics and write safe debug artifacts under runtime/output.",
+    )
     args = parser.parse_args()
     if not args.debug_browser and not args.today and not args.tomorrow:
         parser.error("one of --today or --tomorrow is required unless --debug-browser is used")
@@ -217,6 +239,12 @@ def verbose_log(enabled: bool, message: str) -> None:
     """Write a diagnostic message to stderr when verbose mode is enabled."""
     if enabled:
         print(message, file=sys.stderr)
+
+
+def decimal_debug_log(enabled: bool, message: str) -> None:
+    """Write Decimal-specific diagnostics to stderr when requested."""
+    if enabled:
+        print(f"[decimal-debug] {message}", file=sys.stderr)
 
 
 def run_command_text(command: list[str], timeout: int = 5) -> str:
@@ -341,6 +369,16 @@ def requested_day(args: argparse.Namespace) -> date:
     if args.today:
         return now_uk.date()
     return (now_uk + timedelta(days=1)).date()
+
+
+def decimal_target_section(target_day: date) -> str:
+    """Return the Decimal accordion section expected for a UK-local target day."""
+    today_uk = datetime.now(UK_TZ).date()
+    if target_day == today_uk:
+        return "today"
+    if target_day == today_uk + timedelta(days=1):
+        return "tomorrow"
+    return "all"
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -1149,15 +1187,19 @@ def open_decimal_menu_item(
     raise RuntimeError(f"{description} could not be opened.") from last_error
 
 
-def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict[str, object]:
+def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verbose: bool) -> dict[str, object]:
     """Extract Decimal Legacy Developer fixtures using in-page JS."""
+    target_section = decimal_target_section(target_day)
     payload = driver.execute_async_script(
         """
         const done = arguments[arguments.length - 1];
         const rowSelector = arguments[0];
-        const todaySelectors = arguments[1];
-        const inPlaySelectors = arguments[2];
-        const readyRootSelectors = arguments[3];
+        const candidateSelector = arguments[1];
+        const todaySelectors = arguments[2];
+        const inPlaySelectors = arguments[3];
+        const tomorrowSelectors = arguments[4];
+        const readyRootSelectors = arguments[5];
+        const targetSection = arguments[6];
 
         const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
         const isVisible = (el) => {
@@ -1170,14 +1212,6 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
             return false;
           }
         };
-        const textEquals = (el, text) => clean(el && (el.innerText || el.textContent || "")) === text;
-        const pushUnique = (list, seen, value) => {
-          if (value && !seen.has(value)) {
-            seen.add(value);
-            list.push(value);
-          }
-        };
-
         const collectRoots = () => {
           const roots = [];
           const seen = new Set();
@@ -1260,18 +1294,24 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
         };
 
         const findSectionButton = (kind) => {
-          const exactText = kind === "today" ? "Today" : "In Play";
+          const exactText = kind === "today" ? "Today" : (kind === "tomorrow" ? "Tomorrow" : "In Play");
+          const textNeedle = exactText.toUpperCase();
           const targetSelector = kind === "today"
-            ? 'button[data-target="#Today"], button[data-bs-target="#Today"]'
-            : 'button[data-target="#running"], button[data-bs-target="#running"]';
+            ? 'button[data-target="#Today"], button[data-bs-target="#Today"], button[data-target*="today" i], button[data-bs-target*="today" i]'
+            : kind === "tomorrow"
+              ? 'button[data-target="#Tomorrow"], button[data-bs-target="#Tomorrow"], button[data-target="#tomorrow"], button[data-bs-target="#tomorrow"], button[data-target*="tomorrow" i], button[data-bs-target*="tomorrow" i]'
+              : 'button[data-target="#running"], button[data-bs-target="#running"], button[data-target*="running" i], button[data-bs-target*="running" i]';
           const direct = queryFirstDeep(targetSelector);
           if (direct) return direct;
-          return queryAllDeep("button").find((button) => textEquals(button, exactText)) || null;
+          return queryAllDeep("button,a,[role='button']").find((button) => {
+            const text = clean(button.innerText || button.textContent || "").toUpperCase();
+            return text === textNeedle || text.includes(textNeedle);
+          }) || null;
         };
 
         const querySectionRows = (selectors) => {
           for (const selector of selectors) {
-            const rows = queryAllDeep(selector).filter((row) => row && row.getAttribute("data-id"));
+            const rows = queryAllDeep(selector).filter((row) => row && (row.getAttribute("data-id") || row.getAttribute("data-name")));
             if (rows.length) return rows;
           }
           return [];
@@ -1279,7 +1319,7 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
 
         const findContainer = (selectors) => {
           for (const selector of selectors) {
-            const containerSelector = selector.replace(/\\s+a\\.list-group-item\\.list-group-item-action\\[data-id\\]$/, "");
+            const containerSelector = selector.split(/\\s+/)[0];
             const node = queryFirstDeep(containerSelector);
             if (node) return node;
           }
@@ -1290,8 +1330,10 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
           let current = row;
           while (current) {
             const id = clean(current.id || "");
-            if (id === "running" || id === "running_container") return "in_play";
-            if (id === "Today" || id === "Today_container") return "today";
+            const loweredId = id.toLowerCase();
+            if (loweredId.includes("running")) return "in_play";
+            if (loweredId.includes("today")) return "today";
+            if (loweredId.includes("tomorrow")) return "tomorrow";
             if (current.parentElement) {
               current = current.parentElement;
               continue;
@@ -1310,14 +1352,19 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
           const teamA = clean(row.querySelector('div[data-id="A"]')?.innerText || row.querySelector('div[data-id="A"]')?.textContent || "");
           const teamB = clean(row.querySelector('div[data-id="B"]')?.innerText || row.querySelector('div[data-id="B"]')?.textContent || "");
           const dataName = clean(row.getAttribute("data-name") || "");
+          const dataStart = clean(row.getAttribute("data-start") || row.getAttribute("datetime") || row.querySelector("[datetime]")?.getAttribute("datetime") || "");
+          const rawText = clean(row.innerText || row.textContent || "");
+          const matchText = clean(rawText.match(/[^\\n\\r|]+\\s+v(?:s)?\\s+[^\\n\\r|]+/i)?.[0] || "");
+          const timeText = clean(dataStart || rawText.match(/\\b\\d{4}-\\d{2}-\\d{2}[T\\s]\\d{1,2}:\\d{2}(?::\\d{2})?(?:Z|[+-]\\d{2}:?\\d{2})?\\b/)?.[0] || rawText.match(/\\b\\d{1,2}\\/\\d{1,2}\\/\\d{2,4}\\s+\\d{1,2}:\\d{2}\\b/)?.[0] || rawText.match(/\\b\\d{1,2}:\\d{2}\\b/)?.[0] || "");
           return {
             match_id: clean(row.getAttribute("data-id") || ""),
-            display_name: teamA && teamB ? `${teamA} v ${teamB}` : dataName,
+            display_name: teamA && teamB ? `${teamA} v ${teamB}` : (dataName || matchText),
             data_name: dataName,
             teamA,
             teamB,
             section: inferSection(row),
-            start_time: clean(row.getAttribute("data-start") || ""),
+            start_time: timeText,
+            raw_text: rawText,
             outer_html: row.outerHTML || "",
           };
         };
@@ -1327,7 +1374,7 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
           const seen = new Set();
           for (const row of rows) {
             const fixture = serializeRow(row);
-            const key = fixture.match_id || fixture.outer_html;
+            const key = fixture.match_id || `${fixture.display_name}|${fixture.start_time}` || fixture.outer_html;
             if (!key || seen.has(key)) continue;
             seen.add(key);
             fixtures.push(fixture);
@@ -1338,20 +1385,34 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
         const extractSnapshot = () => {
           const todayContainer = findContainer(todaySelectors);
           const inPlayContainer = findContainer(inPlaySelectors);
+          const tomorrowContainer = findContainer(tomorrowSelectors);
           const todayRows = querySectionRows(todaySelectors);
           const inPlayRows = querySectionRows(inPlaySelectors);
-          const allRows = queryAllDeep(rowSelector).filter((row) => row && row.getAttribute("data-id"));
+          const tomorrowRows = querySectionRows(tomorrowSelectors);
+          const fallbackSelector = `${rowSelector}, [data-id][data-start], [data-name][data-start], tr, .card, .fixture, [class*="fixture" i]`;
+          const allRows = queryAllDeep(fallbackSelector).filter((row) => {
+            if (!row) return false;
+            if (row.getAttribute("data-id") || row.getAttribute("data-name") || row.getAttribute("data-start")) return true;
+            const text = clean(row.innerText || row.textContent || "");
+            return /\\b\\d{1,2}:\\d{2}\\b/.test(text) && /\\s+v(?:s)?\\s+/i.test(text);
+          });
+          const candidateRows = queryAllDeep(candidateSelector).filter((row) => isVisible(row) && clean(row.innerText || row.textContent || ""));
           const readyRootExists = readyRootSelectors.some((selector) => !!queryFirstDeep(selector));
           const inPlayButton = findSectionButton("in_play");
+          const tomorrowButton = findSectionButton("tomorrow");
           const preferredRows = [...inPlayRows, ...todayRows];
           return {
             todayContainer,
             inPlayContainer,
+            tomorrowContainer,
             inPlayButton,
+            tomorrowButton,
             todayRows,
             inPlayRows,
+            tomorrowRows,
             allRows,
-            ready: todayRows.length > 0 || inPlayRows.length > 0 || (readyRootExists && allRows.length > 0) || (!!inPlayButton && allRows.length > 0),
+            candidateRows,
+            ready: todayRows.length > 0 || tomorrowRows.length > 0 || inPlayRows.length > 0 || (readyRootExists && allRows.length > 0) || (!!inPlayButton && allRows.length > 0) || (!!tomorrowButton && allRows.length > 0),
             readyRootExists,
           };
         };
@@ -1359,7 +1420,7 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
         const maybeExpandSection = (kind, snapshot) => {
           const button = findSectionButton(kind);
           const panel = resolvePanelFromButton(button);
-          const rows = kind === "today" ? snapshot.todayRows : snapshot.inPlayRows;
+          const rows = kind === "today" ? snapshot.todayRows : (kind === "tomorrow" ? snapshot.tomorrowRows : snapshot.inPlayRows);
           if (!button || !panel || rows.length > 0 || panelLooksExpanded(panel)) return false;
           try {
             button.click();
@@ -1371,9 +1432,12 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
 
         const start = Date.now();
         let expanded = false;
+        let scrollAttempted = false;
+        let scrollPasses = 0;
         let snapshot = extractSnapshot();
         expanded = maybeExpandSection("today", snapshot) || expanded;
         expanded = maybeExpandSection("in_play", snapshot) || expanded;
+        expanded = maybeExpandSection("tomorrow", snapshot) || expanded;
 
         const trimFixture = (fixture) => ({
           match_id: fixture.match_id,
@@ -1383,24 +1447,94 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
           teamB: fixture.teamB,
           section: fixture.section,
           start_time: fixture.start_time,
+          raw_text: fixture.raw_text,
         });
 
-        const finish = () => {
+        const scrollTargets = () => {
+          const targets = [document.scrollingElement || document.documentElement || document.body];
+          for (const selector of ["#date", "#Today_container", "#Tomorrow_container", "#tomorrow_container", "#running_container", "#Today", "#Tomorrow", "#tomorrow", "#running"]) {
+            const node = queryFirstDeep(selector);
+            if (node && !targets.includes(node)) targets.push(node);
+          }
+          return targets.filter(Boolean);
+        };
+
+        const scrollAndCollect = (callback) => {
+          const targets = scrollTargets();
+          let stablePasses = 0;
+          let lastCount = -1;
+          const seenRows = new Map();
+          const collect = () => {
+            snapshot = extractSnapshot();
+            for (const row of snapshot.allRows) {
+              const fixture = serializeRow(row);
+              const key = fixture.match_id || `${fixture.display_name}|${fixture.start_time}` || fixture.outer_html;
+              if (key && !seenRows.has(key)) seenRows.set(key, row);
+            }
+            for (const row of snapshot.candidateRows) {
+              const fixture = serializeRow(row);
+              const key = fixture.match_id || `${fixture.display_name}|${fixture.start_time}` || fixture.outer_html;
+              if (key && !seenRows.has(key)) seenRows.set(key, row);
+            }
+            return seenRows.size;
+          };
+          const step = () => {
+            const count = collect();
+            if (count === lastCount) {
+              stablePasses += 1;
+            } else {
+              stablePasses = 0;
+              lastCount = count;
+            }
+            if (stablePasses >= 3 || scrollPasses >= 12) {
+              collect();
+              callback(Array.from(seenRows.values()));
+              return;
+            }
+            scrollAttempted = true;
+            scrollPasses += 1;
+            for (const target of targets) {
+              try {
+                const nextTop = Math.min(target.scrollTop + Math.max(400, Math.floor(target.clientHeight || 800)), target.scrollHeight || 0);
+                target.scrollTop = nextTop;
+              } catch (error) {}
+            }
+            try {
+              window.scrollBy(0, Math.max(400, Math.floor(window.innerHeight || 800)));
+            } catch (error) {}
+            setTimeout(step, 250);
+          };
+          step();
+        };
+
+        const finish = (scrolledRows = []) => {
           snapshot = extractSnapshot();
-          const preferredRows = [...snapshot.inPlayRows, ...snapshot.todayRows];
+          const preferredRows = targetSection === "tomorrow"
+            ? snapshot.tomorrowRows
+            : targetSection === "today"
+              ? [...snapshot.inPlayRows, ...snapshot.todayRows]
+              : snapshot.allRows;
           const preferredFixtures = dedupeRows(preferredRows);
-          const allFixtures = dedupeRows(snapshot.allRows);
-          const source = preferredFixtures.length ? "today_inplay_sections" : "date_fallback";
+          const allFixtures = dedupeRows([...snapshot.allRows, ...snapshot.candidateRows, ...scrolledRows]);
+          const source = preferredFixtures.length ? `${targetSection}_section` : "date_fallback";
           done({
             status: snapshot.ready || allFixtures.length ? "ok" : "waiting",
             preferred_fixtures: preferredFixtures.map(trimFixture),
             all_fixtures: allFixtures.map(trimFixture),
+            candidate_fixtures: dedupeRows(snapshot.candidateRows).map(trimFixture),
             todayRowsCount: snapshot.todayRows.length,
             inPlayRowsCount: snapshot.inPlayRows.length,
+            tomorrowRowsCount: snapshot.tomorrowRows.length,
             allRowsCount: snapshot.allRows.length,
+            candidateRowsCount: snapshot.candidateRows.length,
             foundTodayContainer: !!snapshot.todayContainer,
             foundInPlayContainer: !!snapshot.inPlayContainer,
+            foundTomorrowContainer: !!snapshot.tomorrowContainer,
+            targetSection,
+            scrollAttempted,
+            scrollPasses,
             page_url: window.location.href,
+            page_title: document.title || "",
             source,
           });
         };
@@ -1408,8 +1542,11 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
         const tick = () => {
           snapshot = extractSnapshot();
           const waitedLongEnough = Date.now() - start >= 1500;
-          if (snapshot.ready || !expanded || waitedLongEnough) {
-            finish();
+          const targetReady = targetSection === "tomorrow"
+            ? snapshot.tomorrowRows.length > 0
+            : snapshot.ready;
+          if (targetReady || !expanded || waitedLongEnough) {
+            scrollAndCollect(finish);
             return;
           }
           setTimeout(tick, 150);
@@ -1418,9 +1555,12 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
         tick();
         """,
         DECIMAL_LEGACY_ROW_SELECTOR,
+        DECIMAL_LEGACY_CANDIDATE_SELECTOR,
         list(DECIMAL_LEGACY_TODAY_ROW_SELECTORS),
         list(DECIMAL_LEGACY_IN_PLAY_ROW_SELECTORS),
+        list(DECIMAL_LEGACY_TOMORROW_ROW_SELECTORS),
         list(DECIMAL_LEGACY_READY_ROOT_SELECTORS),
+        target_section,
     )
     result = payload or {}
     if verbose:
@@ -1428,14 +1568,22 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, verbose: bool) -> dict
     return result
 
 
-def wait_for_decimal_legacy_rows_via_js(driver: WebDriver, timeout: int, verbose: bool) -> dict[str, object]:
+def wait_for_decimal_legacy_rows_via_js(
+    driver: WebDriver, target_day: date, timeout: int, verbose: bool
+) -> dict[str, object]:
     """Wait for Decimal Legacy Developer Today/In Play rows to become available."""
     payload: dict[str, object] = {}
 
     def poll(current_driver: WebDriver) -> bool:
         nonlocal payload
-        payload = extract_decimal_legacy_rows_via_js(current_driver, verbose)
-        return bool(payload.get("allRowsCount")) or bool(payload.get("todayRowsCount")) or bool(payload.get("inPlayRowsCount"))
+        payload = extract_decimal_legacy_rows_via_js(current_driver, target_day, verbose)
+        return (
+            bool(payload.get("allRowsCount"))
+            or bool(payload.get("candidateRowsCount"))
+            or bool(payload.get("todayRowsCount"))
+            or bool(payload.get("tomorrowRowsCount"))
+            or bool(payload.get("inPlayRowsCount"))
+        )
 
     try:
         WebDriverWait(driver, timeout).until(poll)
@@ -1444,7 +1592,7 @@ def wait_for_decimal_legacy_rows_via_js(driver: WebDriver, timeout: int, verbose
     return payload
 
 
-def open_decimal_legacy_developer(driver: WebDriver, verbose: bool) -> dict[str, object]:
+def open_decimal_legacy_developer(driver: WebDriver, target_day: date, verbose: bool) -> dict[str, object]:
     """Navigate Decimal to the Legacy Developer viewer and return JS extraction payload."""
     verbose_log(verbose, f"Opening Decimal dec page: {DECIMAL_DEC_URL}")
     try:
@@ -1476,8 +1624,9 @@ def open_decimal_legacy_developer(driver: WebDriver, verbose: bool) -> dict[str,
     except Exception as exc:
         raise RuntimeError("Decimal Legacy Developer menu could not be opened.") from exc
 
-    payload = wait_for_decimal_legacy_rows_via_js(driver, DECIMAL_WAIT_SECONDS, verbose)
+    payload = wait_for_decimal_legacy_rows_via_js(driver, target_day, DECIMAL_WAIT_SECONDS, verbose)
     verbose_log(verbose, f"Decimal Legacy Developer Today rows found: {int(payload.get('todayRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer Tomorrow rows found: {int(payload.get('tomorrowRowsCount', 0))}")
     verbose_log(verbose, f"Decimal Legacy Developer In Play rows found: {int(payload.get('inPlayRowsCount', 0))}")
     return payload
 
@@ -1488,30 +1637,92 @@ def parse_decimal_legacy_fixture_payload(
     verbose: bool,
 ) -> Optional[Fixture]:
     """Convert a JS-extracted Legacy Developer row into a Decimal fixture."""
+    fixture, _reason = parse_decimal_legacy_fixture_payload_with_reason(row_payload, target_day, verbose)
+    return fixture
+
+
+def infer_decimal_start_text(row_payload: dict[str, object]) -> str:
+    """Infer a Decimal start time from structured fields or visible row text."""
+    start_time_text = normalize_whitespace(str(row_payload.get("start_time", "")))
+    if start_time_text:
+        return start_time_text
+
+    raw_text = normalize_whitespace(str(row_payload.get("raw_text", "")))
+    if not raw_text:
+        return ""
+
+    patterns = (
+        r"\b\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?\b",
+        r"\b\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\b",
+        r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}\s+\d{1,2}:\d{2}\b",
+        r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:BST|GMT)?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+        if match:
+            return normalize_whitespace(match.group(0))
+    return ""
+
+
+def infer_decimal_match_name(row_payload: dict[str, object], start_time_text: str) -> str:
+    """Infer a match name from structured fields or visible row text."""
     match_name = normalize_whitespace(str(row_payload.get("display_name", "")))
     if not match_name:
         match_name = normalize_whitespace(str(row_payload.get("data_name", "")))
-    if not match_name:
-        return None
+    if match_name:
+        return match_name
 
-    start_time_text = normalize_whitespace(str(row_payload.get("start_time", "")))
+    team_a = normalize_whitespace(str(row_payload.get("teamA", "")))
+    team_b = normalize_whitespace(str(row_payload.get("teamB", "")))
+    if team_a and team_b:
+        return f"{team_a} v {team_b}"
+
+    raw_text = normalize_whitespace(str(row_payload.get("raw_text", "")))
+    if not raw_text:
+        return ""
+    if start_time_text:
+        raw_text = normalize_whitespace(raw_text.replace(start_time_text, " "))
+    raw_text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:BST|GMT)?\b", " ", raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " ", raw_text)
+    raw_text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", raw_text)
+    candidates = [part.strip(" -|") for part in re.split(r"\s{2,}|\n|\r|\t", raw_text) if part.strip(" -|")]
+    if candidates:
+        return max(candidates, key=len)
+    return raw_text
+
+
+def parse_decimal_legacy_fixture_payload_with_reason(
+    row_payload: dict[str, object],
+    target_day: date,
+    verbose: bool,
+) -> tuple[Optional[Fixture], str]:
+    """Convert a JS-extracted row into a fixture and explain discarded rows."""
+    start_time_text = infer_decimal_start_text(row_payload)
     if not start_time_text:
-        return None
+        return None, "missing start time"
+
+    match_name = infer_decimal_match_name(row_payload, start_time_text)
+    if not match_name:
+        return None, "missing match name"
 
     start_time = parse_decimal_datetime(start_time_text, target_day, verbose=verbose)
     if start_time is None or start_time.date() != target_day:
-        return None
+        parsed_text = start_time.isoformat() if start_time else "unparsed"
+        return None, f"start time not on target day ({parsed_text})"
 
     if is_rejected_fixture_text(match_name):
-        return None
+        return None, "rejected non-fixture text"
     if len(normalize_name(match_name)) < 4:
-        return None
+        return None, "normalized match name too short"
 
-    return Fixture(
-        match_name=match_name,
-        competition="",
-        start_time=start_time,
-        source="decimal",
+    return (
+        Fixture(
+            match_name=match_name,
+            competition="",
+            start_time=start_time,
+            source="decimal",
+        ),
+        "kept",
     )
 
 
@@ -1519,40 +1730,168 @@ def build_decimal_legacy_fixtures_from_rows(
     row_payloads: Iterable[dict[str, object]],
     target_day: date,
     verbose: bool,
+    debug_rows: Optional[list[dict[str, object]]] = None,
 ) -> list[Fixture]:
     """Convert JS-extracted Legacy Developer rows into deduped target-day fixtures."""
     fixtures: list[Fixture] = []
     seen_keys: set[tuple[str, datetime]] = set()
     for row_payload in row_payloads:
-        fixture = parse_decimal_legacy_fixture_payload(dict(row_payload), target_day, verbose)
+        row_dict = dict(row_payload)
+        fixture, reason = parse_decimal_legacy_fixture_payload_with_reason(row_dict, target_day, verbose)
         if fixture is None:
+            if debug_rows is not None:
+                debug_rows.append(
+                    {
+                        "status": "discarded",
+                        "reason": reason,
+                        "row": sanitize_decimal_candidate(row_dict),
+                    }
+                )
             continue
         dedupe_key = (normalize_name(fixture.match_name), fixture.start_time)
         if dedupe_key in seen_keys:
+            if debug_rows is not None:
+                debug_rows.append(
+                    {
+                        "status": "discarded",
+                        "reason": "duplicate fixture",
+                        "row": sanitize_decimal_candidate(row_dict),
+                        "parsed": fixture_to_debug_dict(fixture),
+                    }
+                )
             continue
         seen_keys.add(dedupe_key)
+        if debug_rows is not None:
+            debug_rows.append(
+                {
+                    "status": "kept",
+                    "reason": reason,
+                    "row": sanitize_decimal_candidate(row_dict),
+                    "parsed": fixture_to_debug_dict(fixture),
+                }
+            )
         fixtures.append(fixture)
     return sorted(fixtures, key=lambda item: item.start_time)
+
+
+def sanitize_decimal_candidate(row_payload: dict[str, object]) -> dict[str, object]:
+    """Keep useful Decimal candidate fields without bloating debug JSON."""
+    return {
+        "match_id": normalize_whitespace(str(row_payload.get("match_id", ""))),
+        "display_name": normalize_whitespace(str(row_payload.get("display_name", ""))),
+        "data_name": normalize_whitespace(str(row_payload.get("data_name", ""))),
+        "teamA": normalize_whitespace(str(row_payload.get("teamA", ""))),
+        "teamB": normalize_whitespace(str(row_payload.get("teamB", ""))),
+        "section": normalize_whitespace(str(row_payload.get("section", ""))),
+        "start_time": normalize_whitespace(str(row_payload.get("start_time", ""))),
+        "raw_text": normalize_whitespace(str(row_payload.get("raw_text", "")))[:1000],
+    }
+
+
+def fixture_to_debug_dict(fixture: Fixture) -> dict[str, str]:
+    """Serialize a parsed fixture for debug output."""
+    return {
+        "match_name": fixture.match_name,
+        "competition": fixture.competition,
+        "start_time": fixture.start_time.isoformat(),
+        "source": fixture.source,
+    }
+
+
+def write_decimal_debug_artifacts(
+    driver: WebDriver,
+    payload: dict[str, object],
+    debug_rows: list[dict[str, object]],
+    fixtures: list[Fixture],
+    enabled: bool,
+) -> None:
+    """Write optional Decimal debug files under ignored runtime output."""
+    if not enabled:
+        return
+
+    DECIMAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    candidates_path = DECIMAL_DEBUG_DIR / "decimal_candidates.json"
+    html_path = DECIMAL_DEBUG_DIR / "decimal_page.html"
+    png_path = DECIMAL_DEBUG_DIR / "decimal_page.png"
+
+    try:
+        html_path.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+    except Exception as exc:
+        decimal_debug_log(enabled, f"Failed to write Decimal HTML artifact: {exc}")
+
+    try:
+        driver.save_screenshot(str(png_path))
+    except Exception as exc:
+        decimal_debug_log(enabled, f"Failed to write Decimal screenshot artifact: {exc}")
+
+    artifact_payload = {
+        "page_url": payload.get("page_url", ""),
+        "page_title": payload.get("page_title", ""),
+        "target_section": payload.get("targetSection", ""),
+        "counts": {
+            "candidate_rows": int(payload.get("candidateRowsCount", 0)),
+            "candidate_payload_rows": len(payload.get("candidate_fixtures") or []),
+            "structured_rows": len(payload.get("all_fixtures") or []),
+            "preferred_rows": len(payload.get("preferred_fixtures") or []),
+            "parsed_fixtures": len(fixtures),
+            "today_rows": int(payload.get("todayRowsCount", 0)),
+            "tomorrow_rows": int(payload.get("tomorrowRowsCount", 0)),
+            "in_play_rows": int(payload.get("inPlayRowsCount", 0)),
+            "all_rows_visible_at_finish": int(payload.get("allRowsCount", 0)),
+        },
+        "scroll": {
+            "attempted": bool(payload.get("scrollAttempted")),
+            "passes": int(payload.get("scrollPasses", 0)),
+        },
+        "candidates": debug_rows,
+        "fixtures": [fixture_to_debug_dict(fixture) for fixture in fixtures],
+    }
+    candidates_path.write_text(json.dumps(artifact_payload, indent=2), encoding="utf-8")
+    decimal_debug_log(enabled, f"Decimal debug artifacts written to {DECIMAL_DEBUG_DIR}")
 
 
 def extract_decimal_legacy_developer_fixtures(
     driver: WebDriver,
     target_day: date,
     verbose: bool,
+    debug_decimal: bool = False,
 ) -> list[Fixture]:
-    """Extract Decimal fixtures from the Legacy Developer Today/In Play sections."""
-    payload = open_decimal_legacy_developer(driver, verbose)
+    """Extract Decimal fixtures from the Legacy Developer sections."""
+    target_section = decimal_target_section(target_day)
+    decimal_debug_log(debug_decimal, f"Decimal target date: {target_day.isoformat()} Europe/London section={target_section}")
+    payload = open_decimal_legacy_developer(driver, target_day, verbose)
     preferred_rows = payload.get("preferred_fixtures") or []
     all_rows = payload.get("all_fixtures") or []
+    broad_candidate_rows = payload.get("candidate_fixtures") or []
+    candidate_rows = [*preferred_rows, *all_rows, *broad_candidate_rows]
     verbose_log(verbose, f"Decimal Legacy Developer Today container found: {bool(payload.get('foundTodayContainer'))}")
+    verbose_log(verbose, f"Decimal Legacy Developer Tomorrow container found: {bool(payload.get('foundTomorrowContainer'))}")
     verbose_log(verbose, f"Decimal Legacy Developer In Play container found: {bool(payload.get('foundInPlayContainer'))}")
     verbose_log(verbose, f"Decimal Legacy Developer today rows count: {int(payload.get('todayRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer tomorrow rows count: {int(payload.get('tomorrowRowsCount', 0))}")
     verbose_log(verbose, f"Decimal Legacy Developer in-play rows count: {int(payload.get('inPlayRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer broad candidate rows count: {int(payload.get('candidateRowsCount', 0))}")
     verbose_log(verbose, f"Decimal Legacy Developer preferred rows count: {len(preferred_rows)}")
     verbose_log(verbose, f"Decimal Legacy Developer all rows count: {len(all_rows)}")
+    decimal_debug_log(debug_decimal, f"Current page URL: {payload.get('page_url', '')}")
+    decimal_debug_log(debug_decimal, f"Page title: {payload.get('page_title', '')}")
+    decimal_debug_log(debug_decimal, f"Candidate fixture elements before filtering: {len(candidate_rows)}")
+    decimal_debug_log(debug_decimal, f"Visible all-row candidates at finish: {int(payload.get('allRowsCount', 0))}")
+    decimal_debug_log(
+        debug_decimal,
+        f"Scrolling attempted: {bool(payload.get('scrollAttempted'))} passes={int(payload.get('scrollPasses', 0))}",
+    )
+    if debug_decimal:
+        for index, row in enumerate(candidate_rows[:20], start=1):
+            sample = sanitize_decimal_candidate(dict(row))
+            decimal_debug_log(debug_decimal, f"Candidate {index}: {json.dumps(sample, ensure_ascii=False)}")
 
-    preferred_fixtures = build_decimal_legacy_fixtures_from_rows(preferred_rows, target_day, verbose)
-    all_fixtures = build_decimal_legacy_fixtures_from_rows(all_rows, target_day, verbose)
+    preferred_debug_rows: list[dict[str, object]] = []
+    all_debug_rows: list[dict[str, object]] = []
+    preferred_fixtures = build_decimal_legacy_fixtures_from_rows(
+        preferred_rows, target_day, verbose, preferred_debug_rows if debug_decimal else None
+    )
+    all_fixtures = build_decimal_legacy_fixtures_from_rows(candidate_rows, target_day, verbose, all_debug_rows if debug_decimal else None)
     verbose_log(
         verbose,
         f"Decimal Legacy Developer preferred rows kept for target day: {len(preferred_fixtures)}",
@@ -1560,13 +1899,30 @@ def extract_decimal_legacy_developer_fixtures(
     verbose_log(verbose, f"Decimal Legacy Developer all rows kept for target day: {len(all_fixtures)}")
     if preferred_fixtures:
         fixtures = preferred_fixtures
-        verbose_log(verbose, "Decimal Legacy Developer using Today/In Play rows for target day")
+        debug_rows = preferred_debug_rows
+        verbose_log(verbose, f"Decimal Legacy Developer using {target_section} preferred rows for target day")
     else:
         if all_fixtures:
             fixtures = all_fixtures
+            debug_rows = all_debug_rows
             verbose_log(verbose, "Decimal Legacy Developer falling back to all rows for target day")
         else:
+            write_decimal_debug_artifacts(driver, payload, all_debug_rows or preferred_debug_rows, [], debug_decimal)
             raise RuntimeError("No valid Decimal Legacy Developer fixtures were parsed for target day.")
+
+    decimal_debug_log(debug_decimal, f"Candidate fixture elements after filtering: {len(fixtures)}")
+    if debug_decimal:
+        for item in (debug_rows or [])[:80]:
+            if item.get("status") == "discarded":
+                row = item.get("row") or {}
+                decimal_debug_log(
+                    debug_decimal,
+                    f"Discarded Decimal row: reason={item.get('reason')} text={row.get('raw_text') or row.get('display_name')}",
+                )
+        for fixture in fixtures:
+            decimal_debug_log(debug_decimal, f"Parsed Decimal fixture: {json.dumps(fixture_to_debug_dict(fixture), ensure_ascii=False)}")
+        write_decimal_debug_artifacts(driver, payload, debug_rows, fixtures, debug_decimal)
+    decimal_debug_log(debug_decimal, f"Final Decimal fixture count: {len(fixtures)}")
 
     if verbose and fixtures:
         samples = ", ".join(
@@ -1618,9 +1974,16 @@ def fixture_row_to_fixture(row: pd.Series, target_day: date, verbose: bool = Fal
     )
 
 
-def fetch_decimal_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
+def fetch_decimal_fixtures(target_day: date, verbose: bool, debug_decimal: bool = False) -> list[Fixture]:
     """Log into Decimal and scrape Legacy Developer fixture rows for the requested UK-local day."""
     verbose_log(verbose, f"Fetching Decimal fixtures for {target_day.isoformat()}")
+    decimal_debug_log(
+        debug_decimal,
+        "Decimal target date being scraped: "
+        f"{target_day.isoformat()} timezone=Europe/London "
+        f"bounds={day_bounds(target_day)[0].isoformat()}..{day_bounds(target_day)[1].isoformat()} "
+        f"now={datetime.now(UK_TZ).isoformat()}",
+    )
     login_start = perf_counter()
     try:
         driver = build_chrome_driver()
@@ -1630,9 +1993,11 @@ def fetch_decimal_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
     try:
         login_decimal(driver, verbose)
         verbose_log(verbose, f"Decimal login time: {perf_counter() - login_start:.2f}s")
+        decimal_debug_log(debug_decimal, f"Page URL after login: {driver.current_url}")
+        decimal_debug_log(debug_decimal, f"Page title after login: {driver.title}")
         extraction_start = perf_counter()
-        verbose_log(verbose, "Extracting Decimal Legacy Developer Today/In Play fixtures")
-        fixtures = extract_decimal_legacy_developer_fixtures(driver, target_day, verbose)
+        verbose_log(verbose, "Extracting Decimal Legacy Developer fixtures")
+        fixtures = extract_decimal_legacy_developer_fixtures(driver, target_day, verbose, debug_decimal)
         verbose_log(
             verbose,
             f"Decimal Legacy Developer extraction time: {perf_counter() - extraction_start:.2f}s",
@@ -1789,6 +2154,8 @@ def print_results(
 ) -> None:
     """Print results to stdout as TSV or aligned columns."""
     print_summary_counts(comparison_counts(betfair_fixtures, decimal_fixtures, results), pretty)
+    if len(decimal_fixtures) < len(betfair_fixtures):
+        print(f"Warning: Decimal scrape returned only {len(decimal_fixtures)} fixtures; check Decimal debug output.")
     not_matching_count = sum(
         1 for result in results
         if result.decimal_fixture is None or not result.time_matches
@@ -1871,7 +2238,7 @@ def main() -> int:
         betfair_fixtures = fetch_betfair_fixtures(target_day, args.verbose)
         verbose_log(args.verbose, f"Betfair fetch time: {perf_counter() - betfair_start:.2f}s")
         try:
-            decimal_fixtures = fetch_decimal_fixtures(target_day, args.verbose)
+            decimal_fixtures = fetch_decimal_fixtures(target_day, args.verbose, args.debug_decimal)
         except DecimalScrapeError as exc:
             print_decimal_scrape_failure(betfair_fixtures, exc, pretty=args.pretty)
             verbose_log(args.verbose, f"Total script runtime: {perf_counter() - total_start:.2f}s")
