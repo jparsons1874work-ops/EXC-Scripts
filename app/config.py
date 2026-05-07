@@ -32,6 +32,10 @@ SECRET_KEYS = (
     "DUPE_MATCH_SLACK_WEBHOOK_URL",
     "SLACK_WEBHOOK_URL",
     "DG_API_KEY",
+    "CHROME_BINARY",
+    "GOOGLE_CHROME_BIN",
+    "CHROME_BIN",
+    "CHROMEDRIVER_PATH",
 )
 
 
@@ -67,6 +71,8 @@ def materialize_b64_secret(secret_name: str, file_name: str) -> str:
 
 def child_environment() -> dict[str, str]:
     env = os.environ.copy()
+    if not env.get("CHROME_BINARY") and Path("/usr/bin/google-chrome").exists():
+        env["CHROME_BINARY"] = "/usr/bin/google-chrome"
     for key in SECRET_KEYS:
         value = get_setting(key)
         if value:
@@ -82,7 +88,6 @@ def child_environment() -> dict[str, str]:
         env["BETFAIR_KEY_FILE"] = key_file
 
     env.setdefault("SCRIPT_OUTPUT_DIR", str(OUTPUT_DIR))
-    env.setdefault("CHROME_PROFILE_DIR", str(OUTPUT_DIR / "chrome_profile"))
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 

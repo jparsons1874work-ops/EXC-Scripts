@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.config import LOG_DIR, PROJECT_ROOT, child_environment, ensure_runtime_dirs
+from app.config import LOG_DIR, OUTPUT_DIR, PROJECT_ROOT, child_environment, ensure_runtime_dirs
 from app.registry import SCRIPTS_BY_ID, ScriptSpec
 from app.scheduler import window_status
 
@@ -71,6 +71,19 @@ class ScriptRunner:
             command = [sys.executable, str(script_path), *args]
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
 
+            env = child_environment()
+
+            if script_id in {
+                "cricket-time-check-today",
+                "cricket-time-check-tomorrow",
+                "cricket-decimal-fixture-scrape",
+            }:
+                profile_dir = OUTPUT_DIR / "chrome_profiles" / f"{script_id}_{int(time.time())}"
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                env["CHROME_PROFILE_DIR"] = str(profile_dir)
+                if not env.get("CHROME_BINARY") and Path("/usr/bin/google-chrome").exists():
+                    env["CHROME_BINARY"] = "/usr/bin/google-chrome"
+
             process = subprocess.Popen(
                 command,
                 cwd=str(PROJECT_ROOT),
@@ -78,7 +91,7 @@ class ScriptRunner:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                env=child_environment(),
+                env=env,
                 creationflags=creationflags,
             )
 
