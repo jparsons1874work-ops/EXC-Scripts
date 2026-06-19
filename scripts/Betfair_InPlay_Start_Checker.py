@@ -637,6 +637,43 @@ def send_slack_message(
         raise RuntimeError(f"Slack webhook failed: status={status_code}, body={body[:300]}")
 
 
+def send_lifecycle_message(
+    connection: sqlite3.Connection,
+    config: Config,
+    *,
+    dry_run: bool,
+    event_type: str,
+    message: str,
+) -> None:
+    print(message, flush=True)
+    if dry_run:
+        db_log(connection, "INFO", event_type, "Dry-run: lifecycle Slack message not sent")
+        return
+    if is_placeholder(config.slack_webhook_url):
+        db_log(connection, "ERROR", "config_error", f"{SLACK_WEBHOOK_ENV_NAME} missing")
+        return
+    try:
+        send_slack_message(config.slack_webhook_url, message)
+    except Exception as exc:
+        db_log(connection, "ERROR", "slack_failure", f"Lifecycle Slack message failed: {exc}")
+        return
+    db_log(connection, "INFO", event_type, "Lifecycle Slack message sent")
+
+
+def startup_message(repeat_minutes: float, dry_run: bool) -> str:
+    cadence = f"Scanning every {repeat_minutes:g} minutes." if repeat_minutes else "Running one scan now."
+    dry_run_note = " Dry-run is enabled; Slack alerts will not be sent." if dry_run else ""
+    return (
+        ":satellite_antenna: Betfair In-Play Start Checker online\n\n"
+        f"{cadence} Monitoring MATCH_ODDS markets for overdue events that have not turned in-play."
+        f"{dry_run_note}"
+    )
+
+
+def shutdown_message() -> str:
+    return ":octagonal_sign: Betfair In-Play Start Checker stopped"
+
+
 def fetch_overdue_candidates(
     connection: sqlite3.Connection,
     client: APIClient,
@@ -1042,6 +1079,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overdue-minutes", type=float, default=DEFAULT_OVERDUE_MINUTES)
     parser.add_argument("--max-results", type=int, default=1000)
     parser.add_argument("--market-book-batch-size", type=int, default=DEFAULT_MARKET_BOOK_BATCH_SIZE)
+    parser.add_argument("--send-startup-message", action="store_true", help="Send a Slack message when the scanner starts.")
+    parser.add_argument("--send-shutdown-message", action="store_true", help="Send a Slack message when the scanner stops.")
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     return parser.parse_args()
 
@@ -1055,6 +1094,14 @@ def main() -> int:
     connection = open_db()
     repeat_minutes = max(args.repeat_minutes, 0)
     cycle = 1
+    if args.send_startup_message:
+        send_lifecycle_message(
+            connection,
+            config,
+            dry_run=args.dry_run,
+            event_type="startup_message",
+            message=startup_message(repeat_minutes, args.dry_run),
+        )
     try:
         while True:
             if repeat_minutes:
@@ -1071,6 +1118,14 @@ def main() -> int:
             time.sleep(sleep_seconds)
     except KeyboardInterrupt:
         log("Interrupted.")
+        if args.send_shutdown_message:
+            send_lifecycle_message(
+                connection,
+                config,
+                dry_run=args.dry_run,
+                event_type="shutdown_message",
+                message=shutdown_message(),
+            )
         return 130
     finally:
         connection.close()

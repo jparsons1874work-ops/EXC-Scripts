@@ -98,7 +98,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "Betfair",
         "Flags MATCH_ODDS markets whose scheduled start is overdue but not in-play.",
         "scripts/Betfair_InPlay_Start_Checker.py",
-        ("--repeat-minutes", "2"),
+        ("--repeat-minutes", "2", "--send-startup-message", "--send-shutdown-message"),
         long_running=True,
         parsed_output=True,
     ),
