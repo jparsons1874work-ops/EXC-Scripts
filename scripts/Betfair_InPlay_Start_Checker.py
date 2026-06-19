@@ -12,7 +12,7 @@ import sqlite3
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -45,6 +45,23 @@ FLASHSCORE_SPORTS = ("Tennis", "Darts")
 FLASHSCORE_URLS = {
     "Tennis": "https://www.flashscore.com/tennis/",
     "Darts": "https://www.flashscore.com/darts/",
+}
+SURNAME_PARTICLES = {"van", "de", "del", "da", "di", "von", "la", "le", "du"}
+COMMON_SURNAMES = {
+    "smith",
+    "jones",
+    "williams",
+    "brown",
+    "taylor",
+    "anderson",
+    "thompson",
+    "white",
+    "martin",
+    "lee",
+    "wilson",
+    "johnson",
+    "roberts",
+    "wright",
 }
 
 
@@ -109,6 +126,14 @@ class MatchConfidence:
     level: str
     reason: str
     score: float
+    flashscore_participant_1: str = ""
+    flashscore_participant_2: str = ""
+    betfair_participant_1: str = ""
+    betfair_participant_2: str = ""
+    flashscore_surname_1: str = ""
+    flashscore_surname_2: str = ""
+    betfair_surname_1: str = ""
+    betfair_surname_2: str = ""
 
 
 @dataclass
@@ -176,6 +201,38 @@ def name_similarity(first: str, second: str) -> float:
     return SequenceMatcher(None, first_norm, second_norm).ratio()
 
 
+@dataclass(frozen=True)
+class NameParts:
+    original: str
+    normalized: str
+    tokens: tuple[str, ...]
+    surname: str
+    first_initial: str
+    forename: str
+
+
+def name_parts(name: str) -> NameParts:
+    normalized = normalize_match_name(name)
+    tokens = tuple(token for token in normalized.split() if token)
+    if not tokens:
+        return NameParts(name, normalized, (), "", "", "")
+
+    trailing_initial = len(tokens[-1]) == 1
+    if trailing_initial and len(tokens) >= 2:
+        first_initial = tokens[-1]
+        surname_tokens = list(tokens[:-1])
+        forename = ""
+    else:
+        first_initial = tokens[0][0] if tokens[0] else ""
+        forename = tokens[0] if len(tokens) >= 2 else ""
+        surname_tokens = [tokens[-1]]
+        index = len(tokens) - 2
+        while index >= 0 and tokens[index] in SURNAME_PARTICLES:
+            surname_tokens.insert(0, tokens[index])
+            index -= 1
+    return NameParts(name, normalized, tokens, " ".join(surname_tokens), first_initial, forename)
+
+
 def parse_participants(name: str) -> tuple[str, str] | None:
     parts = [
         part.strip()
@@ -187,6 +244,30 @@ def parse_participants(name: str) -> tuple[str, str] | None:
     return None
 
 
+def surname_matches(first: NameParts, second: NameParts) -> bool:
+    if not first.surname or not second.surname:
+        return False
+    return first.surname == second.surname or SequenceMatcher(None, first.surname, second.surname).ratio() >= 0.92
+
+
+def participant_pair_score(flashscore: NameParts, betfair: NameParts) -> tuple[int, list[str], bool]:
+    score = 0
+    reasons: list[str] = []
+    support = False
+    if surname_matches(flashscore, betfair):
+        score += 45
+        reasons.append(f"surname {flashscore.surname} matched")
+    if flashscore.first_initial and betfair.first_initial and flashscore.first_initial == betfair.first_initial:
+        score += 10
+        support = True
+        reasons.append("first initial matched")
+    if flashscore.forename and betfair.forename and name_similarity(flashscore.forename, betfair.forename) >= 0.84:
+        score += 10
+        support = True
+        reasons.append("forename similar")
+    return score, reasons, support
+
+
 def participant_confidence(
     flashscore_participants: tuple[str, str],
     betfair_participants: tuple[str, str] | None,
@@ -195,30 +276,79 @@ def participant_confidence(
 ) -> MatchConfidence:
     if not betfair_participants:
         return MatchConfidence("Low", "Betfair participants could not be parsed", 0.0)
-    direct = (
-        name_similarity(flashscore_participants[0], betfair_participants[0])
-        + name_similarity(flashscore_participants[1], betfair_participants[1])
-    ) / 2
-    reversed_score = (
-        name_similarity(flashscore_participants[0], betfair_participants[1])
-        + name_similarity(flashscore_participants[1], betfair_participants[0])
-    ) / 2
-    score = max(direct, reversed_score)
-    if score >= 0.88:
-        return MatchConfidence("High", "Both participant names match order-insensitively", score)
+    if any(re.search(r"\s*(?:/|&|\+)\s*", participant) for participant in (*flashscore_participants, *betfair_participants)):
+        return MatchConfidence(
+            "Low",
+            "Doubles/team format skipped in v1",
+            0.0,
+            flashscore_participants[0],
+            flashscore_participants[1],
+            betfair_participants[0],
+            betfair_participants[1],
+        )
+    fs1 = name_parts(flashscore_participants[0])
+    fs2 = name_parts(flashscore_participants[1])
+    bf1 = name_parts(betfair_participants[0])
+    bf2 = name_parts(betfair_participants[1])
+    orders = ((fs1, fs2, bf1, bf2), (fs1, fs2, bf2, bf1))
+    best_score = -1
+    best_reasons: list[str] = []
+    best_support = False
+    best_bf1 = bf1
+    best_bf2 = bf2
+    both_surnames = False
+    for left_fs, right_fs, left_bf, right_bf in orders:
+        left_score, left_reasons, left_support = participant_pair_score(left_fs, left_bf)
+        right_score, right_reasons, right_support = participant_pair_score(right_fs, right_bf)
+        competition_score = name_similarity(flashscore_competition, betfair_competition)
+        total = left_score + right_score
+        support = left_support or right_support
+        reasons = [*left_reasons, *right_reasons]
+        if competition_score >= 0.82:
+            total += 10
+            support = True
+            reasons.append("competition similar")
+        surnames_ok = surname_matches(left_fs, left_bf) and surname_matches(right_fs, right_bf)
+        if surnames_ok and competition_score >= 0.70:
+            total += 5
+            reasons.append("competition supports match context")
+        if total > best_score:
+            best_score = total
+            best_reasons = reasons
+            best_support = support
+            best_bf1 = left_bf
+            best_bf2 = right_bf
+            both_surnames = surnames_ok
 
-    one_name_score = max(
-        name_similarity(flashscore_participants[0], betfair_participants[0]),
-        name_similarity(flashscore_participants[0], betfair_participants[1]),
-        name_similarity(flashscore_participants[1], betfair_participants[0]),
-        name_similarity(flashscore_participants[1], betfair_participants[1]),
+    common_surname_requires_support = any(
+        surname in COMMON_SURNAMES for surname in (fs1.surname, fs2.surname, best_bf1.surname, best_bf2.surname)
     )
-    competition_score = name_similarity(flashscore_competition, betfair_competition)
-    if one_name_score >= 0.90 and competition_score >= 0.82:
-        return MatchConfidence("Medium", "One participant and competition are similar", (one_name_score + competition_score) / 2)
-    if one_name_score >= 0.80:
-        return MatchConfidence("Low", "Only one participant appears to match", one_name_score)
-    return MatchConfidence("Low", "Participant names did not match confidently", score)
+    if not both_surnames:
+        level = "Low"
+        best_reasons.append("both participant surnames did not match")
+    elif common_surname_requires_support and not best_support:
+        level = "Low"
+        best_reasons.append("common surname match lacked supporting signal")
+    elif best_score >= 90:
+        level = "High"
+    elif best_score >= 70:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return MatchConfidence(
+        level,
+        "; ".join(best_reasons) or "No strong matching evidence",
+        float(best_score),
+        flashscore_participants[0],
+        flashscore_participants[1],
+        best_bf1.original,
+        best_bf2.original,
+        fs1.surname,
+        fs2.surname,
+        best_bf1.surname,
+        best_bf2.surname,
+    )
 
 
 def format_betfair_time(value: datetime) -> str:
@@ -383,7 +513,16 @@ def init_db(connection: sqlite3.Connection) -> None:
             betfair_last_seen_inplay INTEGER,
             betfair_last_seen_status TEXT,
             slack_alert_sent INTEGER,
-            slack_error TEXT
+            slack_error TEXT,
+            flashscore_participant_1 TEXT,
+            flashscore_participant_2 TEXT,
+            betfair_participant_1 TEXT,
+            betfair_participant_2 TEXT,
+            flashscore_surname_1 TEXT,
+            flashscore_surname_2 TEXT,
+            betfair_surname_1 TEXT,
+            betfair_surname_2 TEXT,
+            match_score REAL
         )
         """
     )
@@ -405,6 +544,15 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_alert_state", "betfair_last_seen_status", "TEXT")
     ensure_column(connection, "inplay_alert_state", "slack_alert_sent", "INTEGER")
     ensure_column(connection, "inplay_alert_state", "slack_error", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_participant_1", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_participant_2", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "betfair_participant_1", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "betfair_participant_2", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_surname_1", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_surname_2", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "betfair_surname_1", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "betfair_surname_2", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "match_score", "REAL")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS inplay_scan_logs (
@@ -941,7 +1089,16 @@ def upsert_alert_state(
                 flashscore_score = ?,
                 flashscore_detected_live_at = ?,
                 match_confidence = ?,
-                match_reason = ?
+                match_reason = ?,
+                flashscore_participant_1 = ?,
+                flashscore_participant_2 = ?,
+                betfair_participant_1 = ?,
+                betfair_participant_2 = ?,
+                flashscore_surname_1 = ?,
+                flashscore_surname_2 = ?,
+                betfair_surname_1 = ?,
+                betfair_surname_2 = ?,
+                match_score = ?
             WHERE event_id = ?
             """,
             (
@@ -955,6 +1112,15 @@ def upsert_alert_state(
                 iso_utc(flashscore_match.detected_live_at),
                 match_confidence.level if match_confidence else "",
                 match_confidence.reason if match_confidence else "",
+                match_confidence.flashscore_participant_1 if match_confidence else "",
+                match_confidence.flashscore_participant_2 if match_confidence else "",
+                match_confidence.betfair_participant_1 if match_confidence else "",
+                match_confidence.betfair_participant_2 if match_confidence else "",
+                match_confidence.flashscore_surname_1 if match_confidence else "",
+                match_confidence.flashscore_surname_2 if match_confidence else "",
+                match_confidence.betfair_surname_1 if match_confidence else "",
+                match_confidence.betfair_surname_2 if match_confidence else "",
+                match_confidence.score if match_confidence else None,
                 candidate.event_id,
             ),
         )
@@ -1058,7 +1224,16 @@ def record_final_verification_failed(
                 flashscore_score = ?,
                 flashscore_detected_live_at = ?,
                 match_confidence = ?,
-                match_reason = ?
+                match_reason = ?,
+                flashscore_participant_1 = ?,
+                flashscore_participant_2 = ?,
+                betfair_participant_1 = ?,
+                betfair_participant_2 = ?,
+                flashscore_surname_1 = ?,
+                flashscore_surname_2 = ?,
+                betfair_surname_1 = ?,
+                betfair_surname_2 = ?,
+                match_score = ?
             WHERE event_id = ?
             """,
             (
@@ -1071,9 +1246,127 @@ def record_final_verification_failed(
                 iso_utc(flashscore_match.detected_live_at),
                 match_confidence.level if match_confidence else "",
                 match_confidence.reason if match_confidence else "",
+                match_confidence.flashscore_participant_1 if match_confidence else "",
+                match_confidence.flashscore_participant_2 if match_confidence else "",
+                match_confidence.betfair_participant_1 if match_confidence else "",
+                match_confidence.betfair_participant_2 if match_confidence else "",
+                match_confidence.flashscore_surname_1 if match_confidence else "",
+                match_confidence.flashscore_surname_2 if match_confidence else "",
+                match_confidence.betfair_surname_1 if match_confidence else "",
+                match_confidence.betfair_surname_2 if match_confidence else "",
+                match_confidence.score if match_confidence else None,
                 candidate.event_id,
             ),
         )
+    connection.commit()
+
+
+def record_flashscore_match_diagnostic(
+    connection: sqlite3.Connection,
+    candidate: MarketCandidate,
+    flashscore_match: FlashscoreMatch,
+    confidence: MatchConfidence,
+    *,
+    now: datetime,
+    result: str,
+    reason: str,
+) -> None:
+    existing = connection.execute(
+        """
+        SELECT first_flagged_at, alert_sent_at, recovered_at
+        FROM inplay_alert_state
+        WHERE event_id = ?
+        """,
+        (candidate.event_id,),
+    ).fetchone()
+    connection.execute(
+        """
+        INSERT INTO inplay_alert_state (
+            event_id, market_id, sport_name, competition_name, event_name,
+            scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
+            last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
+            final_verification_at, final_verification_result, final_verification_reason,
+            trigger_source, flashscore_match_id, flashscore_url, flashscore_match_name,
+            flashscore_competition, flashscore_status, flashscore_score,
+            flashscore_detected_live_at, match_confidence, match_reason,
+            betfair_last_checked_at, betfair_last_seen_inplay, betfair_last_seen_status,
+            flashscore_participant_1, flashscore_participant_2, betfair_participant_1,
+            betfair_participant_2, flashscore_surname_1, flashscore_surname_2,
+            betfair_surname_1, betfair_surname_2, match_score
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            market_id = excluded.market_id,
+            sport_name = excluded.sport_name,
+            competition_name = excluded.competition_name,
+            event_name = excluded.event_name,
+            scheduled_start_utc = excluded.scheduled_start_utc,
+            scheduled_start_uk = excluded.scheduled_start_uk,
+            first_flagged_at = COALESCE(inplay_alert_state.first_flagged_at, excluded.first_flagged_at),
+            alert_sent_at = COALESCE(inplay_alert_state.alert_sent_at, excluded.alert_sent_at),
+            last_seen_status = NULL,
+            last_seen_inplay = NULL,
+            last_checked_at = excluded.last_checked_at,
+            final_verification_result = excluded.final_verification_result,
+            final_verification_reason = excluded.final_verification_reason,
+            trigger_source = excluded.trigger_source,
+            flashscore_match_id = excluded.flashscore_match_id,
+            flashscore_url = excluded.flashscore_url,
+            flashscore_match_name = excluded.flashscore_match_name,
+            flashscore_competition = excluded.flashscore_competition,
+            flashscore_status = excluded.flashscore_status,
+            flashscore_score = excluded.flashscore_score,
+            flashscore_detected_live_at = excluded.flashscore_detected_live_at,
+            match_confidence = excluded.match_confidence,
+            match_reason = excluded.match_reason,
+            betfair_last_checked_at = NULL,
+            betfair_last_seen_inplay = NULL,
+            betfair_last_seen_status = NULL,
+            flashscore_participant_1 = excluded.flashscore_participant_1,
+            flashscore_participant_2 = excluded.flashscore_participant_2,
+            betfair_participant_1 = excluded.betfair_participant_1,
+            betfair_participant_2 = excluded.betfair_participant_2,
+            flashscore_surname_1 = excluded.flashscore_surname_1,
+            flashscore_surname_2 = excluded.flashscore_surname_2,
+            betfair_surname_1 = excluded.betfair_surname_1,
+            betfair_surname_2 = excluded.betfair_surname_2,
+            match_score = excluded.match_score
+        """,
+        (
+            candidate.event_id,
+            candidate.market_id,
+            candidate.sport_name,
+            candidate.competition_name,
+            candidate.event_name,
+            iso_utc(candidate.scheduled_start_utc),
+            format_uk_datetime(candidate.scheduled_start_utc),
+            existing["first_flagged_at"] if existing else iso_utc(now),
+            existing["alert_sent_at"] if existing else None,
+            existing["recovered_at"] if existing else None,
+            iso_utc(now),
+            result,
+            reason,
+            "flashscore_live",
+            flashscore_match.match_id,
+            flashscore_match.url,
+            flashscore_match.match_name,
+            flashscore_match.competition_name,
+            flashscore_match.status_text,
+            flashscore_match.score,
+            iso_utc(flashscore_match.detected_live_at),
+            confidence.level,
+            confidence.reason,
+            confidence.flashscore_participant_1,
+            confidence.flashscore_participant_2,
+            confidence.betfair_participant_1,
+            confidence.betfair_participant_2,
+            confidence.flashscore_surname_1,
+            confidence.flashscore_surname_2,
+            confidence.betfair_surname_1,
+            confidence.betfair_surname_2,
+            confidence.score,
+        ),
+    )
     connection.commit()
 
 
@@ -1599,11 +1892,20 @@ def betfair_flashscore_candidates(
 
 
 def best_betfair_match(
+    connection: sqlite3.Connection,
     flashscore_match: FlashscoreMatch,
     betfair_candidates: list[MarketCandidate],
-) -> tuple[MarketCandidate | None, MatchConfidence]:
-    best_candidate: MarketCandidate | None = None
-    best_confidence = MatchConfidence("Low", "No Betfair match found", 0.0)
+) -> tuple[MarketCandidate | None, MatchConfidence, bool]:
+    db_log(
+        connection,
+        "INFO",
+        "name_match_started",
+        "Flashscore Betfair name matching started",
+        sport_name=flashscore_match.sport_name,
+        event_name=flashscore_match.match_name,
+        details={"flashscore_match_name": flashscore_match.match_name, "flashscore_competition": flashscore_match.competition_name},
+    )
+    scored: list[tuple[MarketCandidate, MatchConfidence]] = []
     for candidate in betfair_candidates:
         if normalize_sport_name(candidate.sport_name) != normalize_sport_name(flashscore_match.sport_name):
             continue
@@ -1613,10 +1915,53 @@ def best_betfair_match(
             flashscore_match.competition_name,
             candidate.competition_name,
         )
-        if confidence.score > best_confidence.score:
-            best_candidate = candidate
-            best_confidence = confidence
-    return best_candidate, best_confidence
+        if candidate.scheduled_start_utc and abs((flashscore_match.detected_live_at - candidate.scheduled_start_utc).total_seconds()) <= 3 * 3600:
+            confidence = replace(
+                confidence,
+                score=confidence.score + 5,
+                reason=f"{confidence.reason}; scheduled time near live detection",
+            )
+        scored.append((candidate, confidence))
+        db_log(
+            connection,
+            "DEBUG",
+            "name_match_candidate_scored",
+            f"Name match candidate scored: {confidence.score:.0f} {confidence.level}",
+            sport_name=flashscore_match.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={
+                "flashscore_match_name": flashscore_match.match_name,
+                "betfair_event_name": candidate.event_name,
+                "match_score": confidence.score,
+                "match_confidence": confidence.level,
+                "match_reason": confidence.reason,
+                "flashscore_surname_1": confidence.flashscore_surname_1,
+                "flashscore_surname_2": confidence.flashscore_surname_2,
+                "betfair_surname_1": confidence.betfair_surname_1,
+                "betfair_surname_2": confidence.betfair_surname_2,
+            },
+        )
+    if not scored:
+        return None, MatchConfidence("Low", "No Betfair match found", 0.0), False
+    scored.sort(key=lambda item: item[1].score, reverse=True)
+    best_candidate, best_confidence = scored[0]
+    if len(scored) > 1 and best_confidence.level == "High" and scored[1][1].score >= best_confidence.score - 8:
+        return best_candidate, MatchConfidence(
+            "Low",
+            f"ambiguous_match: top scores {best_confidence.score:.0f} and {scored[1][1].score:.0f}",
+            best_confidence.score,
+            best_confidence.flashscore_participant_1,
+            best_confidence.flashscore_participant_2,
+            best_confidence.betfair_participant_1,
+            best_confidence.betfair_participant_2,
+            best_confidence.flashscore_surname_1,
+            best_confidence.flashscore_surname_2,
+            best_confidence.betfair_surname_1,
+            best_confidence.betfair_surname_2,
+        ), True
+    return best_candidate, best_confidence, False
 
 
 def build_flashscore_slack_message(
@@ -1686,7 +2031,8 @@ def process_flashscore_live_matches(
     already_alerted = alerted_event_ids(connection)
 
     for flashscore_match in live_matches:
-        candidate, confidence = best_betfair_match(
+        candidate, confidence, ambiguous = best_betfair_match(
+            connection,
             flashscore_match,
             candidates_by_sport.get(flashscore_match.sport_name, []),
         )
@@ -1706,11 +2052,48 @@ def process_flashscore_live_matches(
                 },
             )
             continue
-        if confidence.level != "High":
+        if ambiguous:
+            record_flashscore_match_diagnostic(
+                connection,
+                candidate,
+                flashscore_match,
+                confidence,
+                now=utc_now(),
+                result="skipped",
+                reason="ambiguous_match",
+            )
             db_log(
                 connection,
                 "INFO",
-                "flashscore_betfair_match_low_confidence",
+                "name_match_ambiguous_no_alert",
+                "Flashscore Betfair match skipped as ambiguous",
+                sport_name=flashscore_match.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details={
+                    "flashscore_match_name": flashscore_match.match_name,
+                    "match_score": confidence.score,
+                    "match_confidence": confidence.level,
+                    "match_reason": confidence.reason,
+                },
+            )
+            continue
+        if confidence.level != "High":
+            record_flashscore_match_diagnostic(
+                connection,
+                candidate,
+                flashscore_match,
+                confidence,
+                now=utc_now(),
+                result="skipped",
+                reason=f"{confidence.level.casefold()}_confidence",
+            )
+            log_type = "name_match_medium_confidence_no_alert" if confidence.level == "Medium" else "name_match_low_confidence_no_alert"
+            db_log(
+                connection,
+                "INFO",
+                log_type,
                 "Flashscore Betfair match skipped due to low confidence",
                 sport_name=flashscore_match.sport_name,
                 event_id=candidate.event_id,
@@ -1729,7 +2112,7 @@ def process_flashscore_live_matches(
         db_log(
             connection,
             "INFO",
-            "flashscore_betfair_match_high_confidence",
+            "name_match_high_confidence",
             "Flashscore Betfair match high confidence",
             sport_name=flashscore_match.sport_name,
             event_id=candidate.event_id,
@@ -2080,6 +2463,28 @@ def run_self_test() -> int:
     assert is_excluded_sport("Greyhound Racing")
     assert not is_excluded_sport("Cricket")
 
+    smith_match = participant_confidence(("Smith M.", "Jones D."), ("Michael Smith", "Dave Jones"), "", "")
+    assert smith_match.level == "High"
+    assert smith_match.flashscore_surname_1 == "smith"
+    assert smith_match.betfair_surname_1 == "smith"
+    djokovic_match = participant_confidence(("Djokovic N.", "Alcaraz C."), ("Novak Djokovic", "Carlos Alcaraz"), "", "")
+    assert djokovic_match.level == "High"
+    van_gerwen_match = participant_confidence(
+        ("Van Gerwen M.", "Smith M."),
+        ("Michael van Gerwen", "Michael Smith"),
+        "Premier League Darts",
+        "Premier League Darts",
+    )
+    assert van_gerwen_match.level == "High"
+    assert van_gerwen_match.flashscore_surname_1 == "van gerwen"
+    assert van_gerwen_match.betfair_surname_1 == "van gerwen"
+    one_surname_match = participant_confidence(("Smith M.", "Brown D."), ("Michael Smith", "Dave Jones"), "", "")
+    assert one_surname_match.level == "Low"
+    assert "both participant surnames did not match" in one_surname_match.reason
+    doubles_match = participant_confidence(("Player A / Player B", "Player C / Player D"), ("Player A v Player B", "Player C v Player D"), "", "")
+    assert doubles_match.level == "Low"
+    assert "Doubles/team format skipped" in doubles_match.reason
+
     try:
         send_slack_message("", "test")
         raise AssertionError("missing webhook should fail")
@@ -2333,6 +2738,30 @@ def run_self_test() -> int:
             ("Luke Littler", "Michael Smith"),
         )
 
+        ambiguous_db = sqlite3.connect(":memory:")
+        ambiguous_db.row_factory = sqlite3.Row
+        init_db(ambiguous_db)
+        ambiguous_candidates = [
+            MarketCandidate("Darts", "15", "ambiguous-1", "Michael Smith v Dave Jones", "Premier League Darts", "1.amb1", utc_now()),
+            MarketCandidate("Darts", "15", "ambiguous-2", "Michael Smith v David Jones", "Premier League Darts", "1.amb2", utc_now()),
+        ]
+        ambiguous_match = FlashscoreMatch(
+            "Darts",
+            "Smith M. v Jones D.",
+            "Premier League Darts",
+            "Live",
+            "1-0",
+            "fs-ambiguous",
+            "https://www.flashscore.com/match/fs-ambiguous/",
+            utc_now(),
+            ("Smith M.", "Jones D."),
+        )
+        _, ambiguous_confidence, ambiguous = best_betfair_match(ambiguous_db, ambiguous_match, ambiguous_candidates)
+        assert ambiguous
+        assert ambiguous_confidence.level == "Low"
+        assert ambiguous_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'name_match_candidate_scored'").fetchone()[0] == 2
+        ambiguous_db.close()
+
         flash_db = sqlite3.connect(":memory:")
         flash_db.row_factory = sqlite3.Row
         init_db(flash_db)
@@ -2412,6 +2841,39 @@ def run_self_test() -> int:
         assert no_match_stats.slack_alerts_sent == 0
         assert no_match_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'flashscore_live_no_betfair_match'").fetchone()[0] >= 1
         no_match_db.close()
+
+        low_confidence_flash = FlashscoreMatch(
+            "Darts",
+            "Luke Littler v Peter Wright",
+            "Premier League Darts",
+            "Live - Set 1",
+            "1-0",
+            "fs-low-confidence",
+            "https://www.flashscore.com/match/fs-low-confidence/",
+            utc_now(),
+            ("Luke Littler", "Peter Wright"),
+        )
+        low_confidence_db = sqlite3.connect(":memory:")
+        low_confidence_db.row_factory = sqlite3.Row
+        init_db(low_confidence_db)
+        low_confidence_stats = ScanStats()
+        process_flashscore_live_matches(
+            low_confidence_db,
+            FlashscoreFakeClient(FlashscoreFakeBetting()),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            flash_args,
+            low_confidence_stats,
+            [low_confidence_flash],
+        )
+        low_confidence_state = low_confidence_db.execute(
+            "SELECT last_seen_inplay, betfair_last_seen_inplay, match_confidence, final_verification_reason FROM inplay_alert_state WHERE event_id = 'bf-darts-1'"
+        ).fetchone()
+        assert low_confidence_stats.slack_alerts_sent == 0
+        assert low_confidence_state["last_seen_inplay"] is None
+        assert low_confidence_state["betfair_last_seen_inplay"] is None
+        assert low_confidence_state["match_confidence"] == "Low"
+        assert low_confidence_state["final_verification_reason"] == "low_confidence"
+        low_confidence_db.close()
     finally:
         globals()["send_slack_message"] = real_send_slack_message
 

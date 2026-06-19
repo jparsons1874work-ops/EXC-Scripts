@@ -24,6 +24,7 @@ class CricketTimeResult:
 class InPlayCheckerResult:
     summary: dict[str, str]
     sport_breakdown: list[dict[str, str]]
+    active_groups: list[dict[str, object]]
     active_flags: list[dict[str, str]]
     recovered_events: list[dict[str, str]]
     recent_alerts: list[dict[str, str]]
@@ -34,6 +35,15 @@ class InPlayCheckerResult:
 
 UK_TZ = ZoneInfo("Europe/London")
 INPLAY_DB_PATH = OUTPUT_DIR / "betfair_inplay_start_checker.sqlite3"
+PREFERRED_SPORT_ORDER = {
+    "Tennis": 1,
+    "Darts": 2,
+    "Cricket": 3,
+    "Basketball": 4,
+    "Rugby Union": 5,
+    "Rugby League": 6,
+    "Snooker": 7,
+}
 
 
 SUMMARY_LABELS = (
@@ -144,6 +154,10 @@ def _rows(connection: sqlite3.Connection, query: str, params: tuple = ()) -> lis
     return [dict(row) for row in connection.execute(query, params).fetchall()]
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
 def _log_details(row: dict[str, str]) -> dict[str, str]:
     try:
         details = json.loads(row.get("details_json") or "{}")
@@ -167,6 +181,10 @@ def _decorate_log_rows(rows: list[dict[str, str]]) -> None:
 def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
     now = datetime.now(UK_TZ)
     for row in rows:
+        row["scheduled_start_utc_raw"] = row.get("scheduled_start_utc")
+        row["flashscore_detected_live_at_raw"] = row.get("flashscore_detected_live_at")
+        row["last_checked_at_raw"] = row.get("last_checked_at")
+        row["betfair_last_checked_at_raw"] = row.get("betfair_last_checked_at")
         inplay = row.get("betfair_last_seen_inplay", row.get("last_seen_inplay"))
         if inplay is None or inplay == "":
             row["inplay_label"] = "Unknown"
@@ -187,7 +205,9 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         row["display_event_name"] = str(row.get("flashscore_match_name") or row.get("event_name") or "")
         row["display_competition"] = str(row.get("flashscore_competition") or row.get("competition_name") or "")
         row["betfair_status_label"] = str(row.get("betfair_last_seen_status") or row.get("last_seen_status") or "")
-        row["match_confidence_label"] = str(row.get("match_confidence") or "")
+        confidence = str(row.get("match_confidence") or "")
+        score = row.get("match_score")
+        row["match_confidence_label"] = f"{confidence} ({score:.0f})" if confidence and isinstance(score, (int, float)) else confidence
         row["last_log_reason"] = str(
             row.get("slack_error")
             or row.get("match_reason")
@@ -207,6 +227,37 @@ def _format_duration(delta) -> str:
     if hours:
         return f"{hours}h {minutes}m {seconds}s"
     return f"{minutes}m {seconds}s"
+
+
+def _sort_time(row: dict[str, str]) -> datetime:
+    candidates = (
+        row.get("flashscore_detected_live_at_raw"),
+        row.get("scheduled_start_utc_raw"),
+        row.get("last_checked_at_raw"),
+        row.get("betfair_last_checked_at_raw"),
+    )
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UK_TZ)
+        except ValueError:
+            continue
+    return datetime.max.replace(tzinfo=UK_TZ)
+
+
+def _group_active_rows(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        row["display_time_uk"] = _format_db_time(row.get("flashscore_detected_live_at_raw") or row.get("scheduled_start_utc_raw"))
+        grouped.setdefault(str(row.get("sport_name") or "Other"), []).append(row)
+
+    groups: list[dict[str, object]] = []
+    for sport_name, sport_rows in grouped.items():
+        sport_rows.sort(key=lambda row: (_sort_time(row), str(row.get("display_event_name") or row.get("event_name") or "")))
+        groups.append({"sport_name": sport_name, "rows": sport_rows})
+    groups.sort(key=lambda group: (PREFERRED_SPORT_ORDER.get(str(group["sport_name"]), 99), str(group["sport_name"]).casefold()))
+    return groups
 
 
 def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -287,9 +338,14 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         columns = [description[0] for description in connection.execute("SELECT * FROM inplay_scan_runs LIMIT 1").description]
         latest_run = dict(zip(columns, latest))
         excluded_sports = json.loads(latest_run.get("excluded_sports_json") or "[]")
+        state_columns = _table_columns(connection, "inplay_alert_state")
+
+        def state_column(name: str, default: str = "''") -> str:
+            return name if name in state_columns else f"{default} AS {name}"
+
         active_flags = _rows(
             connection,
-            """
+            f"""
             SELECT event_id, market_id, sport_name, competition_name, event_name,
                    scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
                    last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
@@ -298,7 +354,11 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                    flashscore_competition, flashscore_status, flashscore_score,
                    flashscore_detected_live_at, match_confidence, match_reason,
                    betfair_last_checked_at, betfair_last_seen_inplay, betfair_last_seen_status,
-                   slack_alert_sent, slack_error
+                   slack_alert_sent, slack_error, {state_column("flashscore_participant_1")},
+                   {state_column("flashscore_participant_2")}, {state_column("betfair_participant_1")},
+                   {state_column("betfair_participant_2")}, {state_column("flashscore_surname_1")},
+                   {state_column("flashscore_surname_2")}, {state_column("betfair_surname_1")},
+                   {state_column("betfair_surname_2")}, {state_column("match_score", "NULL")}
             FROM inplay_alert_state
             ORDER BY COALESCE(betfair_last_checked_at, last_checked_at, first_flagged_at) DESC
             LIMIT 50
@@ -316,13 +376,14 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         )
         recent_alerts = _rows(
             connection,
-            """
+            f"""
             SELECT event_id, market_id, sport_name, competition_name, event_name,
                    scheduled_start_utc, scheduled_start_uk, alert_sent_at, last_seen_status,
                    last_seen_inplay, last_checked_at, final_verification_result, final_verification_reason,
                    trigger_source, flashscore_match_name, flashscore_competition, flashscore_status,
                    flashscore_score, match_confidence, match_reason, betfair_last_checked_at,
-                   betfair_last_seen_inplay, betfair_last_seen_status, slack_alert_sent, slack_error
+                   betfair_last_seen_inplay, betfair_last_seen_status, slack_alert_sent, slack_error,
+                   {state_column("match_score", "NULL")}
             FROM inplay_alert_state
             WHERE alert_sent_at IS NOT NULL
             ORDER BY alert_sent_at DESC
@@ -363,6 +424,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
 
         _decorate_state_rows(active_flags)
         _decorate_state_rows(recent_alerts)
+        active_groups = _group_active_rows(active_flags)
         for rows in (recovered_events,):
             for row in rows:
                 for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
@@ -370,6 +432,10 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                         row[key] = _format_db_time(row.get(key))
         _decorate_log_rows(recent_logs)
         _decorate_log_rows(recent_skipped_events)
+
+        ambiguous_matches = sum(1 for row in latest_scan_logs if row.get("event_type") == "name_match_ambiguous_no_alert")
+        active_not_inplay_flags = sum(1 for row in active_flags if row.get("inplay_label") == "No")
+        last_error_row = next((row for row in recent_logs if row.get("level") == "ERROR"), None)
 
         summary = {
             "last_scan_time": _format_db_time(latest_run.get("scan_completed_at") or latest_run.get("scan_started_at")),
@@ -384,12 +450,16 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             "betfair_time_scan_status": str(latest_run.get("betfair_time_scan_status", "")),
             "flashscore_scan_status": str(latest_run.get("flashscore_scan_status", "")),
             "flashscore_live_matches_found": str(latest_run.get("flashscore_live_matches_found", 0)),
+            "active_not_inplay_flags": str(active_not_inplay_flags),
+            "ambiguous_matches_skipped": str(ambiguous_matches),
+            "last_error": str(last_error_row.get("message") if last_error_row else ""),
             "dry_run": "yes" if latest_run.get("dry_run") else "no",
             "status": str(latest_run.get("status", "")),
         }
         return InPlayCheckerResult(
             summary=summary,
             sport_breakdown=sport_breakdown,
+            active_groups=active_groups,
             active_flags=active_flags,
             recovered_events=recovered_events,
             recent_alerts=recent_alerts,
