@@ -37,8 +37,11 @@ Required values depend on which scripts you run:
 - `APP_PASSWORD` protects the app. If absent, local dev is allowed with a visible warning.
 - Betfair scripts need `BETFAIR_USERNAME`, `BETFAIR_PASSWORD`, `BETFAIR_APP_KEY`, and cert/key file paths or B64 cert values.
 - Decimal scripts need `DECIMAL_USERNAME` and `DECIMAL_PASSWORD`.
+- Golf - Non-Runner Check needs `DG_API_KEY` for DataGolf field/schedule data.
+- Golf - Non-Runner Check Slack notifications should use `GOLF_NR_SLACK_WEBHOOK_URL`, or `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`. If using bot token/channel, invite the bot to the target Slack channel and grant `chat:write`.
 - Tennis integrity Slack notifications use `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the tennis-specific value is missing.
 - Betfair duplicate match and duplicate market Slack notifications use `DUPE_MATCH_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the duplicate-specific value is missing.
+- Betfair In-Play Start Checker uses `Slack_Webhook_TIP` exactly from the hub's server-side config/environment. It does not use `SLACK_WEBHOOK_URL`, Slack bot tokens, threads, or recovery messages.
 - Other Slack integrations may use `SLACK_WEBHOOK_URL` or bot token/channel values, depending on the script.
 
 ## Run Locally

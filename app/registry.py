@@ -60,6 +60,8 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "Golf",
         "Checks Betfair Exchange golf markets for potential non-runner issues.",
         "scripts/Golf_Exchange_NR_Checks.py",
+        long_running=True,
+        allowed_window=RunWindow("07:00", "23:00"),
     ),
     script(
         "Cricket - Decimal Fixture Scrape",
@@ -90,6 +92,15 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Betfair_Duplicate_Market_Check.py",
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
+    ),
+    script(
+        "Betfair In-Play Start Checker",
+        "Betfair",
+        "Flags MATCH_ODDS markets whose scheduled start is overdue but not in-play.",
+        "scripts/Betfair_InPlay_Start_Checker.py",
+        ("--repeat-minutes", "2"),
+        long_running=True,
+        parsed_output=True,
     ),
     script(
         "Tennis - Integrity Check",

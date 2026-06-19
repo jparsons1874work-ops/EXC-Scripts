@@ -13,7 +13,7 @@ This guide assumes an Ubuntu EC2 instance running the FastAPI Betfair Scripts Hu
 - Initial app test uses TCP `8000`.
 - Do not open HTTP/HTTPS publicly until the app works locally on the VM.
 - For team access, put Nginx and HTTPS in front of the app.
-- Secrets live only in `/opt/betfair-scripts/.env` on the server.
+- Secrets are supplied from `/opt/betfair-scripts/.env` on the AWS server by the running service.
 
 Security group guidance:
 
@@ -77,7 +77,7 @@ python3 -m venv .venv
 /opt/betfair-scripts/.venv/bin/python -m pip install -r requirements.txt
 ```
 
-Create server-only environment config:
+Create the server-only environment config used by the service:
 
 ```bash
 cp .env.example .env
@@ -90,7 +90,7 @@ At minimum set:
 APP_PASSWORD=use-a-strong-shared-password
 ```
 
-Set operational secrets as needed:
+Set operational secrets in `/opt/betfair-scripts/.env` as needed:
 
 ```bash
 BETFAIR_USERNAME=
@@ -98,19 +98,26 @@ BETFAIR_PASSWORD=
 BETFAIR_APP_KEY=
 DECIMAL_USERNAME=
 DECIMAL_PASSWORD=
+DG_API_KEY=
+GOLF_NR_SLACK_WEBHOOK_URL=
+GOLF_NR_SLACK_BOT_TOKEN=
+GOLF_NR_SLACK_CHANNEL=
 SLACK_BOT_TOKEN=
 SLACK_CHANNEL=
 TENNIS_INTEGRITY_SLACK_WEBHOOK_URL=
 DUPE_MATCH_SLACK_WEBHOOK_URL=
 SLACK_WEBHOOK_URL=
+Slack_Webhook_TIP=
 ```
 
 Slack webhook routing:
 
+- Golf - Non-Runner Check requires `DG_API_KEY` and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`.
 - Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
-- Keep the Tennis Integrity and Duplicate Matches webhook values separate so alerts do not cross channels.
+- Betfair In-Play Start Checker uses `Slack_Webhook_TIP` exactly from `/opt/betfair-scripts/.env`. Do not rename it to `SLACK_WEBHOOK_TIP` or `SLACK_WEBHOOK_URL`, and do not commit it, hardcode it, or print it in logs.
+- Keep the Golf NR, Tennis Integrity, Duplicate Matches, and In-Play Checker webhook values intentionally routed so alerts do not cross channels.
 
 Betfair certificate options:
 
@@ -167,7 +174,7 @@ Or use the helper after reviewing it:
 sudo bash deploy/create_systemd_service.sh
 ```
 
-The service:
+The example service:
 
 - Uses working directory `/opt/betfair-scripts`.
 - Loads environment from `/opt/betfair-scripts/.env`.

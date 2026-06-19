@@ -7,7 +7,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
 from app.config import APP_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
-from app.parsers import parse_cricket_time_check_output
+from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.runner import RUNNING, default_args_for, runner
 from app.scheduler import window_status
@@ -91,7 +91,13 @@ async def script_detail(request: Request, script_id: str):
     state = runner.get_state(script_id)
     allowed, window_label = window_status(spec)
     cricket = None
-    if spec.parsed_output and state.status != RUNNING:
+    inplay = None
+    if spec.id == "betfair-in-play-start-checker":
+        try:
+            inplay = parse_inplay_checker_state()
+        except Exception:
+            inplay = None
+    elif spec.parsed_output and state.status != RUNNING:
         try:
             cricket = parse_cricket_time_check_output(state.output_lines)
         except Exception:
@@ -106,6 +112,7 @@ async def script_detail(request: Request, script_id: str):
             allowed=allowed,
             window_label=window_label,
             cricket=cricket,
+            inplay=inplay,
         ),
     )
 
@@ -153,7 +160,13 @@ async def script_output(request: Request, script_id: str):
     spec = SCRIPTS_BY_ID[script_id]
     state = runner.get_state(script_id)
     cricket = None
-    if spec.parsed_output and state.status != RUNNING:
+    inplay = None
+    if spec.id == "betfair-in-play-start-checker":
+        try:
+            inplay = parse_inplay_checker_state()
+        except Exception:
+            inplay = None
+    elif spec.parsed_output and state.status != RUNNING:
         try:
             cricket = parse_cricket_time_check_output(state.output_lines)
         except Exception:
@@ -161,7 +174,7 @@ async def script_output(request: Request, script_id: str):
     return templates.TemplateResponse(
         request,
         "partials/output_console.html",
-        template_context(request, spec=spec, state=state, cricket=cricket),
+        template_context(request, spec=spec, state=state, cricket=cricket, inplay=inplay),
     )
 
 

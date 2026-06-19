@@ -1,0 +1,163 @@
+<div class="inplay-panel">
+  {% if inplay.config_error %}
+  <div class="error">{{ inplay.config_error }}</div>
+  {% endif %}
+
+  <div class="metric-row inplay-metrics">
+    <div class="metric">
+      <span class="metric-label">Last scan</span>
+      <span class="metric-value compact">{{ inplay.summary.last_scan_time or 'Never' }}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Next scan</span>
+      <span class="metric-value compact">{{ inplay.summary.next_scheduled_scan or 'Not scheduled' }}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Included sports</span>
+      <span class="metric-value">{{ inplay.summary.included_sports_count }}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Markets scanned</span>
+      <span class="metric-value">{{ inplay.summary.markets_scanned }}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Flags found</span>
+      <span class="metric-value">{{ inplay.summary.flags_found }}</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">Slack sent</span>
+      <span class="metric-value">{{ inplay.summary.slack_alerts_sent }}</span>
+    </div>
+  </div>
+
+  <div class="inplay-meta">
+    <span>Excluded sports: {{ inplay.summary.excluded_sports }}</span>
+    <span>Slack failures: {{ inplay.summary.slack_alert_failures }}</span>
+    <span>API errors: {{ inplay.summary.api_errors }}</span>
+    <span>Dry-run: {{ inplay.summary.dry_run }}</span>
+  </div>
+
+  <h3>Active Flagged Events</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Event</th>
+          <th>Sport</th>
+          <th>Competition</th>
+          <th>Event ID</th>
+          <th>Market ID</th>
+          <th>Start UK</th>
+          <th>Status</th>
+          <th>Alert sent</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.active_flags %}
+        <tr>
+          <td>{{ row.event_name }}</td>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.competition_name }}</td>
+          <td>{{ row.event_id }}</td>
+          <td>{{ row.market_id }}</td>
+          <td>{{ row.scheduled_start_uk }}</td>
+          <td>{{ row.last_seen_status }}</td>
+          <td>{{ row.alert_sent_at or 'No' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8">No active flagged events.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Recent Slack Alerts</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Alert time</th>
+          <th>Event</th>
+          <th>Sport</th>
+          <th>Event ID</th>
+          <th>Market ID</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.recent_alerts %}
+        <tr>
+          <td>{{ row.alert_sent_at }}</td>
+          <td>{{ row.event_name }}</td>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.event_id }}</td>
+          <td>{{ row.market_id }}</td>
+          <td>{{ row.last_seen_status }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No Slack alerts recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Later Seen In-Play</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Recovered</th>
+          <th>Event</th>
+          <th>Sport</th>
+          <th>Event ID</th>
+          <th>Market ID</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.recovered_events %}
+        <tr>
+          <td>{{ row.recovered_at }}</td>
+          <td>{{ row.event_name }}</td>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.event_id }}</td>
+          <td>{{ row.market_id }}</td>
+          <td>{{ row.last_seen_status }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No recovered events recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Recent Logs</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Level</th>
+          <th>Type</th>
+          <th>Message</th>
+          <th>Event ID</th>
+          <th>Market ID</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.recent_logs %}
+        <tr>
+          <td>{{ row.timestamp }}</td>
+          <td>{{ row.level }}</td>
+          <td>{{ row.event_type }}</td>
+          <td>{{ row.message }}</td>
+          <td>{{ row.event_id }}</td>
+          <td>{{ row.market_id }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No scan logs recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>

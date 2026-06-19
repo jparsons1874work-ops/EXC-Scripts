@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from app.config import OUTPUT_DIR
 
 
 @dataclass(frozen=True)
@@ -11,6 +18,20 @@ class CricketTimeResult:
     summary: dict[str, str]
     failure_message: str = ""
     root_error: str = ""
+
+
+@dataclass(frozen=True)
+class InPlayCheckerResult:
+    summary: dict[str, str]
+    active_flags: list[dict[str, str]]
+    recovered_events: list[dict[str, str]]
+    recent_alerts: list[dict[str, str]]
+    recent_logs: list[dict[str, str]]
+    config_error: str = ""
+
+
+UK_TZ = ZoneInfo("Europe/London")
+INPLAY_DB_PATH = OUTPUT_DIR / "betfair_inplay_start_checker.sqlite3"
 
 
 SUMMARY_LABELS = (
@@ -104,3 +125,106 @@ def parse_cricket_time_check_output(output_lines: list[str]) -> CricketTimeResul
             )
 
     return CricketTimeResult(mismatch_count=int(match.group(1)), rows=rows, summary=summary)
+
+
+def _format_db_time(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.astimezone(UK_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _rows(connection: sqlite3.Connection, query: str, params: tuple = ()) -> list[dict[str, str]]:
+    connection.row_factory = sqlite3.Row
+    return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+
+def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerResult | None:
+    if not db_path.exists():
+        return None
+
+    connection = sqlite3.connect(db_path)
+    try:
+        latest = connection.execute(
+            "SELECT * FROM inplay_scan_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            return None
+        columns = [description[0] for description in connection.execute("SELECT * FROM inplay_scan_runs LIMIT 1").description]
+        latest_run = dict(zip(columns, latest))
+        excluded_sports = json.loads(latest_run.get("excluded_sports_json") or "[]")
+        active_flags = _rows(
+            connection,
+            """
+            SELECT event_id, market_id, sport_name, competition_name, event_name,
+                   scheduled_start_uk, first_flagged_at, alert_sent_at,
+                   last_seen_status, last_seen_inplay, last_checked_at
+            FROM inplay_alert_state
+            WHERE recovered_at IS NULL
+            ORDER BY first_flagged_at DESC
+            LIMIT 20
+            """,
+        )
+        recovered_events = _rows(
+            connection,
+            """
+            SELECT event_id, market_id, sport_name, event_name, recovered_at, last_seen_status, last_checked_at
+            FROM inplay_alert_state
+            WHERE recovered_at IS NOT NULL
+            ORDER BY recovered_at DESC
+            LIMIT 10
+            """,
+        )
+        recent_alerts = _rows(
+            connection,
+            """
+            SELECT event_id, market_id, sport_name, competition_name, event_name,
+                   scheduled_start_uk, alert_sent_at, last_seen_status
+            FROM inplay_alert_state
+            WHERE alert_sent_at IS NOT NULL
+            ORDER BY alert_sent_at DESC
+            LIMIT 10
+            """,
+        )
+        recent_logs = _rows(
+            connection,
+            """
+            SELECT timestamp, level, event_type, message, sport_name, event_id, market_id
+            FROM inplay_scan_logs
+            ORDER BY id DESC
+            LIMIT 30
+            """,
+        )
+
+        for rows in (active_flags, recovered_events, recent_alerts, recent_logs):
+            for row in rows:
+                for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
+                    if key in row:
+                        row[key] = _format_db_time(row.get(key))
+
+        summary = {
+            "last_scan_time": _format_db_time(latest_run.get("scan_completed_at") or latest_run.get("scan_started_at")),
+            "next_scheduled_scan": _format_db_time(latest_run.get("next_scan_at")),
+            "included_sports_count": str(latest_run.get("included_sports_count", 0)),
+            "excluded_sports": ", ".join(excluded_sports) if excluded_sports else "None",
+            "markets_scanned": str(latest_run.get("markets_scanned", 0)),
+            "flags_found": str(latest_run.get("flags_found", 0)),
+            "slack_alerts_sent": str(latest_run.get("slack_alerts_sent", 0)),
+            "slack_alert_failures": str(latest_run.get("slack_alert_failures", 0)),
+            "api_errors": str(latest_run.get("api_errors", 0)),
+            "dry_run": "yes" if latest_run.get("dry_run") else "no",
+            "status": str(latest_run.get("status", "")),
+        }
+        return InPlayCheckerResult(
+            summary=summary,
+            active_flags=active_flags,
+            recovered_events=recovered_events,
+            recent_alerts=recent_alerts,
+            recent_logs=recent_logs,
+            config_error=str(latest_run.get("config_error") or ""),
+        )
+    finally:
+        connection.close()
