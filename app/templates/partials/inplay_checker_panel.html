@@ -37,6 +37,44 @@
     <span>Dry-run: {{ inplay.summary.dry_run }}</span>
   </div>
 
+  <h3>Latest Scan Sport Breakdown</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Sport</th>
+          <th>Markets</th>
+          <th>Not overdue</th>
+          <th>In-play</th>
+          <th>Closed</th>
+          <th>Already alerted</th>
+          <th>Missing event ID</th>
+          <th>Flags</th>
+          <th>Slack alerts</th>
+          <th>API errors</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.sport_breakdown %}
+        <tr>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.markets_scanned }}</td>
+          <td>{{ row.not_overdue }}</td>
+          <td>{{ row.already_in_play }}</td>
+          <td>{{ row.closed }}</td>
+          <td>{{ row.already_alerted }}</td>
+          <td>{{ row.missing_event_id }}</td>
+          <td>{{ row.flags }}</td>
+          <td>{{ row.slack_alerts }}</td>
+          <td>{{ row.api_errors }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="10">No sport breakdown recorded for the latest scan.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
   <h3>Active Flagged Events</h3>
   <div class="table-wrap">
     <table>
@@ -126,6 +164,36 @@
         </tr>
         {% else %}
         <tr><td colspan="6">No recovered events recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Recent Skipped Events</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Reason</th>
+          <th>Sport</th>
+          <th>Event</th>
+          <th>Event ID</th>
+          <th>Market ID</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in inplay.recent_skipped_events %}
+        <tr>
+          <td>{{ row.timestamp }}</td>
+          <td>{{ row.reason or row.message }}</td>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.event_name }}</td>
+          <td>{{ row.event_id }}</td>
+          <td>{{ row.market_id }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No skipped events recorded.</td></tr>
         {% endfor %}
       </tbody>
     </table>

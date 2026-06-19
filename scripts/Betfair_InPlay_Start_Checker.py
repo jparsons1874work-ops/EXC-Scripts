@@ -723,7 +723,14 @@ def fetch_overdue_candidates(
             continue
 
         stats.markets_scanned += len(catalogues)
-        db_log(connection, "INFO", "markets_scanned", f"{event_type.sport_name}: {len(catalogues)} MATCH_ODDS markets")
+        db_log(
+            connection,
+            "INFO",
+            "markets_scanned",
+            f"{event_type.sport_name}: {len(catalogues)} MATCH_ODDS markets",
+            sport_name=event_type.sport_name,
+            details={"markets_scanned": len(catalogues), "event_type_id": event_type.event_type_id},
+        )
         for catalogue in catalogues:
             candidate = catalogue_to_candidate(catalogue, event_type)
             if not candidate.event_id:

@@ -23,9 +23,11 @@ class CricketTimeResult:
 @dataclass(frozen=True)
 class InPlayCheckerResult:
     summary: dict[str, str]
+    sport_breakdown: list[dict[str, str]]
     active_flags: list[dict[str, str]]
     recovered_events: list[dict[str, str]]
     recent_alerts: list[dict[str, str]]
+    recent_skipped_events: list[dict[str, str]]
     recent_logs: list[dict[str, str]]
     config_error: str = ""
 
@@ -142,6 +144,90 @@ def _rows(connection: sqlite3.Connection, query: str, params: tuple = ()) -> lis
     return [dict(row) for row in connection.execute(query, params).fetchall()]
 
 
+def _log_details(row: dict[str, str]) -> dict[str, str]:
+    try:
+        details = json.loads(row.get("details_json") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(details, dict):
+        return {}
+    return details
+
+
+def _decorate_log_rows(rows: list[dict[str, str]]) -> None:
+    for row in rows:
+        details = _log_details(row)
+        row["event_name"] = str(details.get("event_name") or "")
+        row["reason"] = str(details.get("reason") or "")
+        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
+            if key in row:
+                row[key] = _format_db_time(row.get(key))
+
+
+def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    breakdown: dict[str, dict[str, int | str]] = {}
+
+    def entry_for(sport_name: str) -> dict[str, int | str]:
+        sport = sport_name or "unknown"
+        if sport not in breakdown:
+            breakdown[sport] = {
+                "sport_name": sport,
+                "markets_scanned": 0,
+                "not_overdue": 0,
+                "already_in_play": 0,
+                "closed": 0,
+                "already_alerted": 0,
+                "missing_event_id": 0,
+                "flags": 0,
+                "slack_alerts": 0,
+                "api_errors": 0,
+                "other_skips": 0,
+            }
+        return breakdown[sport]
+
+    for row in rows:
+        details = _log_details(row)
+        sport_name = str(row.get("sport_name") or "")
+        if not sport_name and row.get("event_type") == "markets_scanned":
+            message = str(row.get("message") or "")
+            sport_name = message.split(":", 1)[0].strip()
+        entry = entry_for(sport_name)
+
+        event_type = str(row.get("event_type") or "")
+        reason = str(details.get("reason") or "")
+        if event_type == "markets_scanned":
+            try:
+                entry["markets_scanned"] = int(entry["markets_scanned"]) + int(details.get("markets_scanned") or 0)
+            except (TypeError, ValueError):
+                pass
+        elif event_type == "skipped":
+            if reason == "not overdue":
+                entry["not_overdue"] = int(entry["not_overdue"]) + 1
+            elif reason == "already in-play":
+                entry["already_in_play"] = int(entry["already_in_play"]) + 1
+            elif reason == "closed":
+                entry["closed"] = int(entry["closed"]) + 1
+            elif reason == "already alerted":
+                entry["already_alerted"] = int(entry["already_alerted"]) + 1
+            elif reason == "missing event ID":
+                entry["missing_event_id"] = int(entry["missing_event_id"]) + 1
+            else:
+                entry["other_skips"] = int(entry["other_skips"]) + 1
+        elif event_type == "dry_run_alert":
+            entry["flags"] = int(entry["flags"]) + 1
+        elif event_type == "slack_alert_sent":
+            entry["flags"] = int(entry["flags"]) + 1
+            entry["slack_alerts"] = int(entry["slack_alerts"]) + 1
+        elif event_type == "api_error":
+            entry["api_errors"] = int(entry["api_errors"]) + 1
+
+    return [
+        {key: str(value) for key, value in row.items()}
+        for row in sorted(breakdown.values(), key=lambda item: str(item["sport_name"]).casefold())
+        if any(int(row.get(metric, "0")) for metric in ("markets_scanned", "not_overdue", "already_in_play", "closed", "flags", "api_errors"))
+    ]
+
+
 def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerResult | None:
     if not db_path.exists():
         return None
@@ -195,21 +281,39 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             SELECT timestamp, level, event_type, message, sport_name, event_id, market_id, details_json
             FROM inplay_scan_logs
             ORDER BY id DESC
-            LIMIT 30
+            LIMIT 80
             """,
         )
+        recent_skipped_events = _rows(
+            connection,
+            """
+            SELECT timestamp, level, event_type, message, sport_name, event_id, market_id, details_json
+            FROM inplay_scan_logs
+            WHERE event_type = 'skipped'
+            ORDER BY id DESC
+            LIMIT 200
+            """,
+        )
+        latest_scan_logs = _rows(
+            connection,
+            """
+            SELECT timestamp, level, event_type, message, sport_name, event_id, market_id, details_json
+            FROM inplay_scan_logs
+            WHERE timestamp >= ?
+            ORDER BY id ASC
+            LIMIT 5000
+            """,
+            (latest_run.get("scan_started_at") or "",),
+        )
+        sport_breakdown = _latest_scan_sport_breakdown(latest_scan_logs)
 
-        for rows in (active_flags, recovered_events, recent_alerts, recent_logs):
+        for rows in (active_flags, recovered_events, recent_alerts):
             for row in rows:
-                if "details_json" in row:
-                    try:
-                        details = json.loads(row.get("details_json") or "{}")
-                    except json.JSONDecodeError:
-                        details = {}
-                    row["event_name"] = str(details.get("event_name") or "")
                 for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
                     if key in row:
                         row[key] = _format_db_time(row.get(key))
+        _decorate_log_rows(recent_logs)
+        _decorate_log_rows(recent_skipped_events)
 
         summary = {
             "last_scan_time": _format_db_time(latest_run.get("scan_completed_at") or latest_run.get("scan_started_at")),
@@ -226,9 +330,11 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         }
         return InPlayCheckerResult(
             summary=summary,
+            sport_breakdown=sport_breakdown,
             active_flags=active_flags,
             recovered_events=recovered_events,
             recent_alerts=recent_alerts,
+            recent_skipped_events=recent_skipped_events,
             recent_logs=recent_logs,
             config_error=str(latest_run.get("config_error") or ""),
         )
