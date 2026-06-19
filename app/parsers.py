@@ -164,6 +164,43 @@ def _decorate_log_rows(rows: list[dict[str, str]]) -> None:
                 row[key] = _format_db_time(row.get(key))
 
 
+def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
+    now = datetime.now(UK_TZ)
+    for row in rows:
+        inplay = row.get("last_seen_inplay")
+        if inplay is None or inplay == "":
+            row["inplay_label"] = "Unknown"
+        elif int(inplay) == 1:
+            row["inplay_label"] = "Yes"
+        else:
+            row["inplay_label"] = "No"
+
+        start_value = row.get("scheduled_start_utc")
+        try:
+            start_dt = datetime.fromisoformat(str(start_value or "").replace("Z", "+00:00")).astimezone(UK_TZ)
+        except ValueError:
+            start_dt = None
+        row["overdue_by"] = _format_duration(now - start_dt) if start_dt else ""
+        row["slack_alert_sent"] = "Yes" if row.get("alert_sent_at") else "No"
+        row["last_log_reason"] = str(
+            row.get("final_verification_reason")
+            or row.get("final_verification_result")
+            or ""
+        )
+        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "final_verification_at"):
+            if key in row:
+                row[key] = _format_db_time(row.get(key))
+
+
+def _format_duration(delta) -> str:
+    total_seconds = max(0, int(delta.total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{minutes}m {seconds}s"
+
+
 def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     breakdown: dict[str, dict[str, int | str]] = {}
 
@@ -218,7 +255,7 @@ def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, s
         elif event_type == "slack_alert_sent":
             entry["flags"] = int(entry["flags"]) + 1
             entry["slack_alerts"] = int(entry["slack_alerts"]) + 1
-        elif event_type == "api_error":
+        elif event_type in {"api_error", "final_verification_failed"}:
             entry["api_errors"] = int(entry["api_errors"]) + 1
 
     return [
@@ -246,12 +283,12 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             connection,
             """
             SELECT event_id, market_id, sport_name, competition_name, event_name,
-                   scheduled_start_uk, first_flagged_at, alert_sent_at,
-                   last_seen_status, last_seen_inplay, last_checked_at
+                   scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
+                   last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
+                   final_verification_at, final_verification_result, final_verification_reason
             FROM inplay_alert_state
-            WHERE recovered_at IS NULL
-            ORDER BY first_flagged_at DESC
-            LIMIT 20
+            ORDER BY COALESCE(last_checked_at, first_flagged_at) DESC
+            LIMIT 50
             """,
         )
         recovered_events = _rows(
@@ -268,7 +305,8 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             connection,
             """
             SELECT event_id, market_id, sport_name, competition_name, event_name,
-                   scheduled_start_uk, alert_sent_at, last_seen_status
+                   scheduled_start_utc, scheduled_start_uk, alert_sent_at, last_seen_status,
+                   last_seen_inplay, last_checked_at, final_verification_result, final_verification_reason
             FROM inplay_alert_state
             WHERE alert_sent_at IS NOT NULL
             ORDER BY alert_sent_at DESC
@@ -307,7 +345,9 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         )
         sport_breakdown = _latest_scan_sport_breakdown(latest_scan_logs)
 
-        for rows in (active_flags, recovered_events, recent_alerts):
+        _decorate_state_rows(active_flags)
+        _decorate_state_rows(recent_alerts)
+        for rows in (recovered_events,):
             for row in rows:
                 for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
                     if key in row:

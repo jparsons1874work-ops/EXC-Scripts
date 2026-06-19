@@ -269,10 +269,16 @@ def init_db(connection: sqlite3.Connection) -> None:
             last_seen_status TEXT,
             last_seen_inplay INTEGER,
             recovered_at TEXT,
-            last_checked_at TEXT
+            last_checked_at TEXT,
+            final_verification_at TEXT,
+            final_verification_result TEXT,
+            final_verification_reason TEXT
         )
         """
     )
+    ensure_column(connection, "inplay_alert_state", "final_verification_at", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "final_verification_result", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "final_verification_reason", "TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS inplay_scan_logs (
@@ -311,6 +317,12 @@ def init_db(connection: sqlite3.Connection) -> None:
         """
     )
     connection.commit()
+
+
+def ensure_column(connection: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def db_log(
@@ -551,10 +563,17 @@ def upsert_alert_state(
     *,
     now: datetime,
     alert_sent_at: datetime | None = None,
+    final_verification_at: datetime | None = None,
+    final_verification_result: str = "",
+    final_verification_reason: str = "",
 ) -> None:
     first_flagged_at = iso_utc(now)
     existing = connection.execute(
-        "SELECT first_flagged_at, alert_sent_at, recovered_at FROM inplay_alert_state WHERE event_id = ?",
+        """
+        SELECT first_flagged_at, alert_sent_at, recovered_at, final_verification_result, final_verification_reason
+        FROM inplay_alert_state
+        WHERE event_id = ?
+        """,
         (candidate.event_id,),
     ).fetchone()
     recovered_at = existing["recovered_at"] if existing else None
@@ -565,9 +584,10 @@ def upsert_alert_state(
         INSERT INTO inplay_alert_state (
             event_id, market_id, sport_name, competition_name, event_name,
             scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
-            last_seen_status, last_seen_inplay, recovered_at, last_checked_at
+            last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
+            final_verification_at, final_verification_result, final_verification_reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(event_id) DO UPDATE SET
             market_id = excluded.market_id,
             sport_name = excluded.sport_name,
@@ -580,7 +600,16 @@ def upsert_alert_state(
             last_seen_status = excluded.last_seen_status,
             last_seen_inplay = excluded.last_seen_inplay,
             recovered_at = COALESCE(inplay_alert_state.recovered_at, excluded.recovered_at),
-            last_checked_at = excluded.last_checked_at
+            last_checked_at = excluded.last_checked_at,
+            final_verification_at = COALESCE(excluded.final_verification_at, inplay_alert_state.final_verification_at),
+            final_verification_result = CASE
+                WHEN excluded.final_verification_result != '' THEN excluded.final_verification_result
+                ELSE inplay_alert_state.final_verification_result
+            END,
+            final_verification_reason = CASE
+                WHEN excluded.final_verification_reason != '' THEN excluded.final_verification_reason
+                ELSE inplay_alert_state.final_verification_reason
+            END
         """,
         (
             candidate.event_id,
@@ -596,9 +625,206 @@ def upsert_alert_state(
             int(book.inplay),
             recovered_at,
             iso_utc(now),
+            iso_utc(final_verification_at) if final_verification_at else None,
+            final_verification_result or (existing["final_verification_result"] if existing else ""),
+            final_verification_reason or (existing["final_verification_reason"] if existing else ""),
         ),
     )
     connection.commit()
+
+
+def record_final_verification_failed(
+    connection: sqlite3.Connection,
+    candidate: MarketCandidate,
+    initial_book: MarketBookSnapshot,
+    *,
+    now: datetime,
+    reason: str,
+) -> None:
+    existing = connection.execute(
+        """
+        SELECT first_flagged_at, alert_sent_at, recovered_at
+        FROM inplay_alert_state
+        WHERE event_id = ?
+        """,
+        (candidate.event_id,),
+    ).fetchone()
+    connection.execute(
+        """
+        INSERT INTO inplay_alert_state (
+            event_id, market_id, sport_name, competition_name, event_name,
+            scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
+            last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
+            final_verification_at, final_verification_result, final_verification_reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            market_id = excluded.market_id,
+            sport_name = excluded.sport_name,
+            competition_name = excluded.competition_name,
+            event_name = excluded.event_name,
+            scheduled_start_utc = excluded.scheduled_start_utc,
+            scheduled_start_uk = excluded.scheduled_start_uk,
+            last_seen_status = excluded.last_seen_status,
+            last_seen_inplay = NULL,
+            last_checked_at = excluded.last_checked_at,
+            final_verification_at = excluded.final_verification_at,
+            final_verification_result = excluded.final_verification_result,
+            final_verification_reason = excluded.final_verification_reason
+        """,
+        (
+            candidate.event_id,
+            candidate.market_id,
+            candidate.sport_name,
+            candidate.competition_name,
+            candidate.event_name,
+            iso_utc(candidate.scheduled_start_utc),
+            format_uk_datetime(candidate.scheduled_start_utc),
+            existing["first_flagged_at"] if existing else iso_utc(now),
+            existing["alert_sent_at"] if existing else None,
+            initial_book.status,
+            None,
+            existing["recovered_at"] if existing else None,
+            iso_utc(now),
+            iso_utc(now),
+            "failed",
+            reason,
+        ),
+    )
+    connection.commit()
+
+
+def verify_candidate_before_alert(
+    connection: sqlite3.Connection,
+    client: APIClient,
+    candidate: MarketCandidate,
+    initial_book: MarketBookSnapshot,
+    already_alerted: set[str],
+    overdue_minutes: float,
+) -> MarketBookSnapshot | None:
+    db_log(
+        connection,
+        "INFO",
+        "final_verification_started",
+        "Final verification started",
+        sport_name=candidate.sport_name,
+        event_id=candidate.event_id,
+        market_id=candidate.market_id,
+        event_name=candidate.event_name,
+    )
+    try:
+        final_books = list_market_books(client, [candidate.market_id])
+        final_book = final_books.get(candidate.market_id)
+        if final_book is None:
+            raise RuntimeError("No MarketBook returned for final verification")
+    except Exception as exc:
+        now = utc_now()
+        reason = str(exc)
+        record_final_verification_failed(connection, candidate, initial_book, now=now, reason=reason)
+        db_log(
+            connection,
+            "ERROR",
+            "final_verification_failed",
+            f"Final verification failed: {reason}",
+            sport_name=candidate.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={"reason": reason},
+        )
+        return None
+
+    now = utc_now()
+    latest_alerted = already_alerted | alerted_event_ids(connection)
+    final_decision = alert_decision(candidate, final_book, now, latest_alerted, overdue_minutes)
+    if final_book.inplay:
+        upsert_alert_state(
+            connection,
+            candidate,
+            final_book,
+            now=now,
+            final_verification_at=now,
+            final_verification_result="suppressed",
+            final_verification_reason="inplay",
+        )
+        db_log(
+            connection,
+            "INFO",
+            "candidate_suppressed_final_check_inplay",
+            "Candidate suppressed by final check: market is in-play",
+            sport_name=candidate.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={"status": final_book.status, "inplay": final_book.inplay},
+        )
+        return None
+    if final_book.status == "CLOSED":
+        upsert_alert_state(
+            connection,
+            candidate,
+            final_book,
+            now=now,
+            final_verification_at=now,
+            final_verification_result="suppressed",
+            final_verification_reason="closed",
+        )
+        db_log(
+            connection,
+            "INFO",
+            "candidate_suppressed_final_check_closed",
+            "Candidate suppressed by final check: market is closed",
+            sport_name=candidate.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={"status": final_book.status, "inplay": final_book.inplay},
+        )
+        return None
+    if not final_decision.should_alert:
+        upsert_alert_state(
+            connection,
+            candidate,
+            final_book,
+            now=now,
+            final_verification_at=now,
+            final_verification_result="suppressed",
+            final_verification_reason=final_decision.reason,
+        )
+        db_log(
+            connection,
+            "INFO",
+            "skipped",
+            f"Candidate suppressed by final check: {final_decision.reason}",
+            sport_name=candidate.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={"reason": final_decision.reason, "status": final_book.status, "inplay": final_book.inplay},
+        )
+        return None
+
+    upsert_alert_state(
+        connection,
+        candidate,
+        final_book,
+        now=now,
+        final_verification_at=now,
+        final_verification_result="confirmed_not_inplay",
+        final_verification_reason="not_inplay",
+    )
+    db_log(
+        connection,
+        "INFO",
+        "final_verification_confirmed_not_inplay",
+        "Final verification confirmed market is still not in-play",
+        sport_name=candidate.sport_name,
+        event_id=candidate.event_id,
+        market_id=candidate.market_id,
+        event_name=candidate.event_name,
+        details={"status": final_book.status, "inplay": final_book.inplay},
+    )
+    return final_book
 
 
 def build_slack_message(candidate: MarketCandidate, book: MarketBookSnapshot, now: datetime) -> str:
@@ -836,9 +1062,32 @@ def process_candidates(
                 )
                 continue
 
-            stats.flags_found += 1
+            db_log(
+                connection,
+                "INFO",
+                "candidate_found",
+                "Candidate found for final verification",
+                sport_name=candidate.sport_name,
+                event_id=candidate.event_id,
+                market_id=market_id,
+                event_name=candidate.event_name,
+                details={"status": book.status, "inplay": book.inplay},
+            )
             handled_this_scan.add(candidate.event_id)
-            message = build_slack_message(candidate, book, now)
+            final_book = verify_candidate_before_alert(
+                connection,
+                client,
+                candidate,
+                book,
+                already_alerted,
+                args.overdue_minutes,
+            )
+            if final_book is None:
+                continue
+
+            stats.flags_found += 1
+            alert_now = utc_now()
+            message = build_slack_message(candidate, final_book, alert_now)
             print("", flush=True)
             print(message, flush=True)
             if args.dry_run:
@@ -866,7 +1115,14 @@ def process_candidates(
                     market_id=market_id,
                     event_name=candidate.event_name,
                 )
-                upsert_alert_state(connection, candidate, book, now=now)
+                upsert_alert_state(
+                    connection,
+                    candidate,
+                    final_book,
+                    now=alert_now,
+                    final_verification_result="confirmed_not_inplay",
+                    final_verification_reason=f"{SLACK_WEBHOOK_ENV_NAME} missing",
+                )
                 continue
 
             try:
@@ -876,20 +1132,35 @@ def process_candidates(
                 db_log(
                     connection,
                     "ERROR",
-                    "slack_failure",
+                    "slack_alert_failed",
                     f"Slack alert failed: {exc}",
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
                     event_name=candidate.event_name,
                 )
-                upsert_alert_state(connection, candidate, book, now=now)
+                upsert_alert_state(
+                    connection,
+                    candidate,
+                    final_book,
+                    now=alert_now,
+                    final_verification_result="confirmed_not_inplay",
+                    final_verification_reason=f"slack_failed: {exc}",
+                )
                 continue
 
             sent_at = utc_now()
             stats.slack_alerts_sent += 1
             already_alerted.add(candidate.event_id)
-            upsert_alert_state(connection, candidate, book, now=now, alert_sent_at=sent_at)
+            upsert_alert_state(
+                connection,
+                candidate,
+                final_book,
+                now=alert_now,
+                alert_sent_at=sent_at,
+                final_verification_result="confirmed_not_inplay",
+                final_verification_reason="alert_sent",
+            )
             db_log(
                 connection,
                 "INFO",
@@ -1044,7 +1315,12 @@ def run_self_test() -> int:
     assert dry_run_stats.flags_found == 1
     assert dry_run_stats.slack_alerts_sent == 0
     assert dry_run_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'dry_run_alert'").fetchone()[0] == 1
-    assert dry_run_db.execute("SELECT COUNT(*) FROM inplay_alert_state").fetchone()[0] == 0
+    dry_run_state = dry_run_db.execute(
+        "SELECT final_verification_result, last_seen_inplay FROM inplay_alert_state WHERE event_id = ?",
+        (runtime_candidate.event_id,),
+    ).fetchone()
+    assert dry_run_state["final_verification_result"] == "confirmed_not_inplay"
+    assert dry_run_state["last_seen_inplay"] == 0
     dry_run_db.close()
 
     sent_messages: list[str] = []
@@ -1082,6 +1358,83 @@ def run_self_test() -> int:
         assert second_stats.slack_alerts_sent == 0
         assert second_stats.skipped_events == 1
         duplicate_db.close()
+
+        class FinalInplayBetting:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def list_market_book(self, market_ids: list[str]) -> list[dict[str, Any]]:
+                self.calls += 1
+                inplay = self.calls == 2
+                return [{"market_id": market_id, "status": "OPEN", "inplay": inplay} for market_id in market_ids]
+
+        class FinalInplayClient:
+            def __init__(self) -> None:
+                self.betting = FinalInplayBetting()
+
+        inplay_db = sqlite3.connect(":memory:")
+        inplay_db.row_factory = sqlite3.Row
+        init_db(inplay_db)
+        inplay_stats = ScanStats()
+        process_candidates(
+            inplay_db,
+            FinalInplayClient(),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            send_args,
+            [runtime_candidate],
+            inplay_stats,
+        )
+        inplay_state = inplay_db.execute(
+            "SELECT last_seen_inplay, final_verification_result, final_verification_reason FROM inplay_alert_state WHERE event_id = ?",
+            (runtime_candidate.event_id,),
+        ).fetchone()
+        assert inplay_stats.slack_alerts_sent == 0
+        assert inplay_state["last_seen_inplay"] == 1
+        assert inplay_state["final_verification_result"] == "suppressed"
+        assert inplay_state["final_verification_reason"] == "inplay"
+        assert inplay_db.execute(
+            "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'candidate_suppressed_final_check_inplay'"
+        ).fetchone()[0] == 1
+        inplay_db.close()
+
+        class FinalFailureBetting:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def list_market_book(self, market_ids: list[str]) -> list[dict[str, Any]]:
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("final lookup failed")
+                return [{"market_id": market_id, "status": "OPEN", "inplay": False} for market_id in market_ids]
+
+        class FinalFailureClient:
+            def __init__(self) -> None:
+                self.betting = FinalFailureBetting()
+
+        failure_db = sqlite3.connect(":memory:")
+        failure_db.row_factory = sqlite3.Row
+        init_db(failure_db)
+        failure_stats = ScanStats()
+        process_candidates(
+            failure_db,
+            FinalFailureClient(),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            send_args,
+            [runtime_candidate],
+            failure_stats,
+        )
+        failure_state = failure_db.execute(
+            "SELECT last_seen_inplay, final_verification_result, final_verification_reason FROM inplay_alert_state WHERE event_id = ?",
+            (runtime_candidate.event_id,),
+        ).fetchone()
+        assert failure_stats.slack_alerts_sent == 0
+        assert failure_state["last_seen_inplay"] is None
+        assert failure_state["final_verification_result"] == "failed"
+        assert "final lookup failed" in failure_state["final_verification_reason"]
+        assert failure_db.execute(
+            "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'final_verification_failed'"
+        ).fetchone()[0] == 1
+        failure_db.close()
     finally:
         globals()["send_slack_message"] = real_send_slack_message
 

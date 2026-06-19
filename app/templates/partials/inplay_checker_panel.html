@@ -75,7 +75,7 @@
     </table>
   </div>
 
-  <h3>Active Flagged Events</h3>
+  <h3>Flagged / Checked Events</h3>
   <div class="table-wrap">
     <table>
       <thead>
@@ -86,8 +86,13 @@
           <th>Event ID</th>
           <th>Market ID</th>
           <th>Start UK</th>
+          <th>Overdue by</th>
           <th>Status</th>
-          <th>Alert sent</th>
+          <th>In-Play</th>
+          <th>Slack alert sent</th>
+          <th>Alert sent at</th>
+          <th>Last checked at</th>
+          <th>Last log/reason</th>
         </tr>
       </thead>
       <tbody>
@@ -99,11 +104,16 @@
           <td>{{ row.event_id }}</td>
           <td>{{ row.market_id }}</td>
           <td>{{ row.scheduled_start_uk }}</td>
+          <td>{{ row.overdue_by }}</td>
           <td>{{ row.last_seen_status }}</td>
-          <td>{{ row.alert_sent_at or 'No' }}</td>
+          <td>{{ row.inplay_label }}</td>
+          <td>{{ row.slack_alert_sent }}</td>
+          <td>{{ row.alert_sent_at }}</td>
+          <td>{{ row.last_checked_at }}</td>
+          <td>{{ row.last_log_reason }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="8">No active flagged events.</td></tr>
+        <tr><td colspan="13">No flagged or checked events.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -117,9 +127,15 @@
           <th>Alert time</th>
           <th>Event</th>
           <th>Sport</th>
+          <th>Competition</th>
           <th>Event ID</th>
           <th>Market ID</th>
+          <th>Start UK</th>
+          <th>Overdue by</th>
           <th>Status</th>
+          <th>In-Play</th>
+          <th>Last checked at</th>
+          <th>Last log/reason</th>
         </tr>
       </thead>
       <tbody>
@@ -128,12 +144,18 @@
           <td>{{ row.alert_sent_at }}</td>
           <td>{{ row.event_name }}</td>
           <td>{{ row.sport_name }}</td>
+          <td>{{ row.competition_name }}</td>
           <td>{{ row.event_id }}</td>
           <td>{{ row.market_id }}</td>
+          <td>{{ row.scheduled_start_uk }}</td>
+          <td>{{ row.overdue_by }}</td>
           <td>{{ row.last_seen_status }}</td>
+          <td>{{ row.inplay_label }}</td>
+          <td>{{ row.last_checked_at }}</td>
+          <td>{{ row.last_log_reason }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="6">No Slack alerts recorded.</td></tr>
+        <tr><td colspan="12">No Slack alerts recorded.</td></tr>
         {% endfor %}
       </tbody>
     </table>
