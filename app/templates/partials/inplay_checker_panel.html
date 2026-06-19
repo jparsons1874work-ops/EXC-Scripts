@@ -32,6 +32,9 @@
 
   <div class="inplay-meta">
     <span>Excluded sports: {{ inplay.summary.excluded_sports }}</span>
+    <span>Betfair scan: {{ inplay.summary.betfair_time_scan_status }}</span>
+    <span>Flashscore scan: {{ inplay.summary.flashscore_scan_status }}</span>
+    <span>Flashscore live matches: {{ inplay.summary.flashscore_live_matches_found }}</span>
     <span>Slack failures: {{ inplay.summary.slack_alert_failures }}</span>
     <span>API errors: {{ inplay.summary.api_errors }}</span>
     <span>Dry-run: {{ inplay.summary.dry_run }}</span>
@@ -80,15 +83,17 @@
     <table>
       <thead>
         <tr>
-          <th>Event</th>
+          <th>Source</th>
           <th>Sport</th>
+          <th>Event / Match</th>
           <th>Competition</th>
-          <th>Event ID</th>
-          <th>Market ID</th>
-          <th>Start UK</th>
-          <th>Overdue by</th>
-          <th>Status</th>
-          <th>In-Play</th>
+          <th>Flashscore Status</th>
+          <th>Flashscore Score</th>
+          <th>Betfair Event ID</th>
+          <th>Betfair Market ID</th>
+          <th>Betfair Status</th>
+          <th>Betfair In-Play</th>
+          <th>Match Confidence</th>
           <th>Slack alert sent</th>
           <th>Alert sent at</th>
           <th>Last checked at</th>
@@ -98,22 +103,24 @@
       <tbody>
         {% for row in inplay.active_flags %}
         <tr>
-          <td>{{ row.event_name }}</td>
+          <td>{{ row.source_label }}</td>
           <td>{{ row.sport_name }}</td>
-          <td>{{ row.competition_name }}</td>
+          <td>{{ row.display_event_name }}</td>
+          <td>{{ row.display_competition }}</td>
+          <td>{{ row.flashscore_status }}</td>
+          <td>{{ row.flashscore_score }}</td>
           <td>{{ row.event_id }}</td>
           <td>{{ row.market_id }}</td>
-          <td>{{ row.scheduled_start_uk }}</td>
-          <td>{{ row.overdue_by }}</td>
-          <td>{{ row.last_seen_status }}</td>
+          <td>{{ row.betfair_status_label }}</td>
           <td>{{ row.inplay_label }}</td>
+          <td>{{ row.match_confidence_label }}</td>
           <td>{{ row.slack_alert_sent }}</td>
           <td>{{ row.alert_sent_at }}</td>
-          <td>{{ row.last_checked_at }}</td>
+          <td>{{ row.betfair_last_checked_at or row.last_checked_at }}</td>
           <td>{{ row.last_log_reason }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="13">No flagged or checked events.</td></tr>
+        <tr><td colspan="15">No flagged or checked events.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -133,7 +140,7 @@
           <th>Start UK</th>
           <th>Overdue by</th>
           <th>Status</th>
-          <th>In-Play</th>
+          <th>Betfair In-Play</th>
           <th>Last checked at</th>
           <th>Last log/reason</th>
         </tr>

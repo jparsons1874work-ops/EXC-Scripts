@@ -167,7 +167,7 @@ def _decorate_log_rows(rows: list[dict[str, str]]) -> None:
 def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
     now = datetime.now(UK_TZ)
     for row in rows:
-        inplay = row.get("last_seen_inplay")
+        inplay = row.get("betfair_last_seen_inplay", row.get("last_seen_inplay"))
         if inplay is None or inplay == "":
             row["inplay_label"] = "Unknown"
         elif int(inplay) == 1:
@@ -181,13 +181,21 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         except ValueError:
             start_dt = None
         row["overdue_by"] = _format_duration(now - start_dt) if start_dt else ""
-        row["slack_alert_sent"] = "Yes" if row.get("alert_sent_at") else "No"
+        row["slack_alert_sent"] = "Yes" if row.get("alert_sent_at") or row.get("slack_alert_sent") else "No"
+        source = str(row.get("trigger_source") or "betfair_time")
+        row["source_label"] = "Flashscore" if source == "flashscore_live" else "Betfair time"
+        row["display_event_name"] = str(row.get("flashscore_match_name") or row.get("event_name") or "")
+        row["display_competition"] = str(row.get("flashscore_competition") or row.get("competition_name") or "")
+        row["betfair_status_label"] = str(row.get("betfair_last_seen_status") or row.get("last_seen_status") or "")
+        row["match_confidence_label"] = str(row.get("match_confidence") or "")
         row["last_log_reason"] = str(
-            row.get("final_verification_reason")
+            row.get("slack_error")
+            or row.get("match_reason")
+            or row.get("final_verification_reason")
             or row.get("final_verification_result")
             or ""
         )
-        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "final_verification_at"):
+        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "final_verification_at", "betfair_last_checked_at", "flashscore_detected_live_at"):
             if key in row:
                 row[key] = _format_db_time(row.get(key))
 
@@ -285,9 +293,14 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             SELECT event_id, market_id, sport_name, competition_name, event_name,
                    scheduled_start_utc, scheduled_start_uk, first_flagged_at, alert_sent_at,
                    last_seen_status, last_seen_inplay, recovered_at, last_checked_at,
-                   final_verification_at, final_verification_result, final_verification_reason
+                   final_verification_at, final_verification_result, final_verification_reason,
+                   trigger_source, flashscore_match_id, flashscore_url, flashscore_match_name,
+                   flashscore_competition, flashscore_status, flashscore_score,
+                   flashscore_detected_live_at, match_confidence, match_reason,
+                   betfair_last_checked_at, betfair_last_seen_inplay, betfair_last_seen_status,
+                   slack_alert_sent, slack_error
             FROM inplay_alert_state
-            ORDER BY COALESCE(last_checked_at, first_flagged_at) DESC
+            ORDER BY COALESCE(betfair_last_checked_at, last_checked_at, first_flagged_at) DESC
             LIMIT 50
             """,
         )
@@ -306,7 +319,10 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             """
             SELECT event_id, market_id, sport_name, competition_name, event_name,
                    scheduled_start_utc, scheduled_start_uk, alert_sent_at, last_seen_status,
-                   last_seen_inplay, last_checked_at, final_verification_result, final_verification_reason
+                   last_seen_inplay, last_checked_at, final_verification_result, final_verification_reason,
+                   trigger_source, flashscore_match_name, flashscore_competition, flashscore_status,
+                   flashscore_score, match_confidence, match_reason, betfair_last_checked_at,
+                   betfair_last_seen_inplay, betfair_last_seen_status, slack_alert_sent, slack_error
             FROM inplay_alert_state
             WHERE alert_sent_at IS NOT NULL
             ORDER BY alert_sent_at DESC
@@ -365,6 +381,9 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             "slack_alerts_sent": str(latest_run.get("slack_alerts_sent", 0)),
             "slack_alert_failures": str(latest_run.get("slack_alert_failures", 0)),
             "api_errors": str(latest_run.get("api_errors", 0)),
+            "betfair_time_scan_status": str(latest_run.get("betfair_time_scan_status", "")),
+            "flashscore_scan_status": str(latest_run.get("flashscore_scan_status", "")),
+            "flashscore_live_matches_found": str(latest_run.get("flashscore_live_matches_found", 0)),
             "dry_run": "yes" if latest_run.get("dry_run") else "no",
             "status": str(latest_run.get("status", "")),
         }
