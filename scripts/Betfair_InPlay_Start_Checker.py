@@ -322,8 +322,12 @@ def db_log(
     sport_name: str = "",
     event_id: str = "",
     market_id: str = "",
+    event_name: str = "",
     details: dict[str, Any] | None = None,
 ) -> None:
+    details_payload = dict(details or {})
+    if event_name and "event_name" not in details_payload:
+        details_payload["event_name"] = event_name
     connection.execute(
         """
         INSERT INTO inplay_scan_logs
@@ -338,7 +342,7 @@ def db_log(
             sport_name,
             event_id,
             market_id,
-            json.dumps(details or {}, sort_keys=True),
+            json.dumps(details_payload, sort_keys=True),
         ),
     )
     connection.commit()
@@ -731,6 +735,7 @@ def fetch_overdue_candidates(
                     "Skipped market with missing event ID",
                     sport_name=candidate.sport_name,
                     market_id=candidate.market_id,
+                    event_name=candidate.event_name,
                     details={"reason": "missing event ID"},
                 )
                 continue
@@ -744,6 +749,7 @@ def fetch_overdue_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=candidate.market_id,
+                    event_name=candidate.event_name,
                     details={"reason": "not overdue", "scheduled_start_utc": iso_utc(candidate.scheduled_start_utc)},
                 )
                 continue
@@ -783,6 +789,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                     details={"reason": "API error"},
                 )
                 continue
@@ -799,6 +806,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                     details={"reason": "already handled this scan", "status": book.status, "inplay": book.inplay},
                 )
                 continue
@@ -816,6 +824,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                     details={"reason": decision.reason, "status": book.status, "inplay": book.inplay},
                 )
                 continue
@@ -834,6 +843,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                 )
                 continue
 
@@ -847,6 +857,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                 )
                 upsert_alert_state(connection, candidate, book, now=now)
                 continue
@@ -863,6 +874,7 @@ def process_candidates(
                     sport_name=candidate.sport_name,
                     event_id=candidate.event_id,
                     market_id=market_id,
+                    event_name=candidate.event_name,
                 )
                 upsert_alert_state(connection, candidate, book, now=now)
                 continue
@@ -879,6 +891,7 @@ def process_candidates(
                 sport_name=candidate.sport_name,
                 event_id=candidate.event_id,
                 market_id=market_id,
+                event_name=candidate.event_name,
             )
 
 

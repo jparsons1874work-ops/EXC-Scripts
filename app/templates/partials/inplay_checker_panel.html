@@ -140,6 +140,8 @@
           <th>Level</th>
           <th>Type</th>
           <th>Message</th>
+          <th>Sport</th>
+          <th>Event</th>
           <th>Event ID</th>
           <th>Market ID</th>
         </tr>
@@ -151,11 +153,13 @@
           <td>{{ row.level }}</td>
           <td>{{ row.event_type }}</td>
           <td>{{ row.message }}</td>
+          <td>{{ row.sport_name }}</td>
+          <td>{{ row.event_name }}</td>
           <td>{{ row.event_id }}</td>
           <td>{{ row.market_id }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="6">No scan logs recorded.</td></tr>
+        <tr><td colspan="8">No scan logs recorded.</td></tr>
         {% endfor %}
       </tbody>
     </table>

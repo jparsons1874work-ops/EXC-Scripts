@@ -192,7 +192,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         recent_logs = _rows(
             connection,
             """
-            SELECT timestamp, level, event_type, message, sport_name, event_id, market_id
+            SELECT timestamp, level, event_type, message, sport_name, event_id, market_id, details_json
             FROM inplay_scan_logs
             ORDER BY id DESC
             LIMIT 30
@@ -201,6 +201,12 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
 
         for rows in (active_flags, recovered_events, recent_alerts, recent_logs):
             for row in rows:
+                if "details_json" in row:
+                    try:
+                        details = json.loads(row.get("details_json") or "{}")
+                    except json.JSONDecodeError:
+                        details = {}
+                    row["event_name"] = str(details.get("event_name") or "")
                 for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "timestamp"):
                     if key in row:
                         row[key] = _format_db_time(row.get(key))
