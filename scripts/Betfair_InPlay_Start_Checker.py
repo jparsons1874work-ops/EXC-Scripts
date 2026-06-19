@@ -664,7 +664,7 @@ def startup_message(repeat_minutes: float, dry_run: bool) -> str:
     cadence = f"Scanning every {repeat_minutes:g} minutes." if repeat_minutes else "Running one scan now."
     dry_run_note = " Dry-run is enabled; Slack alerts will not be sent." if dry_run else ""
     return (
-        ":satellite_antenna: Betfair In-Play Start Checker online\n\n"
+        ":isittip: Betfair In-Play Start Checker online\n\n"
         f"{cadence} Monitoring MATCH_ODDS markets for overdue events that have not turned in-play."
         f"{dry_run_note}"
     )
