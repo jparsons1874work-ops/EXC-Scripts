@@ -35,62 +35,26 @@
     <table>
       <thead>
         <tr>
-          <th>Source</th>
           <th>Sport</th>
-          <th>Format</th>
-          <th>Event / Match</th>
-          <th>Competition</th>
+          <th>Event Name</th>
+          <th>Time of Scan</th>
           <th>Flashscore Status</th>
-          <th>Flashscore Score</th>
-          <th>Betfair Event ID</th>
-          <th>Betfair Market ID</th>
           <th>Betfair Status</th>
-          <th>Verification</th>
-          <th>Verify After</th>
-          <th>Time Remaining</th>
-          <th>Betfair In-Play</th>
-          <th>Betfair In-Play Raw</th>
-          <th>Betfair In-Play Parsed</th>
-          <th>Final Verification Result</th>
-          <th>Final Verification Reason</th>
-          <th>Match Score</th>
-          <th>Match Confidence</th>
-          <th>Slack Sent</th>
-          <th>Alert Sent At</th>
-          <th>Last Checked</th>
-          <th>Last Reason</th>
+          <th>Timer Until Slack</th>
         </tr>
       </thead>
       <tbody>
         {% for row in inplay.active_flags %}
         <tr>
-          <td>{{ row.source_label }}</td>
           <td>{{ row.sport_name }}</td>
-          <td>{{ row.format_label }}</td>
           <td>{{ row.display_event_name }}</td>
-          <td>{{ row.display_competition }}</td>
-          <td>{{ row.flashscore_status }}</td>
-          <td>{{ row.flashscore_score }}</td>
-          <td>{{ row.event_id }}</td>
-          <td>{{ row.market_id }}</td>
-          <td>{{ row.betfair_status_label }}</td>
-          <td>{{ row.verification_label }}</td>
-          <td>{{ row.verify_after }}</td>
-          <td>{{ row.time_remaining }}</td>
-          <td>{{ row.inplay_label }}</td>
-          <td>{{ row.final_inplay_raw_label }}</td>
-          <td>{{ row.final_inplay_parsed_label }}</td>
-          <td>{{ row.final_verification_result }}</td>
-          <td>{{ row.final_verification_reason }}</td>
-          <td>{{ row.match_score_label }}</td>
-          <td>{{ row.match_confidence_label }}</td>
-          <td>{{ row.slack_alert_sent }}</td>
-          <td>{{ row.alert_sent_at }}</td>
-          <td>{{ row.betfair_last_checked_at or row.last_checked_at }}</td>
-          <td>{{ row.last_log_reason }}</td>
+          <td>{{ row.time_of_scan }}</td>
+          <td>{{ row.flashscore_status_display }}</td>
+          <td>{{ row.betfair_compact_status }}</td>
+          <td>{{ row.timer_until_slack }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="24">No flagged or checked events.</td></tr>
+        <tr><td colspan="6">No flagged or checked events.</td></tr>
         {% endfor %}
       </tbody>
     </table>
