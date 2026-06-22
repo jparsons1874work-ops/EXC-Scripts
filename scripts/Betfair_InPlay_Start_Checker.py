@@ -72,6 +72,9 @@ COMMON_SURNAMES = {
 
 load_dotenv(PROJECT_ROOT / ".env")
 
+CURRENT_SCAN_RUN_ID: str = ""
+CURRENT_SCAN_STARTED_AT: str = ""
+
 
 @dataclass(frozen=True)
 class Config:
@@ -919,7 +922,12 @@ def init_db(connection: sqlite3.Connection) -> None:
             final_marketbook_inplay_raw TEXT,
             final_marketbook_inplay_parsed INTEGER,
             final_marketbook_status_parsed TEXT,
-            visible_in_hub INTEGER NOT NULL DEFAULT 1
+            visible_in_hub INTEGER NOT NULL DEFAULT 1,
+            run_id TEXT,
+            last_seen_run_id TEXT,
+            last_seen_in_scan_at TEXT,
+            hidden_reason TEXT,
+            hidden_at TEXT
         )
         """
     )
@@ -970,6 +978,11 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_alert_state", "final_marketbook_inplay_parsed", "INTEGER")
     ensure_column(connection, "inplay_alert_state", "final_marketbook_status_parsed", "TEXT")
     ensure_column(connection, "inplay_alert_state", "visible_in_hub", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(connection, "inplay_alert_state", "run_id", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "last_seen_run_id", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "last_seen_in_scan_at", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "hidden_reason", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "hidden_at", "TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS inplay_scan_logs (
@@ -981,10 +994,12 @@ def init_db(connection: sqlite3.Connection) -> None:
             sport_name TEXT,
             event_id TEXT,
             market_id TEXT,
-            details_json TEXT
+            details_json TEXT,
+            run_id TEXT
         )
         """
     )
+    ensure_column(connection, "inplay_scan_logs", "run_id", "TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS inplay_scan_runs (
@@ -1007,13 +1022,17 @@ def init_db(connection: sqlite3.Connection) -> None:
             ,
             betfair_time_scan_status TEXT NOT NULL DEFAULT 'not_run',
             flashscore_scan_status TEXT NOT NULL DEFAULT 'not_run',
-            flashscore_live_matches_found INTEGER NOT NULL DEFAULT 0
+            flashscore_live_matches_found INTEGER NOT NULL DEFAULT 0,
+            run_id TEXT,
+            current_run_started_at TEXT
         )
         """
     )
     ensure_column(connection, "inplay_scan_runs", "betfair_time_scan_status", "TEXT NOT NULL DEFAULT 'not_run'")
     ensure_column(connection, "inplay_scan_runs", "flashscore_scan_status", "TEXT NOT NULL DEFAULT 'not_run'")
     ensure_column(connection, "inplay_scan_runs", "flashscore_live_matches_found", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(connection, "inplay_scan_runs", "run_id", "TEXT")
+    ensure_column(connection, "inplay_scan_runs", "current_run_started_at", "TEXT")
     connection.commit()
 
 
@@ -1041,8 +1060,8 @@ def db_log(
     connection.execute(
         """
         INSERT INTO inplay_scan_logs
-            (timestamp, level, event_type, message, sport_name, event_id, market_id, details_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (timestamp, level, event_type, message, sport_name, event_id, market_id, details_json, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             iso_utc(utc_now()),
@@ -1053,6 +1072,7 @@ def db_log(
             event_id,
             market_id,
             json.dumps(details_payload, sort_keys=True),
+            CURRENT_SCAN_RUN_ID,
         ),
     )
     connection.commit()
@@ -1191,11 +1211,19 @@ def release_run_lock(lock: RunLock | None) -> None:
 
 
 def start_scan_run(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
+    global CURRENT_SCAN_RUN_ID, CURRENT_SCAN_STARTED_AT
+    run_uuid = str(uuid.uuid4())
+    started_at = iso_utc(utc_now())
     cursor = connection.execute(
-        "INSERT INTO inplay_scan_runs (scan_started_at, status, dry_run) VALUES (?, ?, ?)",
-        (iso_utc(utc_now()), "running", int(bool(args.dry_run))),
+        """
+        INSERT INTO inplay_scan_runs (scan_started_at, status, dry_run, run_id, current_run_started_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (started_at, "running", int(bool(args.dry_run)), run_uuid, started_at),
     )
     connection.commit()
+    CURRENT_SCAN_RUN_ID = run_uuid
+    CURRENT_SCAN_STARTED_AT = started_at
     return int(cursor.lastrowid)
 
 
@@ -1799,6 +1827,19 @@ def upsert_alert_state(
             "UPDATE inplay_alert_state SET visible_in_hub = ? WHERE event_id = ?",
             (1 if visible else 0, candidate.event_id),
         )
+    if CURRENT_SCAN_RUN_ID:
+        connection.execute(
+            """
+            UPDATE inplay_alert_state
+            SET run_id = COALESCE(run_id, ?),
+                last_seen_run_id = ?,
+                last_seen_in_scan_at = ?,
+                hidden_reason = '',
+                hidden_at = NULL
+            WHERE event_id = ?
+            """,
+            (CURRENT_SCAN_RUN_ID, CURRENT_SCAN_RUN_ID, iso_utc(now), candidate.event_id),
+        )
     connection.commit()
 
 
@@ -1806,6 +1847,34 @@ def record_slack_error(connection: sqlite3.Connection, event_id: str, error: str
     connection.execute(
         "UPDATE inplay_alert_state SET slack_alert_sent = 0, slack_error = ? WHERE event_id = ?",
         (error, event_id),
+    )
+    connection.commit()
+
+
+def mark_state_seen_in_current_run(
+    connection: sqlite3.Connection,
+    event_id: str,
+    *,
+    seen_at: datetime | None = None,
+    run_id: str | None = None,
+    make_visible: bool = True,
+) -> None:
+    effective_run_id = run_id if run_id is not None else CURRENT_SCAN_RUN_ID
+    if not event_id or not effective_run_id:
+        return
+    timestamp = iso_utc(seen_at or utc_now())
+    connection.execute(
+        """
+        UPDATE inplay_alert_state
+        SET run_id = COALESCE(run_id, ?),
+            last_seen_run_id = ?,
+            last_seen_in_scan_at = ?,
+            hidden_reason = CASE WHEN ? = 1 THEN '' ELSE hidden_reason END,
+            hidden_at = CASE WHEN ? = 1 THEN NULL ELSE hidden_at END,
+            visible_in_hub = CASE WHEN ? = 1 THEN 1 ELSE visible_in_hub END
+        WHERE event_id = ?
+        """,
+        (effective_run_id, effective_run_id, timestamp, 1 if make_visible else 0, 1 if make_visible else 0, 1 if make_visible else 0, event_id),
     )
     connection.commit()
 
@@ -1926,10 +1995,23 @@ def record_final_verification_failed(
             betfair_last_checked_at = ?,
             betfair_last_seen_inplay = NULL,
             betfair_last_seen_status = ?,
-            visible_in_hub = 1
+            visible_in_hub = 1,
+            run_id = COALESCE(run_id, ?),
+            last_seen_run_id = COALESCE(NULLIF(?, ''), last_seen_run_id),
+            last_seen_in_scan_at = COALESCE(NULLIF(?, ''), last_seen_in_scan_at),
+            hidden_reason = '',
+            hidden_at = NULL
         WHERE event_id = ?
         """,
-        (trigger_source, iso_utc(now), initial_book.status, candidate.event_id),
+        (
+            trigger_source,
+            iso_utc(now),
+            initial_book.status,
+            CURRENT_SCAN_RUN_ID,
+            CURRENT_SCAN_RUN_ID,
+            iso_utc(now) if CURRENT_SCAN_RUN_ID else "",
+            candidate.event_id,
+        ),
     )
     if flashscore_match is not None:
         connection.execute(
@@ -2122,7 +2204,12 @@ def record_flashscore_match_diagnostic(
             betfair_side_2_players = ?,
             betfair_side_1_surnames = ?,
             betfair_side_2_surnames = ?,
-            visible_in_hub = ?
+            visible_in_hub = ?,
+            run_id = COALESCE(run_id, ?),
+            last_seen_run_id = COALESCE(NULLIF(?, ''), last_seen_run_id),
+            last_seen_in_scan_at = COALESCE(NULLIF(?, ''), last_seen_in_scan_at),
+            hidden_reason = CASE WHEN ? != '' THEN '' ELSE hidden_reason END,
+            hidden_at = CASE WHEN ? != '' THEN NULL ELSE hidden_at END
         WHERE event_id = ?
         """,
         (
@@ -2138,6 +2225,11 @@ def record_flashscore_match_diagnostic(
             confidence.betfair_side_1_surnames,
             confidence.betfair_side_2_surnames,
             1 if "ambiguous" in reason.casefold() else 0,
+            CURRENT_SCAN_RUN_ID,
+            CURRENT_SCAN_RUN_ID,
+            iso_utc(now) if CURRENT_SCAN_RUN_ID else "",
+            CURRENT_SCAN_RUN_ID,
+            CURRENT_SCAN_RUN_ID,
             candidate.event_id,
         ),
     )
@@ -3233,6 +3325,7 @@ def due_flashscore_pending_alerts(connection: sqlite3.Connection, now: datetime)
     ).fetchall()
     pending_alerts = [pending_alert_from_state_row(row) for row in rows]
     for pending in pending_alerts:
+        mark_state_seen_in_current_run(connection, pending.candidate.event_id)
         db_log(
             connection,
             "INFO",
@@ -3280,32 +3373,75 @@ def process_due_flashscore_pending_alerts(
     )
 
 
-def cleanup_hub_visibility(connection: sqlite3.Connection) -> None:
+def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_id: str, now: datetime) -> None:
+    now_iso = iso_utc(now)
+    actionable_results = ("failed", "suppressed_unknown", "suppressed_ambiguous")
     connection.execute(
         """
         UPDATE inplay_alert_state
-        SET visible_in_hub = CASE
-            WHEN COALESCE(slack_alert_sent, 0) = 1 OR alert_sent_at IS NOT NULL THEN 1
-            WHEN COALESCE(final_verification_result, '') = 'pending_verification' THEN 1
-            WHEN COALESCE(final_verification_result, '') = 'confirmed_not_inplay' THEN 1
-            WHEN COALESCE(final_verification_result, '') IN ('failed', 'suppressed_unknown', 'suppressed_ambiguous') THEN 1
-            WHEN COALESCE(final_verification_reason, '') LIKE '%ambiguous%' THEN 1
-            WHEN COALESCE(slack_error, '') != '' THEN 1
-            WHEN trigger_source = 'flashscore_live'
-                 AND COALESCE(final_verification_result, '') = 'suppressed_inplay'
-                 AND COALESCE(slack_alert_sent, 0) = 0
-                 AND alert_sent_at IS NULL
-                 AND COALESCE(slack_error, '') = '' THEN 0
-            WHEN trigger_source = 'flashscore_live'
-                 AND COALESCE(betfair_last_seen_inplay, last_seen_inplay, 0) = 1
-                 AND COALESCE(slack_alert_sent, 0) = 0
-                 AND alert_sent_at IS NULL
-                 AND COALESCE(slack_error, '') = '' THEN 0
-            ELSE visible_in_hub
-        END
+        SET visible_in_hub = 1,
+            hidden_reason = '',
+            hidden_at = NULL
+        WHERE (
+            last_seen_run_id = ?
+            OR COALESCE(final_verification_result, '') = 'pending_verification'
+            OR (verify_after IS NOT NULL AND verify_after > ?)
+            OR COALESCE(slack_alert_sent, 0) = 1
+            OR alert_sent_at IS NOT NULL
+            OR COALESCE(final_verification_result, '') IN (?, ?, ?)
+            OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
+            OR COALESCE(slack_error, '') != ''
+        )
+        AND NOT (
+            COALESCE(slack_alert_sent, 0) = 0
+            AND alert_sent_at IS NULL
+            AND COALESCE(slack_error, '') = ''
+            AND (
+                COALESCE(final_verification_result, '') = 'suppressed_inplay'
+                OR COALESCE(betfair_last_seen_inplay, last_seen_inplay, 0) = 1
+            )
+        )
+        """,
+        (current_run_id, now_iso, *actionable_results),
+    )
+    connection.execute(
         """
+        UPDATE inplay_alert_state
+        SET visible_in_hub = 0,
+            hidden_reason = 'all_good_inplay',
+            hidden_at = ?
+        WHERE COALESCE(slack_alert_sent, 0) = 0
+          AND alert_sent_at IS NULL
+          AND COALESCE(slack_error, '') = ''
+          AND (
+              COALESCE(final_verification_result, '') = 'suppressed_inplay'
+              OR COALESCE(betfair_last_seen_inplay, last_seen_inplay, 0) = 1
+          )
+        """,
+        (now_iso,),
+    )
+    connection.execute(
+        """
+        UPDATE inplay_alert_state
+        SET visible_in_hub = 0,
+            hidden_reason = 'old_not_seen_in_latest_scan',
+            hidden_at = ?
+        WHERE COALESCE(last_seen_run_id, '') != ?
+          AND COALESCE(final_verification_result, '') != 'pending_verification'
+          AND (verify_after IS NULL OR verify_after <= ?)
+          AND COALESCE(slack_alert_sent, 0) = 0
+          AND alert_sent_at IS NULL
+          AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
+          AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
+          AND COALESCE(slack_error, '') = ''
+        """,
+        (now_iso, current_run_id, now_iso, *actionable_results),
     )
     connection.commit()
+
+
+def cleanup_hub_visibility(connection: sqlite3.Connection) -> None:
+    cleanup_visible_rows_after_run(connection, CURRENT_SCAN_RUN_ID, utc_now())
 
 
 def startup_message(repeat_minutes: float, dry_run: bool) -> str:
