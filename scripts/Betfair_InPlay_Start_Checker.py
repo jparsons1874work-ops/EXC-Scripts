@@ -68,6 +68,50 @@ COMMON_SURNAMES = {
     "roberts",
     "wright",
 }
+FLASHSCORE_REJECT_FINISHED_MARKERS = (
+    "finished",
+    "ended",
+    "after pen",
+    "after pen.",
+    "aet",
+    "walkover",
+    "retired",
+    "abandoned",
+    "cancelled",
+    "canceled",
+    "postponed",
+    "wo",
+    "ret",
+)
+FLASHSCORE_REJECT_SCHEDULED_MARKERS = (
+    "scheduled",
+    "not started",
+    "starts",
+    "start time",
+)
+FLASHSCORE_LIVE_MARKERS = (
+    "live",
+    "inplay",
+    "in-play",
+    "in progress",
+    "playing",
+    "event__match--live",
+    "event__stage--live",
+)
+FLASHSCORE_ACTIVE_STATUS_MARKERS = (
+    "set 1",
+    "set 2",
+    "set 3",
+    "set 4",
+    "set 5",
+    "1st set",
+    "2nd set",
+    "3rd set",
+    "4th set",
+    "5th set",
+    "leg",
+    "break",
+)
 
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -1369,6 +1413,41 @@ def list_match_odds_catalogues_for_event(client: APIClient, event_id: str, max_r
     )
 
 
+def select_flashscore_live_filter(driver: Any, sport_name: str, connection: sqlite3.Connection) -> None:
+    selected = False
+    try:
+        selected = bool(
+            driver.execute_script(
+                """
+                const candidates = Array.from(document.querySelectorAll(
+                  "button, a, [role='tab'], [class*='filter'], [class*='tab']"
+                ));
+                const live = candidates.find(el => {
+                  const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+                  const title = (el.getAttribute("title") || "").trim().toLowerCase();
+                  const aria = (el.getAttribute("aria-label") || "").trim().toLowerCase();
+                  return text === "live" || text === "live now" || title === "live" || aria === "live";
+                });
+                if (!live) return false;
+                live.click();
+                return true;
+                """
+            )
+        )
+    except Exception:
+        selected = False
+    db_log(
+        connection,
+        "INFO",
+        "flashscore_live_filter_selected",
+        "Flashscore LIVE filter selected" if selected else "Flashscore LIVE filter not found",
+        sport_name=sport_name,
+        details={"selected": selected},
+    )
+    if selected:
+        time.sleep(1.5)
+
+
 def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: int) -> list[FlashscoreMatch]:
     try:
         from selenium import webdriver
@@ -1408,6 +1487,7 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
             try:
                 driver.get(url)
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[id^='g_'], .event__match")))
+                select_flashscore_live_filter(driver, sport_name, connection)
                 time.sleep(2)
                 rows = driver.execute_script(
                     """
@@ -1438,6 +1518,10 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
                       const awayScore = text(row, ".event__score--away");
                       const status = text(row, ".event__stage--block") || text(row, ".event__stage") || text(row, ".event__time");
                       const link = row.querySelector("a[href*='/match/']");
+                      const liveBadge = row.querySelector(
+                        "[class*='live'], [class*='inplay'], [class*='stage--live'], [title*='Live'], [aria-label*='Live']"
+                      );
+                      const parentText = row.parentElement ? row.parentElement.innerText.slice(0, 500) : "";
                       return {
                         id: row.id || row.getAttribute("data-event-id") || "",
                         home,
@@ -1447,6 +1531,8 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
                         url: link ? link.href : "",
                         competition: previousCompetition(row),
                         className: String(row.className || ""),
+                        liveBadgeText: liveBadge ? (liveBadge.innerText || liveBadge.textContent || liveBadge.getAttribute("title") || liveBadge.getAttribute("aria-label") || "") : "",
+                        parentText,
                         fullText: row.innerText || "",
                         participantTexts
                       };
@@ -1461,12 +1547,37 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
                 status = str(row.get("status") or "").strip()
                 score = str(row.get("score") or "").strip()
                 class_name = str(row.get("className") or "")
-                if not flashscore_row_is_live(status, score, class_name):
+                full_text = str(row.get("fullText") or "").strip()
+                live_badge_text = str(row.get("liveBadgeText") or "").strip()
+                parent_text = str(row.get("parentText") or "").strip()
+                live_decision = flashscore_row_live_decision(
+                    status,
+                    score,
+                    class_name,
+                    full_text=full_text,
+                    sport_name=sport_name,
+                    live_badge_text=live_badge_text,
+                    parent_text=parent_text,
+                )
+                if not live_decision.is_live:
+                    db_log(
+                        connection,
+                        "DEBUG",
+                        live_decision.event_type,
+                        "Flashscore row rejected: not live",
+                        sport_name=sport_name,
+                        details={
+                            "row_text": full_text[:500],
+                            "status": status,
+                            "score": score,
+                            "class_name": class_name,
+                            "reason": live_decision.reason,
+                        },
+                    )
                     continue
                 home = str(row.get("home") or "").strip()
                 away = str(row.get("away") or "").strip()
                 child_texts = tuple(str(text).strip() for text in (row.get("participantTexts") or []) if str(text).strip())
-                full_text = str(row.get("fullText") or "").strip()
                 match_format, participants, side_1_player_1, side_1_player_2, side_2_player_1, side_2_player_2, match_name = flashscore_with_sides(
                     sport_name,
                     home,
@@ -1516,7 +1627,7 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
                 db_log(
                     connection,
                     "INFO",
-                    "flashscore_live_match_found",
+                    "flashscore_row_accepted_live",
                     "Flashscore live match found",
                     sport_name=sport_name,
                     event_name=match.match_name,
@@ -1527,6 +1638,7 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
                         "flashscore_score": match.score,
                         "flashscore_match_id": match.match_id,
                         "match_format": match.match_format,
+                        "live_reason": live_decision.reason,
                     },
                 )
     finally:
@@ -1538,15 +1650,64 @@ def flashscore_browser_matches(connection: sqlite3.Connection, timeout_seconds: 
     return matches
 
 
+@dataclass(frozen=True)
+class FlashscoreLiveDecision:
+    is_live: bool
+    reason: str
+    event_type: str
+
+
+def _contains_marker(text: str, markers: Iterable[str]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _contains_terminal_marker(text: str) -> bool:
+    if _contains_marker(text, tuple(marker for marker in FLASHSCORE_REJECT_FINISHED_MARKERS if marker not in {"wo", "ret", "ft"})):
+        return True
+    return bool(re.search(r"\b(?:wo|ret|ft)\b", text))
+
+
+def flashscore_row_live_decision(
+    status: str,
+    score: str,
+    class_name: str,
+    *,
+    full_text: str = "",
+    sport_name: str = "",
+    live_badge_text: str = "",
+    parent_text: str = "",
+) -> FlashscoreLiveDecision:
+    combined = " ".join(
+        value.casefold()
+        for value in (status, class_name, live_badge_text, full_text)
+        if value
+    )
+    parent = parent_text.casefold()
+    status_text = (status or "").casefold().strip()
+    if _contains_terminal_marker(combined):
+        return FlashscoreLiveDecision(False, "finished marker", "flashscore_row_rejected_finished")
+    if _contains_marker(combined, FLASHSCORE_REJECT_SCHEDULED_MARKERS) or re.fullmatch(r"\d{1,2}:\d{2}", status_text or ""):
+        return FlashscoreLiveDecision(False, "scheduled/start-time row", "flashscore_row_rejected_scheduled")
+    if "yesterday" in parent and not _contains_marker(combined, FLASHSCORE_LIVE_MARKERS):
+        return FlashscoreLiveDecision(False, "yesterday section without live marker", "flashscore_row_rejected_yesterday_not_live")
+    if "tomorrow" in parent and not _contains_marker(combined, FLASHSCORE_LIVE_MARKERS):
+        return FlashscoreLiveDecision(False, "tomorrow section without live marker", "flashscore_row_rejected_scheduled")
+
+    has_live_marker = _contains_marker(combined, FLASHSCORE_LIVE_MARKERS)
+    has_active_status = _contains_marker(combined, FLASHSCORE_ACTIVE_STATUS_MARKERS) or bool(
+        re.search(r"\b(?:1st|2nd|3rd|4th|5th)\s+(?:set|leg)\b", combined)
+    )
+    if has_live_marker:
+        return FlashscoreLiveDecision(True, "live marker", "flashscore_row_accepted_live")
+    if has_active_status and not _contains_terminal_marker(combined):
+        return FlashscoreLiveDecision(True, "active set/leg status", "flashscore_row_accepted_live")
+    if score and re.search(r"\d", score):
+        return FlashscoreLiveDecision(False, "score without live marker", "flashscore_row_rejected_not_live")
+    return FlashscoreLiveDecision(False, "no live marker", "flashscore_row_rejected_not_live")
+
+
 def flashscore_row_is_live(status: str, score: str, class_name: str) -> bool:
-    text = f"{status} {class_name}".casefold()
-    if any(marker in text for marker in ("finished", "after pen", "postponed", "cancelled", "walkover", "retired")):
-        return False
-    if any(marker in text for marker in ("live", "inplay", "in-play", "set", "leg", "break", "1st", "2nd", "3rd", "4th", "5th")):
-        return True
-    if score and re.search(r"\d", score) and not re.match(r"^\d{1,2}:\d{2}$", status.strip()):
-        return True
-    return False
+    return flashscore_row_live_decision(status, score, class_name).is_live
 
 
 def catalogue_to_candidate(catalogue: Any, fallback: EventType) -> MarketCandidate:
@@ -2662,6 +2823,71 @@ def record_flashscore_no_slack(
         event_name=pending.candidate.event_name,
         details={"decision": decision, "reason": reason},
     )
+    if result == "suppressed_flashscore_not_live":
+        connection.execute(
+            """
+            UPDATE inplay_alert_state
+            SET visible_in_hub = 0,
+                hidden_reason = 'flashscore_not_live_or_not_seen_latest_live_scan',
+                hidden_at = ?
+            WHERE event_id = ?
+            """,
+            (iso_utc(now), pending.candidate.event_id),
+        )
+        connection.commit()
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_visible_row_hidden_not_live",
+            "Flashscore row hidden because match is no longer live",
+            sport_name=pending.candidate.sport_name,
+            event_id=pending.candidate.event_id,
+            market_id=pending.candidate.market_id,
+            event_name=pending.candidate.event_name,
+            details={"reason": reason},
+        )
+
+
+def flashscore_pending_still_live(
+    connection: sqlite3.Connection,
+    pending: PendingAlert,
+    args: argparse.Namespace,
+) -> bool:
+    verifier = getattr(args, "flashscore_live_verifier", None)
+    if callable(verifier):
+        return bool(verifier(pending))
+    if pending.flashscore_match is None:
+        return True
+    match_id = normalize_match_name(pending.flashscore_match.match_id)
+    match_url = str(pending.flashscore_match.url or "").strip().casefold()
+    match_name = normalize_match_name(pending.flashscore_match.match_name)
+    if not (match_id or match_url or match_name):
+        return True
+    try:
+        live_matches = flashscore_browser_matches(connection, int(getattr(args, "flashscore_timeout_seconds", 12)))
+    except Exception as exc:
+        db_log(
+            connection,
+            "ERROR",
+            "flashscore_pending_live_check_failed",
+            "Flashscore pending live recheck failed before final Slack decision",
+            sport_name=pending.candidate.sport_name,
+            event_id=pending.candidate.event_id,
+            market_id=pending.candidate.market_id,
+            event_name=pending.candidate.event_name,
+            details={"error": str(exc)},
+        )
+        return False
+    for live_match in live_matches:
+        if live_match.sport_name != pending.flashscore_match.sport_name:
+            continue
+        if match_id and normalize_match_name(live_match.match_id) == match_id:
+            return True
+        if match_url and str(live_match.url or "").strip().casefold() == match_url:
+            return True
+        if match_name and normalize_match_name(live_match.match_name) == match_name:
+            return True
+    return False
 
 
 def verify_flashscore_same_event_markets(
@@ -2854,6 +3080,21 @@ def process_flashscore_final_pending(
             event_type="flashscore_final_inplay_unknown_no_alert",
             message="Flashscore final MarketBook status is not alertable; no Slack",
             decision="suppress_unknown",
+            api_called_at=api_called_at,
+        )
+        return
+
+    if not flashscore_pending_still_live(connection, pending, args):
+        record_flashscore_no_slack(
+            connection,
+            pending,
+            exact_snapshot,
+            now=now,
+            result="suppressed_flashscore_not_live",
+            reason="Flashscore match no longer live at verification time",
+            event_type="flashscore_pending_suppressed_not_live_at_verification",
+            message="Flashscore pending candidate suppressed because match is no longer live",
+            decision="suppress_flashscore_not_live",
             api_called_at=api_called_at,
         )
         return
@@ -3420,11 +3661,31 @@ def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_i
         """,
         (now_iso,),
     )
+    flashscore_rows_to_hide = connection.execute(
+        """
+        SELECT event_id, market_id, sport_name, event_name, flashscore_match_name
+        FROM inplay_alert_state
+        WHERE trigger_source = 'flashscore_live'
+          AND COALESCE(last_seen_run_id, '') != ?
+          AND COALESCE(final_verification_result, '') != 'pending_verification'
+          AND (verify_after IS NULL OR verify_after <= ?)
+          AND COALESCE(slack_alert_sent, 0) = 0
+          AND alert_sent_at IS NULL
+          AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
+          AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
+          AND COALESCE(slack_error, '') = ''
+        LIMIT 100
+        """,
+        (current_run_id, now_iso, *actionable_results),
+    ).fetchall()
     connection.execute(
         """
         UPDATE inplay_alert_state
         SET visible_in_hub = 0,
-            hidden_reason = 'old_not_seen_in_latest_scan',
+            hidden_reason = CASE
+                WHEN trigger_source = 'flashscore_live' THEN 'flashscore_not_live_or_not_seen_latest_live_scan'
+                ELSE 'old_not_seen_in_latest_scan'
+            END,
             hidden_at = ?
         WHERE COALESCE(last_seen_run_id, '') != ?
           AND COALESCE(final_verification_result, '') != 'pending_verification'
@@ -3438,6 +3699,18 @@ def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_i
         (now_iso, current_run_id, now_iso, *actionable_results),
     )
     connection.commit()
+    for row in flashscore_rows_to_hide:
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_visible_row_hidden_not_live",
+            "Flashscore row hidden because it was not seen in latest live-only scan",
+            sport_name=str(row["sport_name"] or ""),
+            event_id=str(row["event_id"] or ""),
+            market_id=str(row["market_id"] or ""),
+            event_name=str(row["event_name"] or row["flashscore_match_name"] or ""),
+            details={"reason": "flashscore_not_live_or_not_seen_latest_live_scan"},
+        )
 
 
 def cleanup_hub_visibility(connection: sqlite3.Connection) -> None:
@@ -4362,6 +4635,21 @@ def run_self_test() -> int:
     assert is_excluded_sport("Horse Racing")
     assert is_excluded_sport("Greyhound Racing")
     assert not is_excluded_sport("Cricket")
+    assert flashscore_row_live_decision("Set 1", "", "", sport_name="Tennis").is_live
+    assert not flashscore_row_live_decision("Finished", "6-4 6-4", "", sport_name="Tennis").is_live
+    yesterday_finished = flashscore_row_live_decision(
+        "Finished",
+        "6-4 6-4",
+        "",
+        sport_name="Tennis",
+        parent_text="Yesterday",
+    )
+    assert not yesterday_finished.is_live
+    assert yesterday_finished.event_type == "flashscore_row_rejected_finished"
+    assert not flashscore_row_live_decision("12:00", "", "", sport_name="Tennis").is_live
+    assert not flashscore_row_live_decision("", "6-4 6-4", "", sport_name="Tennis").is_live
+    assert flashscore_row_live_decision("Leg 1", "", "", sport_name="Darts").is_live
+    assert not flashscore_row_live_decision("FT", "6-3", "", sport_name="Darts").is_live
 
     smith_match = participant_confidence(("Smith M.", "Jones D."), ("Michael Smith", "Dave Jones"), "", "")
     assert smith_match.level == "High"
@@ -4781,6 +5069,7 @@ def run_self_test() -> int:
             market_book_batch_size=40,
             alert_delay_seconds=0,
             flashscore_alert_delay_seconds=0,
+            flashscore_live_verifier=lambda pending: True,
         )
         tennis_flash = FlashscoreMatch(
             "Tennis",
@@ -4930,6 +5219,28 @@ def run_self_test() -> int:
         assert pending_delay_state["alert_sent_at"] is None
         pending_delay_db.close()
 
+        pending_visible_db = sqlite3.connect(":memory:")
+        pending_visible_db.row_factory = sqlite3.Row
+        init_db(pending_visible_db)
+        pending_visible_stats = ScanStats()
+        pending_visible_betting = FlashscoreFakeBetting()
+        pending_visible_client = FlashscoreFakeClient(pending_visible_betting)
+        process_flashscore_live_matches(
+            pending_visible_db,
+            pending_visible_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            pending_delay_args,
+            pending_visible_stats,
+            [tennis_flash],
+        )
+        pending_visible_state = pending_visible_db.execute(
+            "SELECT final_verification_result, visible_in_hub, verify_after FROM inplay_alert_state WHERE event_id = 'bf-tennis-1'"
+        ).fetchone()
+        assert pending_visible_state["final_verification_result"] == "pending_verification"
+        assert pending_visible_state["visible_in_hub"] == 1
+        assert parse_datetime(pending_visible_state["verify_after"]) > utc_now()
+        pending_visible_db.close()
+
         stale_inplay_db = sqlite3.connect(":memory:")
         stale_inplay_db.row_factory = sqlite3.Row
         init_db(stale_inplay_db)
@@ -5002,6 +5313,53 @@ def run_self_test() -> int:
         assert suspended_state["final_verification_result"] == "confirmed_not_inplay"
         assert suspended_state["alert_sent_at"] is not None
         suspended_db.close()
+
+        not_live_at_verify_db = sqlite3.connect(":memory:")
+        not_live_at_verify_db.row_factory = sqlite3.Row
+        init_db(not_live_at_verify_db)
+        not_live_at_verify_stats = ScanStats()
+        not_live_at_verify_betting = FlashscoreFakeBetting()
+        not_live_at_verify_client = FlashscoreFakeClient(not_live_at_verify_betting)
+        not_live_at_verify_args = argparse.Namespace(
+            dry_run=False,
+            flashscore_timeout_seconds=1,
+            flashscore_lookback_hours=12.0,
+            flashscore_lookahead_hours=24.0,
+            market_book_batch_size=40,
+            alert_delay_seconds=0,
+            flashscore_alert_delay_seconds=0,
+            flashscore_live_verifier=lambda pending: False,
+        )
+        before_not_live_messages = len(sent_messages)
+        process_flashscore_live_matches(
+            not_live_at_verify_db,
+            not_live_at_verify_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            not_live_at_verify_args,
+            not_live_at_verify_stats,
+            [tennis_flash],
+        )
+        process_due_flashscore_pending_alerts(
+            not_live_at_verify_db,
+            not_live_at_verify_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            not_live_at_verify_args,
+            not_live_at_verify_stats,
+        )
+        not_live_at_verify_state = not_live_at_verify_db.execute(
+            "SELECT final_verification_result, final_verification_reason, visible_in_hub, hidden_reason, alert_sent_at FROM inplay_alert_state WHERE event_id = 'bf-tennis-1'"
+        ).fetchone()
+        assert not_live_at_verify_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_not_live_messages
+        assert not_live_at_verify_state["final_verification_result"] == "suppressed_flashscore_not_live"
+        assert not_live_at_verify_state["final_verification_reason"] == "Flashscore match no longer live at verification time"
+        assert not_live_at_verify_state["visible_in_hub"] == 0
+        assert not_live_at_verify_state["hidden_reason"] == "flashscore_not_live_or_not_seen_latest_live_scan"
+        assert not_live_at_verify_state["alert_sent_at"] is None
+        assert not_live_at_verify_db.execute(
+            "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'flashscore_pending_suppressed_not_live_at_verification'"
+        ).fetchone()[0] == 1
+        not_live_at_verify_db.close()
 
         darts_db = sqlite3.connect(":memory:")
         darts_db.row_factory = sqlite3.Row
