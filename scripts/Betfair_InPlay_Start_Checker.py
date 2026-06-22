@@ -904,6 +904,14 @@ def open_db(path: Path = STATE_DB_PATH) -> sqlite3.Connection:
     return connection
 
 
+def open_db_readonly(path: Path = STATE_DB_PATH) -> sqlite3.Connection | None:
+    if not path.exists():
+        return None
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
 def init_db(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -3634,10 +3642,11 @@ def cleanup_stale_visible_rows(
     now: datetime,
     *,
     clear_visible_table: bool = False,
+    purge_visible_table: bool = False,
     manual: bool = False,
 ) -> int:
     now_iso = iso_utc(now)
-    mode = "clear_visible_table" if clear_visible_table else "clear_stale_visible_rows"
+    mode = "purge_inplay_visible_table" if purge_visible_table else "clear_visible_table" if clear_visible_table else "clear_stale_visible_rows"
     db_log(
         connection,
         "INFO",
@@ -3645,9 +3654,10 @@ def cleanup_stale_visible_rows(
         "Stale visible rows cleanup started",
         details={"current_run_id": current_run_id, "mode": mode, "manual": manual},
     )
-    stale_clause = "1 = 1" if clear_visible_table else "(COALESCE(last_seen_run_id, '') != ? OR COALESCE(last_seen_in_scan_at, '') = '')"
+    force_clear = clear_visible_table or purge_visible_table
+    stale_clause = "1 = 1" if force_clear else "(COALESCE(last_seen_run_id, '') != ? OR COALESCE(last_seen_in_scan_at, '') = '')"
     params: list[Any] = []
-    if not clear_visible_table:
+    if not force_clear:
         params.append(current_run_id)
     rows_to_hide = connection.execute(
         f"""
@@ -3658,8 +3668,6 @@ def cleanup_stale_visible_rows(
           AND {stale_clause}
           AND COALESCE(final_verification_result, '') != 'pending_verification'
           AND (verify_after IS NULL OR verify_after <= ?)
-          AND COALESCE(slack_alert_sent, 0) = 0
-          AND alert_sent_at IS NULL
           AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
           AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
           AND COALESCE(slack_error, '') = ''
@@ -3742,8 +3750,6 @@ def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_i
             last_seen_run_id = ?
             OR COALESCE(final_verification_result, '') = 'pending_verification'
             OR (verify_after IS NOT NULL AND verify_after > ?)
-            OR COALESCE(slack_alert_sent, 0) = 1
-            OR alert_sent_at IS NOT NULL
             OR COALESCE(final_verification_result, '') IN (?, ?, ?)
             OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
             OR COALESCE(slack_error, '') != ''
@@ -3784,18 +3790,103 @@ def cleanup_hub_visibility(connection: sqlite3.Connection) -> None:
     cleanup_visible_rows_after_run(connection, CURRENT_SCAN_RUN_ID, utc_now())
 
 
-def run_manual_visible_rows_cleanup(connection: sqlite3.Connection, *, clear_visible_table: bool = False) -> int:
+def run_manual_visible_rows_cleanup(
+    connection: sqlite3.Connection,
+    *,
+    clear_visible_table: bool = False,
+    purge_visible_table: bool = False,
+) -> int:
     latest_run_id = latest_recorded_scan_run_id(connection)
     hidden_count = cleanup_stale_visible_rows(
         connection,
         latest_run_id,
         utc_now(),
         clear_visible_table=clear_visible_table,
+        purge_visible_table=purge_visible_table,
         manual=True,
     )
-    mode = "visible table" if clear_visible_table else "stale visible rows"
+    mode = "visible table" if clear_visible_table or purge_visible_table else "stale visible rows"
     print(f"Hidden {hidden_count} {mode}.", flush=True)
     return hidden_count
+
+
+def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = STATE_DB_PATH) -> None:
+    table_names = {
+        str(row["name"])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    if "inplay_alert_state" not in table_names or "inplay_scan_runs" not in table_names:
+        print(f"Database: {db_path}", flush=True)
+        print("latest_run_id: (none)", flush=True)
+        print("visible rows: 0", flush=True)
+        print("pending rows: 0", flush=True)
+        print("Slack-sent rows: 0", flush=True)
+        print("latest-run rows: 0", flush=True)
+        print("actionable rows: 0", flush=True)
+        print("sample visible rows:", flush=True)
+        print("  (state tables missing)", flush=True)
+        return
+    latest_run_id = latest_recorded_scan_run_id(connection)
+    now_iso = iso_utc(utc_now())
+    counts = connection.execute(
+        """
+        SELECT
+            SUM(CASE WHEN COALESCE(visible_in_hub, 1) = 1 THEN 1 ELSE 0 END) AS visible_rows,
+            SUM(CASE WHEN COALESCE(visible_in_hub, 1) = 1
+                      AND (COALESCE(final_verification_result, '') = 'pending_verification'
+                           OR (verify_after IS NOT NULL AND verify_after > ?))
+                     THEN 1 ELSE 0 END) AS pending_rows,
+            SUM(CASE WHEN COALESCE(visible_in_hub, 1) = 1
+                      AND (COALESCE(slack_alert_sent, 0) = 1 OR alert_sent_at IS NOT NULL)
+                     THEN 1 ELSE 0 END) AS slack_sent_rows,
+            SUM(CASE WHEN COALESCE(visible_in_hub, 1) = 1
+                      AND COALESCE(last_seen_run_id, '') = ?
+                     THEN 1 ELSE 0 END) AS latest_run_rows,
+            SUM(CASE WHEN COALESCE(visible_in_hub, 1) = 1
+                      AND (COALESCE(final_verification_result, '') IN (?, ?, ?)
+                           OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
+                           OR COALESCE(slack_error, '') != '')
+                     THEN 1 ELSE 0 END) AS actionable_rows
+        FROM inplay_alert_state
+        """,
+        (now_iso, latest_run_id, *ACTIONABLE_FINAL_RESULTS),
+    ).fetchone()
+    print(f"Database: {db_path}", flush=True)
+    print(f"latest_run_id: {latest_run_id or '(none)'}", flush=True)
+    print(f"visible rows: {int(counts['visible_rows'] or 0)}", flush=True)
+    print(f"pending rows: {int(counts['pending_rows'] or 0)}", flush=True)
+    print(f"Slack-sent rows: {int(counts['slack_sent_rows'] or 0)}", flush=True)
+    print(f"latest-run rows: {int(counts['latest_run_rows'] or 0)}", flush=True)
+    print(f"actionable rows: {int(counts['actionable_rows'] or 0)}", flush=True)
+    rows = connection.execute(
+        """
+        SELECT event_name, flashscore_match_name, sport_name, visible_in_hub,
+               last_seen_run_id, verify_after, slack_alert_sent,
+               final_verification_result, hidden_reason
+        FROM inplay_alert_state
+        WHERE COALESCE(visible_in_hub, 1) = 1
+        ORDER BY COALESCE(last_seen_in_scan_at, last_checked_at, first_flagged_at, event_name, flashscore_match_name) DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    print("sample visible rows:", flush=True)
+    if not rows:
+        print("  (none)", flush=True)
+        return
+    for row in rows:
+        print(
+            "  "
+            f"event={row['event_name'] or row['flashscore_match_name'] or ''} | "
+            f"sport={row['sport_name'] or ''} | "
+            f"visible={row['visible_in_hub']} | "
+            f"last_seen_run_id={row['last_seen_run_id'] or ''} | "
+            f"latest_run_id={latest_run_id or ''} | "
+            f"verify_after={row['verify_after'] or ''} | "
+            f"slack_alert_sent={row['slack_alert_sent'] or 0} | "
+            f"final_verification_result={row['final_verification_result'] or ''} | "
+            f"hidden_reason={row['hidden_reason'] or ''}",
+            flush=True,
+        )
 
 
 def startup_message(repeat_minutes: float, dry_run: bool) -> str:
@@ -4975,7 +5066,7 @@ def run_self_test() -> int:
         insert_visible_test_row(cleanup_db, "current-row", last_seen_run_id=current_cleanup_run_id, last_seen_in_scan_at=cleanup_now_iso)
         cleanup_db.commit()
         hidden_count = cleanup_stale_visible_rows(cleanup_db, current_cleanup_run_id, cleanup_now)
-        assert hidden_count == 2
+        assert hidden_count == 3
         cleanup_rows = {
             str(row["event_id"]): row
             for row in cleanup_db.execute("SELECT event_id, visible_in_hub, hidden_reason FROM inplay_alert_state").fetchall()
@@ -4984,7 +5075,7 @@ def run_self_test() -> int:
         assert cleanup_rows["legacy-row"]["hidden_reason"] == "stale_visible_row_not_seen_latest_live_scan"
         assert cleanup_rows["old-row"]["visible_in_hub"] == 0
         assert cleanup_rows["pending-row"]["visible_in_hub"] == 1
-        assert cleanup_rows["slack-row"]["visible_in_hub"] == 1
+        assert cleanup_rows["slack-row"]["visible_in_hub"] == 0
         assert cleanup_rows["actionable-row"]["visible_in_hub"] == 1
         assert cleanup_rows["current-row"]["visible_in_hub"] == 1
         assert cleanup_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'legacy_visible_row_hidden'").fetchone()[0] == 1
@@ -5017,6 +5108,45 @@ def run_self_test() -> int:
             "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'manual_clear_stale_visible_rows_completed'"
         ).fetchone()[0] == 1
         manual_cleanup_db.close()
+
+        purge_cleanup_db = sqlite3.connect(":memory:")
+        purge_cleanup_db.row_factory = sqlite3.Row
+        init_db(purge_cleanup_db)
+        insert_visible_test_row(purge_cleanup_db, "purge-current-row", last_seen_run_id="purge-current-run", last_seen_in_scan_at=cleanup_now_iso)
+        insert_visible_test_row(
+            purge_cleanup_db,
+            "purge-pending-row",
+            last_seen_run_id="purge-old-run",
+            last_seen_in_scan_at=cleanup_now_iso,
+            final_verification_result="pending_verification",
+            verify_after=iso_utc(cleanup_now + timedelta(minutes=5)),
+        )
+        insert_visible_test_row(
+            purge_cleanup_db,
+            "purge-actionable-row",
+            last_seen_run_id="purge-old-run",
+            last_seen_in_scan_at=cleanup_now_iso,
+            final_verification_result="suppressed_unknown",
+        )
+        purge_cleanup_db.commit()
+        purge_hidden_count = cleanup_stale_visible_rows(
+            purge_cleanup_db,
+            "purge-current-run",
+            cleanup_now,
+            purge_visible_table=True,
+            manual=True,
+        )
+        assert purge_hidden_count == 1
+        assert purge_cleanup_db.execute(
+            "SELECT visible_in_hub FROM inplay_alert_state WHERE event_id = 'purge-current-row'"
+        ).fetchone()[0] == 0
+        assert purge_cleanup_db.execute(
+            "SELECT visible_in_hub FROM inplay_alert_state WHERE event_id = 'purge-pending-row'"
+        ).fetchone()[0] == 1
+        assert purge_cleanup_db.execute(
+            "SELECT visible_in_hub FROM inplay_alert_state WHERE event_id = 'purge-actionable-row'"
+        ).fetchone()[0] == 1
+        purge_cleanup_db.close()
 
         duplicate_db = sqlite3.connect(":memory:")
         duplicate_db.row_factory = sqlite3.Row
@@ -5827,7 +5957,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--send-startup-message", action="store_true", help="Send a Slack message when the scanner starts.")
     parser.add_argument("--send-shutdown-message", action="store_true", help="Send a Slack message when the scanner stops.")
     parser.add_argument("--clear-stale-visible-rows", action="store_true", help="Hide stale non-pending rows from the hub table and exit.")
-    parser.add_argument("--clear-visible-table", action="store_true", help="Hide all non-pending, non-Slack, non-actionable hub rows and exit.")
+    parser.add_argument("--clear-visible-table", action="store_true", help="Hide all non-pending, non-actionable hub rows and exit.")
+    parser.add_argument("--purge-inplay-visible-table", action="store_true", help="Force-hide visible hub rows except pending timers and actionable errors, then exit.")
+    parser.add_argument("--debug-visible-table", action="store_true", help="Print visible hub table diagnostics and exit.")
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     return parser.parse_args()
 
@@ -5837,10 +5969,26 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
-    connection = open_db()
-    if args.clear_stale_visible_rows or args.clear_visible_table:
+    if args.debug_visible_table:
+        connection = open_db_readonly()
+        if connection is None:
+            print(f"Database: {STATE_DB_PATH}", flush=True)
+            print("visible rows: 0", flush=True)
+            print("State database does not exist.", flush=True)
+            return 0
         try:
-            run_manual_visible_rows_cleanup(connection, clear_visible_table=bool(args.clear_visible_table))
+            print_visible_table_debug(connection)
+            return 0
+        finally:
+            connection.close()
+    connection = open_db()
+    if args.clear_stale_visible_rows or args.clear_visible_table or args.purge_inplay_visible_table:
+        try:
+            run_manual_visible_rows_cleanup(
+                connection,
+                clear_visible_table=bool(args.clear_visible_table),
+                purge_visible_table=bool(args.purge_inplay_visible_table),
+            )
             return 0
         finally:
             connection.close()

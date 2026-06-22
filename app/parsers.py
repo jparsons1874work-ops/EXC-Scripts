@@ -430,25 +430,21 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         def log_expr(name: str, default: str = "''") -> str:
             return name if name in log_columns else default
 
-        if "visible_in_hub" in state_columns:
-            visible_filter = "COALESCE(visible_in_hub, 1) = 1"
-        else:
-            visible_filter = """
-                (
-                    COALESCE(final_verification_result, '') = 'pending_verification'
-                    OR COALESCE(final_verification_result, '') IN ('failed', 'suppressed_unknown', 'suppressed_ambiguous')
-                    OR alert_sent_at IS NOT NULL
-                    OR COALESCE(slack_alert_sent, 0) = 1
-                    OR COALESCE(slack_error, '') != ''
-                    OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
-                )
-                AND NOT (
-                    COALESCE(final_verification_result, '') = 'suppressed_inplay'
-                    AND COALESCE(slack_alert_sent, 0) = 0
-                    AND alert_sent_at IS NULL
-                    AND COALESCE(slack_error, '') = ''
-                )
-            """
+        now_iso = datetime.now(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        visible_expr = "COALESCE(visible_in_hub, 1)" if "visible_in_hub" in state_columns else "1"
+        last_seen_run_expr = "COALESCE(last_seen_run_id, '')" if "last_seen_run_id" in state_columns else "''"
+        verify_after_expr = "verify_after" if "verify_after" in state_columns else "NULL"
+        visible_filter = f"""
+            {visible_expr} = 1
+            AND (
+                {last_seen_run_expr} = ?
+                OR COALESCE(final_verification_result, '') = 'pending_verification'
+                OR ({verify_after_expr} IS NOT NULL AND {verify_after_expr} > ?)
+                OR COALESCE(final_verification_result, '') IN ('failed', 'suppressed_unknown', 'suppressed_ambiguous')
+                OR COALESCE(slack_error, '') != ''
+                OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
+            )
+        """
 
         active_flags = _rows(
             connection,
@@ -484,6 +480,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             ORDER BY COALESCE(flashscore_detected_live_at, scheduled_start_utc, betfair_last_checked_at, last_checked_at, first_flagged_at) ASC
             LIMIT 50
             """,
+            (latest_run_id, now_iso),
         )
         recovered_events = _rows(
             connection,
@@ -548,7 +545,6 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             )
             AND (
                 {log_expr("run_id")} = ?
-                OR event_type IN ('slack_alert_sent', 'slack_alert_failed', 'flashscore_slack_alert_sent', 'flashscore_slack_alert_failed')
                 OR event_id IN (
                     SELECT event_id
                     FROM inplay_alert_state
@@ -558,7 +554,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             ORDER BY id DESC
             LIMIT 80
             """,
-            (latest_run_id,),
+            (latest_run_id, latest_run_id, now_iso),
         )
         recent_skipped_events = _rows(
             connection,
