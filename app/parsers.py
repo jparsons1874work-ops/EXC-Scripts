@@ -199,7 +199,8 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         row["final_inplay_raw_label"] = str(raw_inplay) if raw_inplay not in (None, "") else ""
         row["final_inplay_parsed_label"] = row["inplay_label"] if final_inplay not in (None, "") else ""
 
-        start_value = row.get("scheduled_start_utc")
+        source = str(row.get("trigger_source") or "betfair_time")
+        start_value = row.get("flashscore_first_seen_live_at") if source == "flashscore_live" else row.get("scheduled_start_utc")
         try:
             start_dt = datetime.fromisoformat(str(start_value or "").replace("Z", "+00:00")).astimezone(UK_TZ)
         except ValueError:
@@ -217,7 +218,6 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         else:
             row["time_remaining"] = ""
         row["slack_alert_sent"] = "Yes" if row.get("alert_sent_at") or row.get("slack_alert_sent") else "No"
-        source = str(row.get("trigger_source") or "betfair_time")
         row["source_label"] = "Flashscore" if source == "flashscore_live" else "Betfair time"
         row["format_label"] = str(row.get("match_format") or "singles").title()
         row["display_event_name"] = str(row.get("flashscore_match_name") or row.get("event_name") or "")
@@ -246,10 +246,20 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
             row["verification_label"] = "Confirmed Not In-Play"
         elif result == "failed":
             row["verification_label"] = "Failed - API Error"
-        elif result == "suppressed_inplay" or (result == "suppressed" and reason in {"inplay", "betfair_inplay"}):
+        elif result in {"suppressed_inplay", "skipped_betfair_already_inplay"} or (result == "suppressed" and reason in {"inplay", "betfair_inplay"}):
             row["verification_label"] = "Suppressed - Now In-Play"
-        elif result == "suppressed_closed" or (result == "suppressed" and reason in {"closed", "betfair_closed"}):
+        elif result in {"suppressed_closed", "skipped_closed_market"} or (result == "suppressed" and reason in {"closed", "betfair_closed"}):
             row["verification_label"] = "Suppressed - Closed"
+        elif result == "skipped_no_betfair_match":
+            row["verification_label"] = "No Betfair Match"
+        elif result == "skipped_low_confidence_match":
+            row["verification_label"] = "Low Confidence Match"
+        elif result == "skipped_ambiguous_match":
+            row["verification_label"] = "Ambiguous Match"
+        elif result == "skipped_betfair_api_error":
+            row["verification_label"] = "Betfair API Error"
+        elif result == "skipped_not_alert_candidate":
+            row["verification_label"] = "Not Alert Candidate"
         else:
             row["verification_label"] = result.replace("_", " ").title() if result else ""
         status_for_compact = str(row.get("final_marketbook_status_parsed") or row.get("betfair_last_seen_status") or row.get("last_seen_status") or "").strip().upper()
@@ -263,13 +273,32 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
             else:
                 row["betfair_compact_status"] = f"{status_for_compact} / Unknown"
         else:
-            row["betfair_compact_status"] = "Unknown"
+            if result == "skipped_no_betfair_match":
+                row["betfair_compact_status"] = "No Betfair Match"
+            elif result == "skipped_low_confidence_match":
+                row["betfair_compact_status"] = "Low Confidence Match"
+            elif result == "skipped_ambiguous_match":
+                row["betfair_compact_status"] = "Ambiguous Match"
+            elif result == "skipped_betfair_api_error" or result == "failed" or row.get("slack_error"):
+                row["betfair_compact_status"] = "Betfair API Error"
+            elif result == "pending_verification":
+                row["betfair_compact_status"] = "Pending Betfair Check"
+            else:
+                row["betfair_compact_status"] = "Unknown"
         if row["slack_alert_sent"] == "Yes":
             row["timer_until_slack"] = "Sent"
-        elif result in {"failed", "suppressed_unknown", "suppressed_ambiguous"} or row.get("slack_error"):
+        elif result in {"failed", "suppressed_unknown", "suppressed_ambiguous", "skipped_betfair_api_error"} or row.get("slack_error"):
             row["timer_until_slack"] = "Error"
         elif result == "pending_verification":
             row["timer_until_slack"] = row["time_remaining"] or "Due"
+        elif result == "skipped_no_betfair_match":
+            row["timer_until_slack"] = "No Betfair Match"
+        elif result == "skipped_low_confidence_match":
+            row["timer_until_slack"] = "Low Confidence"
+        elif result == "skipped_ambiguous_match":
+            row["timer_until_slack"] = "Ambiguous"
+        elif result == "skipped_not_alert_candidate":
+            row["timer_until_slack"] = "Not Required"
         else:
             row["timer_until_slack"] = ""
         row["flashscore_status_display"] = str(row.get("flashscore_status") or "N/A")
@@ -407,7 +436,8 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
     if not db_path.exists():
         return None
 
-    connection = sqlite3.connect(db_path)
+    connection = sqlite3.connect(db_path, timeout=30)
+    connection.execute("PRAGMA busy_timeout=30000")
     try:
         latest = connection.execute(
             "SELECT * FROM inplay_scan_runs ORDER BY id DESC LIMIT 1"
@@ -440,9 +470,18 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                 {last_seen_run_expr} = ?
                 OR COALESCE(final_verification_result, '') = 'pending_verification'
                 OR ({verify_after_expr} IS NOT NULL AND {verify_after_expr} > ?)
-                OR COALESCE(final_verification_result, '') IN ('failed', 'suppressed_unknown', 'suppressed_ambiguous')
+                OR COALESCE(final_verification_result, '') IN ('failed', 'suppressed_unknown', 'suppressed_ambiguous', 'skipped_betfair_api_error', 'skipped_ambiguous_match')
                 OR COALESCE(slack_error, '') != ''
                 OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
+            )
+            AND COALESCE(final_verification_result, '') NOT IN (
+                'skipped_betfair_already_inplay',
+                'skipped_closed_market',
+                'skipped_not_alert_candidate',
+                'skipped_low_confidence_match',
+                'suppressed_flashscore_not_live',
+                'suppressed_closed',
+                'suppressed_status'
             )
         """
 
@@ -469,7 +508,9 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                    {state_column("betfair_side_2_players")}, {state_column("betfair_side_1_surnames")},
                    {state_column("betfair_side_2_surnames")}, {state_column("pending_verification_at")},
                    {state_column("verify_after")}, {state_column("alert_delay_seconds", "NULL")},
-                   {state_column("candidate_first_seen_at")}, {state_column("final_marketbook_status_raw")},
+                   {state_column("candidate_first_seen_at")}, {state_column("flashscore_first_seen_live_at")},
+                   {state_column("overdue_by_seconds", "NULL")}, {state_column("overdue_by_display")},
+                   {state_column("final_marketbook_status_raw")},
                    {state_column("final_marketbook_inplay_raw")},
                    {state_column("final_marketbook_inplay_parsed", "NULL")},
                    {state_column("final_marketbook_status_parsed")},
@@ -503,6 +544,8 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                    betfair_last_seen_inplay, betfair_last_seen_status, slack_alert_sent, slack_error,
                    {state_column("match_score", "NULL")}, {state_column("match_format")},
                    {state_column("verify_after")}, {state_column("pending_verification_at")},
+                   {state_column("candidate_first_seen_at")}, {state_column("flashscore_first_seen_live_at")},
+                   {state_column("overdue_by_seconds", "NULL")}, {state_column("overdue_by_display")},
                    {state_column("final_marketbook_status_raw")},
                    {state_column("final_marketbook_inplay_raw")},
                    {state_column("final_marketbook_inplay_parsed", "NULL")},
