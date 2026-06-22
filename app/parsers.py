@@ -427,6 +427,9 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         def log_column(name: str, default: str = "''") -> str:
             return name if name in log_columns else f"{default} AS {name}"
 
+        def log_expr(name: str, default: str = "''") -> str:
+            return name if name in log_columns else default
+
         if "visible_in_hub" in state_columns:
             visible_filter = "COALESCE(visible_in_hub, 1) = 1"
         else:
@@ -544,7 +547,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                 )
             )
             AND (
-                {log_column("run_id")} = ?
+                {log_expr("run_id")} = ?
                 OR event_type IN ('slack_alert_sent', 'slack_alert_failed', 'flashscore_slack_alert_sent', 'flashscore_slack_alert_failed')
                 OR event_id IN (
                     SELECT event_id
