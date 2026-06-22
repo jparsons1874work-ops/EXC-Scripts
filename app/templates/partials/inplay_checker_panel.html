@@ -5,133 +5,39 @@
 
   <div class="metric-row inplay-metrics">
     <div class="metric">
-      <span class="metric-label">Last scan</span>
+      <span class="metric-label">Last run</span>
       <span class="metric-value compact">{{ inplay.summary.last_scan_time or 'Never' }}</span>
-    </div>
-    <div class="metric">
-      <span class="metric-label">Next scan</span>
-      <span class="metric-value compact">{{ inplay.summary.next_scheduled_scan or 'Not scheduled' }}</span>
-    </div>
-    <div class="metric">
-      <span class="metric-label">Included sports</span>
-      <span class="metric-value">{{ inplay.summary.included_sports_count }}</span>
-    </div>
-    <div class="metric">
-      <span class="metric-label">Markets scanned</span>
-      <span class="metric-value">{{ inplay.summary.markets_scanned }}</span>
     </div>
     <div class="metric">
       <span class="metric-label">Flashscore live</span>
       <span class="metric-value">{{ inplay.summary.flashscore_live_matches_found }}</span>
     </div>
     <div class="metric">
-      <span class="metric-label">Active not in-play</span>
-      <span class="metric-value">{{ inplay.summary.active_not_inplay_flags }}</span>
+      <span class="metric-label">Betfair markets</span>
+      <span class="metric-value">{{ inplay.summary.markets_scanned }}</span>
     </div>
     <div class="metric">
-      <span class="metric-label">Flags found</span>
-      <span class="metric-value">{{ inplay.summary.flags_found }}</span>
+      <span class="metric-label">Active not in-play</span>
+      <span class="metric-value">{{ inplay.summary.active_not_inplay_flags }}</span>
     </div>
     <div class="metric">
       <span class="metric-label">Slack sent</span>
       <span class="metric-value">{{ inplay.summary.slack_alerts_sent }}</span>
     </div>
     <div class="metric">
-      <span class="metric-label">Ambiguous skipped</span>
-      <span class="metric-value">{{ inplay.summary.ambiguous_matches_skipped }}</span>
+      <span class="metric-label">Last error</span>
+      <span class="metric-value compact">{{ inplay.summary.last_error or 'None' }}</span>
     </div>
   </div>
 
-  <div class="inplay-meta">
-    <span>Excluded sports: {{ inplay.summary.excluded_sports }}</span>
-    <span>Betfair scan: {{ inplay.summary.betfair_time_scan_status }}</span>
-    <span>Flashscore scan: {{ inplay.summary.flashscore_scan_status }}</span>
-    <span>Flashscore live matches: {{ inplay.summary.flashscore_live_matches_found }}</span>
-    <span>Slack failures: {{ inplay.summary.slack_alert_failures }}</span>
-    <span>API errors: {{ inplay.summary.api_errors }}</span>
-    <span>Dry-run: {{ inplay.summary.dry_run }}</span>
-    {% if inplay.summary.last_error %}
-    <span>Last error: {{ inplay.summary.last_error }}</span>
-    {% endif %}
-  </div>
-
-  <h3>Latest Scan Sport Breakdown</h3>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Sport</th>
-          <th>Markets</th>
-          <th>Not overdue</th>
-          <th>In-play</th>
-          <th>Closed</th>
-          <th>Already alerted</th>
-          <th>Missing event ID</th>
-          <th>Flags</th>
-          <th>Slack alerts</th>
-          <th>API errors</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in inplay.sport_breakdown %}
-        <tr>
-          <td>{{ row.sport_name }}</td>
-          <td>{{ row.markets_scanned }}</td>
-          <td>{{ row.not_overdue }}</td>
-          <td>{{ row.already_in_play }}</td>
-          <td>{{ row.closed }}</td>
-          <td>{{ row.already_alerted }}</td>
-          <td>{{ row.missing_event_id }}</td>
-          <td>{{ row.flags }}</td>
-          <td>{{ row.slack_alerts }}</td>
-          <td>{{ row.api_errors }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="10">No sport breakdown recorded for the latest scan.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Live Matches / Active Checks</h3>
-  <div class="live-groups">
-    {% for group in inplay.active_groups %}
-    <section class="live-group">
-      <h4>{{ group.sport_name }}</h4>
-      <div class="live-list">
-        {% for row in group.rows %}
-        <div class="live-row">
-          <div class="live-time">{{ row.display_time_uk or 'Time unknown' }}</div>
-          <div class="live-main">
-            <strong>{{ row.display_event_name }}</strong>
-            <span>{{ row.display_competition }}</span>
-            <span>{{ row.source_label }}</span>
-          </div>
-          <div class="live-detail">
-            {% if row.flashscore_status %}<span>Flashscore: {{ row.flashscore_status }}</span>{% endif %}
-            {% if row.flashscore_score %}<span>Score: {{ row.flashscore_score }}</span>{% endif %}
-            <span>Betfair: {{ row.betfair_status_label or 'Unknown' }}</span>
-            <span class="state-label {% if row.inplay_label == 'Yes' %}state-ok{% elif row.inplay_label == 'No' %}state-warn{% else %}state-muted{% endif %}">Betfair In-Play: {{ row.inplay_label }}</span>
-            <span>Confidence: {{ row.match_confidence_label or 'n/a' }}</span>
-            <span>Slack: {{ 'Sent' if row.slack_alert_sent == 'Yes' else 'Not sent' }}</span>
-            <span>Last checked: {{ row.betfair_last_checked_at or row.last_checked_at }}</span>
-          </div>
-        </div>
-        {% endfor %}
-      </div>
-    </section>
-    {% else %}
-    <div class="message">No live matches or active checks recorded.</div>
-    {% endfor %}
-  </div>
-
-  <h3>Detailed Checks</h3>
+  <h3>Checks</h3>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
           <th>Source</th>
           <th>Sport</th>
+          <th>Format</th>
           <th>Event / Match</th>
           <th>Competition</th>
           <th>Flashscore Status</th>
@@ -139,12 +45,20 @@
           <th>Betfair Event ID</th>
           <th>Betfair Market ID</th>
           <th>Betfair Status</th>
+          <th>Verification</th>
+          <th>Verify After</th>
+          <th>Time Remaining</th>
           <th>Betfair In-Play</th>
+          <th>Betfair In-Play Raw</th>
+          <th>Betfair In-Play Parsed</th>
+          <th>Final Verification Result</th>
+          <th>Final Verification Reason</th>
+          <th>Match Score</th>
           <th>Match Confidence</th>
-          <th>Slack alert sent</th>
-          <th>Alert sent at</th>
-          <th>Last checked at</th>
-          <th>Last log/reason</th>
+          <th>Slack Sent</th>
+          <th>Alert Sent At</th>
+          <th>Last Checked</th>
+          <th>Last Reason</th>
         </tr>
       </thead>
       <tbody>
@@ -152,6 +66,7 @@
         <tr>
           <td>{{ row.source_label }}</td>
           <td>{{ row.sport_name }}</td>
+          <td>{{ row.format_label }}</td>
           <td>{{ row.display_event_name }}</td>
           <td>{{ row.display_competition }}</td>
           <td>{{ row.flashscore_status }}</td>
@@ -159,7 +74,15 @@
           <td>{{ row.event_id }}</td>
           <td>{{ row.market_id }}</td>
           <td>{{ row.betfair_status_label }}</td>
+          <td>{{ row.verification_label }}</td>
+          <td>{{ row.verify_after }}</td>
+          <td>{{ row.time_remaining }}</td>
           <td>{{ row.inplay_label }}</td>
+          <td>{{ row.final_inplay_raw_label }}</td>
+          <td>{{ row.final_inplay_parsed_label }}</td>
+          <td>{{ row.final_verification_result }}</td>
+          <td>{{ row.final_verification_reason }}</td>
+          <td>{{ row.match_score_label }}</td>
           <td>{{ row.match_confidence_label }}</td>
           <td>{{ row.slack_alert_sent }}</td>
           <td>{{ row.alert_sent_at }}</td>
@@ -167,143 +90,7 @@
           <td>{{ row.last_log_reason }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="15">No flagged or checked events.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Recent Slack Alerts</h3>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Alert time</th>
-          <th>Event</th>
-          <th>Sport</th>
-          <th>Competition</th>
-          <th>Event ID</th>
-          <th>Market ID</th>
-          <th>Start UK</th>
-          <th>Overdue by</th>
-          <th>Status</th>
-          <th>Betfair In-Play</th>
-          <th>Last checked at</th>
-          <th>Last log/reason</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in inplay.recent_alerts %}
-        <tr>
-          <td>{{ row.alert_sent_at }}</td>
-          <td>{{ row.event_name }}</td>
-          <td>{{ row.sport_name }}</td>
-          <td>{{ row.competition_name }}</td>
-          <td>{{ row.event_id }}</td>
-          <td>{{ row.market_id }}</td>
-          <td>{{ row.scheduled_start_uk }}</td>
-          <td>{{ row.overdue_by }}</td>
-          <td>{{ row.last_seen_status }}</td>
-          <td>{{ row.inplay_label }}</td>
-          <td>{{ row.last_checked_at }}</td>
-          <td>{{ row.last_log_reason }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="12">No Slack alerts recorded.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Later Seen In-Play</h3>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Recovered</th>
-          <th>Event</th>
-          <th>Sport</th>
-          <th>Event ID</th>
-          <th>Market ID</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in inplay.recovered_events %}
-        <tr>
-          <td>{{ row.recovered_at }}</td>
-          <td>{{ row.event_name }}</td>
-          <td>{{ row.sport_name }}</td>
-          <td>{{ row.event_id }}</td>
-          <td>{{ row.market_id }}</td>
-          <td>{{ row.last_seen_status }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="6">No recovered events recorded.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Recent Skipped Events</h3>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Reason</th>
-          <th>Sport</th>
-          <th>Event</th>
-          <th>Event ID</th>
-          <th>Market ID</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in inplay.recent_skipped_events %}
-        <tr>
-          <td>{{ row.timestamp }}</td>
-          <td>{{ row.reason or row.message }}</td>
-          <td>{{ row.sport_name }}</td>
-          <td>{{ row.event_name }}</td>
-          <td>{{ row.event_id }}</td>
-          <td>{{ row.market_id }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="6">No skipped events recorded.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Recent Logs</h3>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Level</th>
-          <th>Type</th>
-          <th>Message</th>
-          <th>Sport</th>
-          <th>Event</th>
-          <th>Event ID</th>
-          <th>Market ID</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in inplay.recent_logs %}
-        <tr>
-          <td>{{ row.timestamp }}</td>
-          <td>{{ row.level }}</td>
-          <td>{{ row.event_type }}</td>
-          <td>{{ row.message }}</td>
-          <td>{{ row.sport_name }}</td>
-          <td>{{ row.event_name }}</td>
-          <td>{{ row.event_id }}</td>
-          <td>{{ row.market_id }}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="8">No scan logs recorded.</td></tr>
+        <tr><td colspan="24">No flagged or checked events.</td></tr>
         {% endfor %}
       </tbody>
     </table>

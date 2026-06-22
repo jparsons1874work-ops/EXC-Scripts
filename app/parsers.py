@@ -185,13 +185,18 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         row["flashscore_detected_live_at_raw"] = row.get("flashscore_detected_live_at")
         row["last_checked_at_raw"] = row.get("last_checked_at")
         row["betfair_last_checked_at_raw"] = row.get("betfair_last_checked_at")
-        inplay = row.get("betfair_last_seen_inplay", row.get("last_seen_inplay"))
+        row["verify_after_raw"] = row.get("verify_after")
+        final_inplay = row.get("final_marketbook_inplay_parsed")
+        inplay = final_inplay if final_inplay not in (None, "") else row.get("betfair_last_seen_inplay", row.get("last_seen_inplay"))
         if inplay is None or inplay == "":
             row["inplay_label"] = "Unknown"
         elif int(inplay) == 1:
             row["inplay_label"] = "Yes"
         else:
             row["inplay_label"] = "No"
+        raw_inplay = row.get("final_marketbook_inplay_raw")
+        row["final_inplay_raw_label"] = str(raw_inplay) if raw_inplay not in (None, "") else ""
+        row["final_inplay_parsed_label"] = row["inplay_label"] if final_inplay not in (None, "") else ""
 
         start_value = row.get("scheduled_start_utc")
         try:
@@ -199,15 +204,32 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
         except ValueError:
             start_dt = None
         row["overdue_by"] = _format_duration(now - start_dt) if start_dt else ""
+        verify_after = None
+        try:
+            verify_after = datetime.fromisoformat(str(row.get("verify_after_raw") or "").replace("Z", "+00:00")).astimezone(UK_TZ)
+        except ValueError:
+            verify_after = None
+        if verify_after and verify_after > now:
+            row["time_remaining"] = _format_duration(verify_after - now)
+        elif verify_after and str(row.get("final_verification_result") or "") == "pending_verification":
+            row["time_remaining"] = "Due"
+        else:
+            row["time_remaining"] = ""
         row["slack_alert_sent"] = "Yes" if row.get("alert_sent_at") or row.get("slack_alert_sent") else "No"
         source = str(row.get("trigger_source") or "betfair_time")
         row["source_label"] = "Flashscore" if source == "flashscore_live" else "Betfair time"
+        row["format_label"] = str(row.get("match_format") or "singles").title()
         row["display_event_name"] = str(row.get("flashscore_match_name") or row.get("event_name") or "")
         row["display_competition"] = str(row.get("flashscore_competition") or row.get("competition_name") or "")
         row["betfair_status_label"] = str(row.get("betfair_last_seen_status") or row.get("last_seen_status") or "")
         confidence = str(row.get("match_confidence") or "")
         score = row.get("match_score")
-        row["match_confidence_label"] = f"{confidence} ({score:.0f})" if confidence and isinstance(score, (int, float)) else confidence
+        try:
+            score_value = float(score) if score not in (None, "") else None
+        except (TypeError, ValueError):
+            score_value = None
+        row["match_score_label"] = f"{score_value:.0f}" if score_value is not None else ""
+        row["match_confidence_label"] = f"{confidence} ({score_value:.0f})" if confidence and score_value is not None else confidence
         row["last_log_reason"] = str(
             row.get("slack_error")
             or row.get("match_reason")
@@ -215,7 +237,21 @@ def _decorate_state_rows(rows: list[dict[str, str]]) -> None:
             or row.get("final_verification_result")
             or ""
         )
-        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "final_verification_at", "betfair_last_checked_at", "flashscore_detected_live_at"):
+        result = str(row.get("final_verification_result") or "")
+        reason = str(row.get("final_verification_reason") or "")
+        if result == "pending_verification":
+            row["verification_label"] = "Pending"
+        elif result == "confirmed_not_inplay":
+            row["verification_label"] = "Confirmed Not In-Play"
+        elif result == "failed":
+            row["verification_label"] = "Failed - API Error"
+        elif result == "suppressed_inplay" or (result == "suppressed" and reason in {"inplay", "betfair_inplay"}):
+            row["verification_label"] = "Suppressed - Now In-Play"
+        elif result == "suppressed_closed" or (result == "suppressed" and reason in {"closed", "betfair_closed"}):
+            row["verification_label"] = "Suppressed - Closed"
+        else:
+            row["verification_label"] = result.replace("_", " ").title() if result else ""
+        for key in ("first_flagged_at", "alert_sent_at", "recovered_at", "last_checked_at", "final_verification_at", "betfair_last_checked_at", "flashscore_detected_live_at", "verify_after", "pending_verification_at"):
             if key in row:
                 row[key] = _format_db_time(row.get(key))
 
@@ -260,6 +296,18 @@ def _group_active_rows(rows: list[dict[str, str]]) -> list[dict[str, object]]:
     return groups
 
 
+def _sort_rows_by_sport_time(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            PREFERRED_SPORT_ORDER.get(str(row.get("sport_name") or ""), 99),
+            str(row.get("sport_name") or "").casefold(),
+            _sort_time(row),
+            str(row.get("display_event_name") or row.get("event_name") or "").casefold(),
+        ),
+    )
+
+
 def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     breakdown: dict[str, dict[str, int | str]] = {}
 
@@ -296,6 +344,8 @@ def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, s
                 entry["markets_scanned"] = int(entry["markets_scanned"]) + int(details.get("markets_scanned") or 0)
             except (TypeError, ValueError):
                 pass
+        elif event_type == "not_overdue_yet":
+            entry["not_overdue"] = int(entry["not_overdue"]) + 1
         elif event_type == "skipped":
             if reason == "not overdue":
                 entry["not_overdue"] = int(entry["not_overdue"]) + 1
@@ -311,10 +361,10 @@ def _latest_scan_sport_breakdown(rows: list[dict[str, str]]) -> list[dict[str, s
                 entry["other_skips"] = int(entry["other_skips"]) + 1
         elif event_type == "dry_run_alert":
             entry["flags"] = int(entry["flags"]) + 1
-        elif event_type == "slack_alert_sent":
+        elif event_type in {"slack_alert_sent", "flashscore_slack_alert_sent"}:
             entry["flags"] = int(entry["flags"]) + 1
             entry["slack_alerts"] = int(entry["slack_alerts"]) + 1
-        elif event_type in {"api_error", "final_verification_failed"}:
+        elif event_type in {"api_error", "final_verification_failed", "flashscore_suppressed_after_5min_delay_api_error"}:
             entry["api_errors"] = int(entry["api_errors"]) + 1
 
     return [
@@ -343,6 +393,30 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         def state_column(name: str, default: str = "''") -> str:
             return name if name in state_columns else f"{default} AS {name}"
 
+        visible_filter = """
+            (
+                COALESCE({visible_column}, 0) = 1
+                OR COALESCE(final_verification_result, '') IN ('pending_verification', 'confirmed_not_inplay', 'failed', 'suppressed_unknown', 'suppressed_ambiguous')
+                OR alert_sent_at IS NOT NULL
+                OR COALESCE(slack_alert_sent, 0) = 1
+                OR COALESCE(slack_error, '') != ''
+                OR COALESCE(final_verification_reason, '') LIKE '%ambiguous%'
+            )
+            AND NOT (
+                COALESCE(final_verification_result, '') = 'suppressed_inplay'
+                AND COALESCE(slack_alert_sent, 0) = 0
+                AND alert_sent_at IS NULL
+                AND COALESCE(slack_error, '') = ''
+            )
+            AND NOT (
+                trigger_source = 'flashscore_live'
+                AND COALESCE(betfair_last_seen_inplay, last_seen_inplay, 0) = 1
+                AND COALESCE(slack_alert_sent, 0) = 0
+                AND alert_sent_at IS NULL
+                AND COALESCE(slack_error, '') = ''
+            )
+        """.format(visible_column="visible_in_hub" if "visible_in_hub" in state_columns else "0")
+
         active_flags = _rows(
             connection,
             f"""
@@ -358,9 +432,22 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                    {state_column("flashscore_participant_2")}, {state_column("betfair_participant_1")},
                    {state_column("betfair_participant_2")}, {state_column("flashscore_surname_1")},
                    {state_column("flashscore_surname_2")}, {state_column("betfair_surname_1")},
-                   {state_column("betfair_surname_2")}, {state_column("match_score", "NULL")}
+                   {state_column("betfair_surname_2")}, {state_column("match_score", "NULL")},
+                   {state_column("match_format")}, {state_column("side_1_player_1")},
+                   {state_column("side_1_player_2")}, {state_column("side_2_player_1")},
+                   {state_column("side_2_player_2")}, {state_column("side_1_surnames")},
+                   {state_column("side_2_surnames")}, {state_column("betfair_side_1_players")},
+                   {state_column("betfair_side_2_players")}, {state_column("betfair_side_1_surnames")},
+                   {state_column("betfair_side_2_surnames")}, {state_column("pending_verification_at")},
+                   {state_column("verify_after")}, {state_column("alert_delay_seconds", "NULL")},
+                   {state_column("candidate_first_seen_at")}, {state_column("final_marketbook_status_raw")},
+                   {state_column("final_marketbook_inplay_raw")},
+                   {state_column("final_marketbook_inplay_parsed", "NULL")},
+                   {state_column("final_marketbook_status_parsed")},
+                   {state_column("visible_in_hub", "1")}
             FROM inplay_alert_state
-            ORDER BY COALESCE(betfair_last_checked_at, last_checked_at, first_flagged_at) DESC
+            WHERE {visible_filter}
+            ORDER BY COALESCE(flashscore_detected_live_at, scheduled_start_utc, betfair_last_checked_at, last_checked_at, first_flagged_at) ASC
             LIMIT 50
             """,
         )
@@ -383,7 +470,12 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
                    trigger_source, flashscore_match_name, flashscore_competition, flashscore_status,
                    flashscore_score, match_confidence, match_reason, betfair_last_checked_at,
                    betfair_last_seen_inplay, betfair_last_seen_status, slack_alert_sent, slack_error,
-                   {state_column("match_score", "NULL")}
+                   {state_column("match_score", "NULL")}, {state_column("match_format")},
+                   {state_column("verify_after")}, {state_column("pending_verification_at")},
+                   {state_column("final_marketbook_status_raw")},
+                   {state_column("final_marketbook_inplay_raw")},
+                   {state_column("final_marketbook_inplay_parsed", "NULL")},
+                   {state_column("final_marketbook_status_parsed")}
             FROM inplay_alert_state
             WHERE alert_sent_at IS NOT NULL
             ORDER BY alert_sent_at DESC
@@ -395,6 +487,28 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
             """
             SELECT timestamp, level, event_type, message, sport_name, event_id, market_id, details_json
             FROM inplay_scan_logs
+            WHERE level = 'ERROR'
+               OR event_type IN (
+                    'slack_alert_sent',
+                    'slack_alert_failed',
+                    'flashscore_slack_alert_sent',
+                    'flashscore_slack_alert_failed',
+                    'flashscore_candidate_created_pending_5min',
+                    'flashscore_candidate_pending_5min_verification',
+                    'flashscore_delayed_verification_due',
+                    'flashscore_delayed_verification_confirmed_not_inplay',
+                    'flashscore_final_decision_send_slack',
+                    'flashscore_final_inplay_unknown_no_alert',
+                    'flashscore_same_event_other_market_inplay_no_alert',
+                    'api_error',
+                    'final_verification_failed',
+                    'flashscore_suppressed_after_5min_delay_api_error',
+                    'name_match_ambiguous_no_alert',
+                    'doubles_name_match_ambiguous_no_alert',
+                    'flashscore_live_no_betfair_match',
+                    'flashscore_tennis_doubles_parse_failed',
+                    'run_skipped_existing_run_active'
+               )
             ORDER BY id DESC
             LIMIT 80
             """,
@@ -424,6 +538,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
 
         _decorate_state_rows(active_flags)
         _decorate_state_rows(recent_alerts)
+        active_flags = _sort_rows_by_sport_time(active_flags)
         active_groups = _group_active_rows(active_flags)
         for rows in (recovered_events,):
             for row in rows:
@@ -433,7 +548,7 @@ def parse_inplay_checker_state(db_path: Path = INPLAY_DB_PATH) -> InPlayCheckerR
         _decorate_log_rows(recent_logs)
         _decorate_log_rows(recent_skipped_events)
 
-        ambiguous_matches = sum(1 for row in latest_scan_logs if row.get("event_type") == "name_match_ambiguous_no_alert")
+        ambiguous_matches = sum(1 for row in latest_scan_logs if row.get("event_type") in {"name_match_ambiguous_no_alert", "doubles_name_match_ambiguous_no_alert"})
         active_not_inplay_flags = sum(1 for row in active_flags if row.get("inplay_label") == "No")
         last_error_row = next((row for row in recent_logs if row.get("level") == "ERROR"), None)
 
