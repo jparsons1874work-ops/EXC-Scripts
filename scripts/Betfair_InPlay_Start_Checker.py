@@ -112,6 +112,7 @@ FLASHSCORE_ACTIVE_STATUS_MARKERS = (
     "leg",
     "break",
 )
+ACTIONABLE_FINAL_RESULTS = ("failed", "suppressed_unknown", "suppressed_ambiguous")
 
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -3614,9 +3615,123 @@ def process_due_flashscore_pending_alerts(
     )
 
 
+def latest_recorded_scan_run_id(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        """
+        SELECT run_id
+        FROM inplay_scan_runs
+        WHERE COALESCE(run_id, '') != ''
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return str(row["run_id"] or "") if row else ""
+
+
+def cleanup_stale_visible_rows(
+    connection: sqlite3.Connection,
+    current_run_id: str,
+    now: datetime,
+    *,
+    clear_visible_table: bool = False,
+    manual: bool = False,
+) -> int:
+    now_iso = iso_utc(now)
+    mode = "clear_visible_table" if clear_visible_table else "clear_stale_visible_rows"
+    db_log(
+        connection,
+        "INFO",
+        "stale_visible_rows_cleanup_started",
+        "Stale visible rows cleanup started",
+        details={"current_run_id": current_run_id, "mode": mode, "manual": manual},
+    )
+    stale_clause = "1 = 1" if clear_visible_table else "(COALESCE(last_seen_run_id, '') != ? OR COALESCE(last_seen_in_scan_at, '') = '')"
+    params: list[Any] = []
+    if not clear_visible_table:
+        params.append(current_run_id)
+    rows_to_hide = connection.execute(
+        f"""
+        SELECT event_id, market_id, sport_name, event_name, flashscore_match_name,
+               last_seen_run_id, last_seen_in_scan_at
+        FROM inplay_alert_state
+        WHERE COALESCE(visible_in_hub, 1) = 1
+          AND {stale_clause}
+          AND COALESCE(final_verification_result, '') != 'pending_verification'
+          AND (verify_after IS NULL OR verify_after <= ?)
+          AND COALESCE(slack_alert_sent, 0) = 0
+          AND alert_sent_at IS NULL
+          AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
+          AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
+          AND COALESCE(slack_error, '') = ''
+        """,
+        (*params, now_iso, *ACTIONABLE_FINAL_RESULTS),
+    ).fetchall()
+    if not rows_to_hide:
+        db_log(
+            connection,
+            "INFO",
+            "stale_visible_rows_hidden",
+            "Stale visible rows cleanup completed: 0 hidden",
+            details={"hidden_count": 0, "mode": mode, "manual": manual},
+        )
+        if manual:
+            db_log(
+                connection,
+                "INFO",
+                "manual_clear_stale_visible_rows_completed",
+                "Manual stale visible rows cleanup completed",
+                details={"hidden_count": 0, "mode": mode},
+            )
+        return 0
+
+    connection.executemany(
+        """
+        UPDATE inplay_alert_state
+        SET visible_in_hub = 0,
+            hidden_reason = 'stale_visible_row_not_seen_latest_live_scan',
+            hidden_at = ?
+        WHERE event_id = ?
+        """,
+        [(now_iso, str(row["event_id"] or "")) for row in rows_to_hide],
+    )
+    connection.commit()
+    legacy_count = 0
+    for row in rows_to_hide:
+        is_legacy = not str(row["last_seen_run_id"] or "").strip() or not str(row["last_seen_in_scan_at"] or "").strip()
+        if is_legacy:
+            legacy_count += 1
+            db_log(
+                connection,
+                "INFO",
+                "legacy_visible_row_hidden",
+                "Legacy visible row hidden because it has no latest-run scan marker",
+                sport_name=str(row["sport_name"] or ""),
+                event_id=str(row["event_id"] or ""),
+                market_id=str(row["market_id"] or ""),
+                event_name=str(row["event_name"] or row["flashscore_match_name"] or ""),
+                details={"hidden_reason": "stale_visible_row_not_seen_latest_live_scan", "mode": mode},
+            )
+    hidden_count = len(rows_to_hide)
+    db_log(
+        connection,
+        "INFO",
+        "stale_visible_rows_hidden",
+        f"Stale visible rows cleanup completed: {hidden_count} hidden",
+        details={"hidden_count": hidden_count, "legacy_count": legacy_count, "mode": mode, "manual": manual},
+    )
+    if manual:
+        db_log(
+            connection,
+            "INFO",
+            "manual_clear_stale_visible_rows_completed",
+            "Manual stale visible rows cleanup completed",
+            details={"hidden_count": hidden_count, "legacy_count": legacy_count, "mode": mode},
+        )
+    return hidden_count
+
+
 def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_id: str, now: datetime) -> None:
     now_iso = iso_utc(now)
-    actionable_results = ("failed", "suppressed_unknown", "suppressed_ambiguous")
     connection.execute(
         """
         UPDATE inplay_alert_state
@@ -3643,7 +3758,7 @@ def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_i
             )
         )
         """,
-        (current_run_id, now_iso, *actionable_results),
+        (current_run_id, now_iso, *ACTIONABLE_FINAL_RESULTS),
     )
     connection.execute(
         """
@@ -3661,60 +3776,26 @@ def cleanup_visible_rows_after_run(connection: sqlite3.Connection, current_run_i
         """,
         (now_iso,),
     )
-    flashscore_rows_to_hide = connection.execute(
-        """
-        SELECT event_id, market_id, sport_name, event_name, flashscore_match_name
-        FROM inplay_alert_state
-        WHERE trigger_source = 'flashscore_live'
-          AND COALESCE(last_seen_run_id, '') != ?
-          AND COALESCE(final_verification_result, '') != 'pending_verification'
-          AND (verify_after IS NULL OR verify_after <= ?)
-          AND COALESCE(slack_alert_sent, 0) = 0
-          AND alert_sent_at IS NULL
-          AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
-          AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
-          AND COALESCE(slack_error, '') = ''
-        LIMIT 100
-        """,
-        (current_run_id, now_iso, *actionable_results),
-    ).fetchall()
-    connection.execute(
-        """
-        UPDATE inplay_alert_state
-        SET visible_in_hub = 0,
-            hidden_reason = CASE
-                WHEN trigger_source = 'flashscore_live' THEN 'flashscore_not_live_or_not_seen_latest_live_scan'
-                ELSE 'old_not_seen_in_latest_scan'
-            END,
-            hidden_at = ?
-        WHERE COALESCE(last_seen_run_id, '') != ?
-          AND COALESCE(final_verification_result, '') != 'pending_verification'
-          AND (verify_after IS NULL OR verify_after <= ?)
-          AND COALESCE(slack_alert_sent, 0) = 0
-          AND alert_sent_at IS NULL
-          AND COALESCE(final_verification_result, '') NOT IN (?, ?, ?)
-          AND COALESCE(final_verification_reason, '') NOT LIKE '%ambiguous%'
-          AND COALESCE(slack_error, '') = ''
-        """,
-        (now_iso, current_run_id, now_iso, *actionable_results),
-    )
     connection.commit()
-    for row in flashscore_rows_to_hide:
-        db_log(
-            connection,
-            "INFO",
-            "flashscore_visible_row_hidden_not_live",
-            "Flashscore row hidden because it was not seen in latest live-only scan",
-            sport_name=str(row["sport_name"] or ""),
-            event_id=str(row["event_id"] or ""),
-            market_id=str(row["market_id"] or ""),
-            event_name=str(row["event_name"] or row["flashscore_match_name"] or ""),
-            details={"reason": "flashscore_not_live_or_not_seen_latest_live_scan"},
-        )
+    cleanup_stale_visible_rows(connection, current_run_id, now)
 
 
 def cleanup_hub_visibility(connection: sqlite3.Connection) -> None:
     cleanup_visible_rows_after_run(connection, CURRENT_SCAN_RUN_ID, utc_now())
+
+
+def run_manual_visible_rows_cleanup(connection: sqlite3.Connection, *, clear_visible_table: bool = False) -> int:
+    latest_run_id = latest_recorded_scan_run_id(connection)
+    hidden_count = cleanup_stale_visible_rows(
+        connection,
+        latest_run_id,
+        utc_now(),
+        clear_visible_table=clear_visible_table,
+        manual=True,
+    )
+    mode = "visible table" if clear_visible_table else "stale visible rows"
+    print(f"Hidden {hidden_count} {mode}.", flush=True)
+    return hidden_count
 
 
 def startup_message(repeat_minutes: float, dry_run: bool) -> str:
@@ -4825,6 +4906,118 @@ def run_self_test() -> int:
     real_send_slack_message = globals()["send_slack_message"]
     globals()["send_slack_message"] = fake_send_slack_message
     try:
+        def insert_visible_test_row(
+            connection: sqlite3.Connection,
+            event_id: str,
+            *,
+            last_seen_run_id: str | None,
+            last_seen_in_scan_at: str | None,
+            final_verification_result: str = "",
+            verify_after: str | None = None,
+            slack_alert_sent: int = 0,
+            alert_sent_at: str | None = None,
+            slack_error: str = "",
+        ) -> None:
+            connection.execute(
+                """
+                INSERT INTO inplay_alert_state (
+                    event_id, market_id, sport_name, event_name, visible_in_hub,
+                    last_seen_run_id, last_seen_in_scan_at, final_verification_result,
+                    verify_after, slack_alert_sent, alert_sent_at, slack_error
+                )
+                VALUES (?, ?, 'Tennis', ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    f"1.{event_id}",
+                    event_id.replace("-", " ").title(),
+                    last_seen_run_id,
+                    last_seen_in_scan_at,
+                    final_verification_result,
+                    verify_after,
+                    slack_alert_sent,
+                    alert_sent_at,
+                    slack_error,
+                ),
+            )
+
+        cleanup_db = sqlite3.connect(":memory:")
+        cleanup_db.row_factory = sqlite3.Row
+        init_db(cleanup_db)
+        cleanup_now = utc_now()
+        cleanup_now_iso = iso_utc(cleanup_now)
+        current_cleanup_run_id = "current-cleanup-run"
+        insert_visible_test_row(cleanup_db, "legacy-row", last_seen_run_id=None, last_seen_in_scan_at=None)
+        insert_visible_test_row(cleanup_db, "old-row", last_seen_run_id="old-run", last_seen_in_scan_at=cleanup_now_iso)
+        insert_visible_test_row(
+            cleanup_db,
+            "pending-row",
+            last_seen_run_id="old-run",
+            last_seen_in_scan_at=cleanup_now_iso,
+            final_verification_result="pending_verification",
+            verify_after=iso_utc(cleanup_now + timedelta(minutes=5)),
+        )
+        insert_visible_test_row(
+            cleanup_db,
+            "slack-row",
+            last_seen_run_id="old-run",
+            last_seen_in_scan_at=cleanup_now_iso,
+            slack_alert_sent=1,
+            alert_sent_at=cleanup_now_iso,
+        )
+        insert_visible_test_row(
+            cleanup_db,
+            "actionable-row",
+            last_seen_run_id="old-run",
+            last_seen_in_scan_at=cleanup_now_iso,
+            final_verification_result="failed",
+        )
+        insert_visible_test_row(cleanup_db, "current-row", last_seen_run_id=current_cleanup_run_id, last_seen_in_scan_at=cleanup_now_iso)
+        cleanup_db.commit()
+        hidden_count = cleanup_stale_visible_rows(cleanup_db, current_cleanup_run_id, cleanup_now)
+        assert hidden_count == 2
+        cleanup_rows = {
+            str(row["event_id"]): row
+            for row in cleanup_db.execute("SELECT event_id, visible_in_hub, hidden_reason FROM inplay_alert_state").fetchall()
+        }
+        assert cleanup_rows["legacy-row"]["visible_in_hub"] == 0
+        assert cleanup_rows["legacy-row"]["hidden_reason"] == "stale_visible_row_not_seen_latest_live_scan"
+        assert cleanup_rows["old-row"]["visible_in_hub"] == 0
+        assert cleanup_rows["pending-row"]["visible_in_hub"] == 1
+        assert cleanup_rows["slack-row"]["visible_in_hub"] == 1
+        assert cleanup_rows["actionable-row"]["visible_in_hub"] == 1
+        assert cleanup_rows["current-row"]["visible_in_hub"] == 1
+        assert cleanup_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'legacy_visible_row_hidden'").fetchone()[0] == 1
+        cleanup_db.close()
+
+        manual_cleanup_db = sqlite3.connect(":memory:")
+        manual_cleanup_db.row_factory = sqlite3.Row
+        init_db(manual_cleanup_db)
+        manual_cleanup_db.execute(
+            """
+            INSERT INTO inplay_scan_runs (scan_started_at, status, dry_run, run_id, current_run_started_at)
+            VALUES (?, 'complete', 1, 'manual-current-run', ?)
+            """,
+            (cleanup_now_iso, cleanup_now_iso),
+        )
+        insert_visible_test_row(manual_cleanup_db, "manual-old-row", last_seen_run_id="manual-old-run", last_seen_in_scan_at=cleanup_now_iso)
+        insert_visible_test_row(manual_cleanup_db, "manual-current-row", last_seen_run_id="manual-current-run", last_seen_in_scan_at=cleanup_now_iso)
+        manual_cleanup_db.commit()
+        before_manual_clear_messages = len(sent_messages)
+        manual_hidden_count = run_manual_visible_rows_cleanup(manual_cleanup_db)
+        assert manual_hidden_count == 1
+        assert len(sent_messages) == before_manual_clear_messages
+        assert manual_cleanup_db.execute(
+            "SELECT visible_in_hub FROM inplay_alert_state WHERE event_id = 'manual-old-row'"
+        ).fetchone()[0] == 0
+        assert manual_cleanup_db.execute(
+            "SELECT visible_in_hub FROM inplay_alert_state WHERE event_id = 'manual-current-row'"
+        ).fetchone()[0] == 1
+        assert manual_cleanup_db.execute(
+            "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'manual_clear_stale_visible_rows_completed'"
+        ).fetchone()[0] == 1
+        manual_cleanup_db.close()
+
         duplicate_db = sqlite3.connect(":memory:")
         duplicate_db.row_factory = sqlite3.Row
         init_db(duplicate_db)
@@ -5633,6 +5826,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flashscore-lookahead-hours", type=float, default=24.0)
     parser.add_argument("--send-startup-message", action="store_true", help="Send a Slack message when the scanner starts.")
     parser.add_argument("--send-shutdown-message", action="store_true", help="Send a Slack message when the scanner stops.")
+    parser.add_argument("--clear-stale-visible-rows", action="store_true", help="Hide stale non-pending rows from the hub table and exit.")
+    parser.add_argument("--clear-visible-table", action="store_true", help="Hide all non-pending, non-Slack, non-actionable hub rows and exit.")
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     return parser.parse_args()
 
@@ -5642,8 +5837,15 @@ def main() -> int:
     if args.self_test:
         return run_self_test()
 
-    config = load_config()
     connection = open_db()
+    if args.clear_stale_visible_rows or args.clear_visible_table:
+        try:
+            run_manual_visible_rows_cleanup(connection, clear_visible_table=bool(args.clear_visible_table))
+            return 0
+        finally:
+            connection.close()
+
+    config = load_config()
     repeat_minutes = max(args.repeat_minutes, 0)
     cycle = 1
     if args.send_startup_message:
