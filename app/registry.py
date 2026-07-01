@@ -23,6 +23,8 @@ class ScriptSpec:
     needs_parameters: bool = False
     parsed_output: bool = False
     allowed_window: RunWindow | None = None
+    timeout_seconds: int = 600
+    allow_concurrent: bool = False
 
 
 def slugify(value: str) -> str:
@@ -39,6 +41,8 @@ def script(
     needs_parameters: bool = False,
     parsed_output: bool = False,
     allowed_window: RunWindow | None = None,
+    timeout_seconds: int = 600,
+    allow_concurrent: bool = False,
 ) -> ScriptSpec:
     return ScriptSpec(
         id=slugify(name),
@@ -51,6 +55,8 @@ def script(
         needs_parameters=needs_parameters,
         parsed_output=parsed_output,
         allowed_window=allowed_window,
+        timeout_seconds=timeout_seconds,
+        allow_concurrent=allow_concurrent,
     )
 
 
@@ -62,12 +68,14 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Golf_Exchange_NR_Checks.py",
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
+        timeout_seconds=16 * 60 * 60,
     ),
     script(
         "Cricket - Decimal Fixture Scrape",
         "Cricket",
         "Scrapes Decimal cricket fixtures and writes the latest output workbook.",
         "scripts/Decimal_Cricket_Scrape_Auto.py",
+        timeout_seconds=20 * 60,
     ),
     script(
         "SAMM - Selection Name Check",
@@ -84,6 +92,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         ("--repeat-minutes", "30", "--send-startup-message", "--send-shutdown-message"),
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
+        timeout_seconds=16 * 60 * 60,
     ),
     script(
         "Betfair - Duplicate Market Check",
@@ -92,6 +101,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Betfair_Duplicate_Market_Check.py",
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
+        timeout_seconds=16 * 60 * 60,
     ),
     script(
         "Betfair In-Play Start Checker",
@@ -101,6 +111,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         ("--repeat-minutes", "2", "--send-startup-message", "--send-shutdown-message"),
         long_running=True,
         parsed_output=True,
+        timeout_seconds=16 * 60 * 60,
     ),
     script(
         "Tennis - Integrity Check",
@@ -109,6 +120,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Integrity-Scanner/start_scanner.py",
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
+        timeout_seconds=16 * 60 * 60,
     ),
     script(
         "Cricket - Time Check Today",

@@ -34,10 +34,10 @@
       <label for="identifier">Identifier / URL / ticker</label>
       <input id="identifier" name="identifier" type="text" placeholder="Event slug, Kalshi URL, or ticker">
       {% endif %}
-      <button class="button button-primary" type="submit" {% if state.status == "Running" or state.status == "Stopping" %}disabled{% endif %}>Start</button>
+      <button class="button button-primary" type="submit" {% if state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
     </form>
     <form method="post" action="/scripts/{{ spec.id }}/stop" class="controls">
-      <button class="button button-danger" type="submit" {% if state.status != "Running" and state.status != "Stopping" %}disabled{% endif %}>Stop</button>
+      <button class="button button-danger" type="submit" {% if state.status != "running" and state.status != "stopping" %}disabled{% endif %}>Stop</button>
     </form>
     <div class="script-path">{{ spec.relative_path }}</div>
   </div>

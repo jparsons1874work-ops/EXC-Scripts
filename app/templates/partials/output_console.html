@@ -4,6 +4,15 @@
 {% if inplay %}
   {% include "partials/inplay_checker_panel.html" %}
 {% endif %}
+{% if state.job_id %}
+<div class="meta">
+  Job {{ state.job_id }}
+  {% if state.pid %} | pid {{ state.pid }}{% endif %}
+  {% if state.process_group_id %} | pgid {{ state.process_group_id }}{% endif %}
+  | timeout {{ state.timeout_seconds }}s
+  {% if state.exit_code is not none %} | exit {{ state.exit_code }}{% endif %}
+</div>
+{% endif %}
 <div class="console">{{ state.output_lines[-500:]|join('\n') if state.output_lines else 'No output yet.' }}</div>
 {% if state.message %}
 <div class="message">{{ state.message }}</div>

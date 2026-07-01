@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -24,6 +24,7 @@ templates.env.cache = None
 @app.on_event("startup")
 async def startup() -> None:
     ensure_runtime_dirs()
+    runner.startup_cleanup()
 
 
 @app.middleware("http")
@@ -80,6 +81,14 @@ async def dashboard(request: Request):
         return auth_redirect
     states = {spec.id: runner.get_state(spec.id) for spec in SCRIPT_REGISTRY}
     return templates.TemplateResponse(request, "dashboard.html", template_context(request, states=states))
+
+
+@app.head("/")
+async def dashboard_head(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    return Response(status_code=200)
 
 
 @app.get("/scripts/{script_id}", response_class=HTMLResponse)
@@ -180,4 +189,7 @@ async def script_output(request: Request, script_id: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "project_root": str(PROJECT_ROOT)}
+    snapshot = runner.health_snapshot()
+    snapshot["status"] = "ok"
+    snapshot["project_root"] = str(PROJECT_ROOT)
+    return snapshot

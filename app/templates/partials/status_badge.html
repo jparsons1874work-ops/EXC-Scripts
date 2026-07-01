@@ -1,1 +1,2 @@
-<span class="status status-{{ state.status|lower|replace(' ', '-') }}">{{ state.status }}</span>
+{% set danger_statuses = ["failed", "timeout", "killed", "blocked"] %}
+<span class="status status-{{ state.status|lower|replace('_', '-') }}{% if state.status in danger_statuses %} status-failed{% endif %}">{{ state.status|replace('_', ' ')|title }}</span>
