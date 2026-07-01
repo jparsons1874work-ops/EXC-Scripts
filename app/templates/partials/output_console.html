@@ -4,6 +4,12 @@
 {% if inplay %}
   {% include "partials/inplay_checker_panel.html" %}
 {% endif %}
+{% if parsed_output_message %}
+<div class="message">{{ parsed_output_message }}</div>
+{% endif %}
+{% if state.duplicate_attempts %}
+<div class="message">Script is already running; {{ state.duplicate_attempts }} duplicate start ignored.</div>
+{% endif %}
 {% if state.job_id %}
 <div class="meta">
   Job {{ state.job_id }}
@@ -11,6 +17,7 @@
   {% if state.process_group_id %} | pgid {{ state.process_group_id }}{% endif %}
   | timeout {{ state.timeout_seconds }}s
   {% if state.exit_code is not none %} | exit {{ state.exit_code }}{% endif %}
+  {% if state.dropped_log_lines %} | {{ state.dropped_log_lines }} file-log lines dropped{% endif %}
 </div>
 {% endif %}
 <div class="console">{{ state.output_lines[-500:]|join('\n') if state.output_lines else 'No output yet.' }}</div>
