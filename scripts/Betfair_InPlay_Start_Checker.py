@@ -44,6 +44,9 @@ DEFAULT_MARKET_BOOK_BATCH_SIZE = 40
 BETFAIR_TIME_OVERDUE_THRESHOLD_SECONDS = 60
 BETFAIR_TIME_ALERT_DELAY_SECONDS = 300
 FLASHSCORE_ALERT_DELAY_SECONDS = 300
+GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS = 120
+GOLF_CYCLING_SPORT_NAMES = {"Golf", "Cycling"}
+GOLF_CYCLING_ALLOWED_MARKET_TYPE_CODES = {"WINNER"}
 DEFAULT_RUN_LOCK_STALE_SECONDS = 300
 SLACK_WEBHOOK_ENV_NAME = "Slack_Webhook_TIP"
 FLASHSCORE_SPORTS = ("Tennis", "Darts")
@@ -149,6 +152,8 @@ class MarketCandidate:
     competition_name: str
     market_id: str
     scheduled_start_utc: datetime | None
+    market_type_code: str = ""
+    market_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -965,6 +970,8 @@ def init_db(connection: sqlite3.Connection) -> None:
             sport_name TEXT,
             competition_name TEXT,
             event_name TEXT,
+            market_type_code TEXT,
+            market_name TEXT,
             scheduled_start_utc TEXT,
             scheduled_start_uk TEXT,
             first_flagged_at TEXT,
@@ -1036,6 +1043,8 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_alert_state", "final_verification_result", "TEXT")
     ensure_column(connection, "inplay_alert_state", "final_verification_reason", "TEXT")
     ensure_column(connection, "inplay_alert_state", "trigger_source", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "market_type_code", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "market_name", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_match_id", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_url", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_match_name", "TEXT")
@@ -1488,6 +1497,29 @@ def list_market_catalogues(
     )
 
 
+def list_golf_cycling_winner_catalogues(
+    client: APIClient,
+    event_type: EventType,
+    start_from: datetime,
+    start_to: datetime,
+    max_results: int,
+) -> list[Any]:
+    event_filter = market_filter(
+        event_type_ids=[event_type.event_type_id],
+        market_type_codes=sorted(GOLF_CYCLING_ALLOWED_MARKET_TYPE_CODES),
+        market_start_time={
+            "from": format_betfair_time(start_from),
+            "to": format_betfair_time(start_to),
+        },
+    )
+    return client.betting.list_market_catalogue(
+        filter=event_filter,
+        market_projection=["EVENT", "EVENT_TYPE", "COMPETITION", "MARKET_START_TIME", "MARKET_DESCRIPTION"],
+        sort="FIRST_TO_START",
+        max_results=max_results,
+    )
+
+
 def list_match_odds_catalogues_for_event(client: APIClient, event_id: str, max_results: int = 100) -> list[Any]:
     event_filter = market_filter(
         event_ids=[event_id],
@@ -1798,18 +1830,47 @@ def flashscore_row_is_live(status: str, score: str, class_name: str) -> bool:
     return flashscore_row_live_decision(status, score, class_name).is_live
 
 
-def catalogue_to_candidate(catalogue: Any, fallback: EventType) -> MarketCandidate:
+def catalogue_market_description(catalogue: Any) -> Any:
+    return object_get_any(catalogue, ("market_description", "marketDescription", "description"), {})
+
+
+def catalogue_market_type_code(catalogue: Any, fallback: str = "") -> str:
+    description = catalogue_market_description(catalogue)
+    value = object_get_any(
+        catalogue,
+        ("market_type_code", "marketTypeCode", "market_type", "marketType"),
+        _MISSING,
+    )
+    if value is _MISSING or value is None or str(value).strip() == "":
+        value = object_get_any(
+            description,
+            ("market_type_code", "marketTypeCode", "market_type", "marketType"),
+            _MISSING,
+        )
+    if value is _MISSING or value is None or str(value).strip() == "":
+        value = fallback
+    return str(value or "").strip().upper()
+
+
+def catalogue_market_name(catalogue: Any) -> str:
+    return str(object_get(catalogue, "market_name", "") or object_get(catalogue, "marketName", "")).strip()
+
+
+def catalogue_to_candidate(catalogue: Any, fallback: EventType, fallback_market_type_code: str = "") -> MarketCandidate:
     event = object_get(catalogue, "event", {})
     event_type = object_get(catalogue, "event_type", {})
     competition = object_get(catalogue, "competition", {})
+    market_name = catalogue_market_name(catalogue)
     return MarketCandidate(
         sport_name=str(object_get(event_type, "name", fallback.sport_name) or fallback.sport_name).strip(),
         event_type_id=str(object_get(event_type, "id", fallback.event_type_id) or fallback.event_type_id).strip(),
         event_id=str(object_get(event, "id", "")).strip(),
-        event_name=str(object_get(event, "name", "") or object_get(catalogue, "market_name", "")).strip(),
+        event_name=str(object_get(event, "name", "") or market_name).strip(),
         competition_name=str(object_get(competition, "name", "")).strip(),
         market_id=str(object_get(catalogue, "market_id", "")).strip(),
         scheduled_start_utc=parse_datetime(object_get(catalogue, "market_start_time", None)),
+        market_type_code=catalogue_market_type_code(catalogue, fallback_market_type_code),
+        market_name=market_name,
     )
 
 
@@ -1976,6 +2037,8 @@ def upsert_alert_state(
         """
         UPDATE inplay_alert_state
         SET trigger_source = COALESCE(trigger_source, ?),
+            market_type_code = ?,
+            market_name = ?,
             betfair_last_checked_at = ?,
             betfair_last_seen_inplay = ?,
             betfair_last_seen_status = ?
@@ -1983,6 +2046,8 @@ def upsert_alert_state(
         """,
         (
             trigger_source,
+            candidate.market_type_code,
+            candidate.market_name,
             iso_utc(now),
             int(book.inplay),
             book.status,
@@ -2526,6 +2591,117 @@ def build_slack_message(candidate: MarketCandidate, book: MarketBookSnapshot, no
             "Please check whether this event should now be live/in-play. React with a tick once handled.",
         ]
     )
+
+
+def is_golf_cycling_sport(sport_name: str) -> bool:
+    normalized = normalize_sport_name(sport_name)
+    return normalized in {normalize_sport_name(name) for name in GOLF_CYCLING_SPORT_NAMES}
+
+
+def is_golf_cycling_winner_market(candidate: MarketCandidate) -> bool:
+    return candidate.market_type_code.upper() in GOLF_CYCLING_ALLOWED_MARKET_TYPE_CODES
+
+
+def build_golf_cycling_slack_message(candidate: MarketCandidate, book: MarketBookSnapshot, now: datetime) -> str:
+    overdue_by = format_duration(now - (candidate.scheduled_start_utc or now))
+    sport_name = candidate.sport_name or "Golf/Cycling"
+    return "\n".join(
+        [
+            f"{sport_name} - {candidate.event_name or 'Unknown event'} winner market is not in-play",
+            f"Betfair Event ID: {candidate.event_id}",
+            f"Betfair Market ID: {candidate.market_id}",
+            f"Scheduled start: {format_slack_uk_time(candidate.scheduled_start_utc)}",
+            f"Overdue by: {overdue_by}",
+            "Please ensure it is in play",
+        ]
+    )
+
+
+def golf_cycling_dedupe_hit(connection: sqlite3.Connection, candidate: MarketCandidate) -> bool:
+    if candidate.market_id:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM inplay_alert_state
+            WHERE trigger_source = 'betfair_winner_time'
+              AND COALESCE(slack_alert_sent, 0) = 1
+              AND lower(COALESCE(sport_name, '')) = lower(?)
+              AND market_id = ?
+            LIMIT 1
+            """,
+            (candidate.sport_name, candidate.market_id),
+        ).fetchone()
+        return row is not None
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM inplay_alert_state
+        WHERE trigger_source = 'betfair_winner_time'
+          AND COALESCE(slack_alert_sent, 0) = 1
+          AND lower(COALESCE(sport_name, '')) = lower(?)
+          AND event_id = ?
+          AND COALESCE(market_name, '') = ?
+        LIMIT 1
+        """,
+        (candidate.sport_name, candidate.event_id, candidate.market_name),
+    ).fetchone()
+    return row is not None
+
+
+def record_golf_cycling_result(
+    connection: sqlite3.Connection,
+    candidate: MarketCandidate,
+    snapshot: FinalMarketBookSnapshot | None,
+    *,
+    now: datetime,
+    result: str,
+    reason: str,
+    alert_sent_at: datetime | None = None,
+    visible_in_hub: bool = False,
+) -> None:
+    book = final_snapshot_to_market_book(snapshot, candidate.market_id) if snapshot else MarketBookSnapshot(candidate.market_id, "", False)
+    overdue_seconds = max(0, int((now - candidate.scheduled_start_utc).total_seconds())) if candidate.scheduled_start_utc else None
+    overdue_display = format_duration(timedelta(seconds=overdue_seconds or 0)) if overdue_seconds is not None else ""
+    upsert_alert_state(
+        connection,
+        candidate,
+        book,
+        now=now,
+        alert_sent_at=alert_sent_at,
+        final_verification_at=now,
+        final_verification_result=result,
+        final_verification_reason=reason,
+        trigger_source="betfair_winner_time",
+    )
+    update_final_marketbook_audit(connection, candidate.event_id, snapshot, visible_in_hub=visible_in_hub)
+    connection.execute(
+        """
+        UPDATE inplay_alert_state
+        SET trigger_source = 'betfair_winner_time',
+            market_type_code = ?,
+            market_name = ?,
+            pending_verification_at = NULL,
+            verify_after = NULL,
+            alert_delay_seconds = 0,
+            overdue_threshold_seconds = ?,
+            overdue_by_seconds = ?,
+            overdue_by_display = ?,
+            slack_alert_sent = CASE WHEN ? IS NULL THEN COALESCE(slack_alert_sent, 0) ELSE 1 END,
+            visible_in_hub = ?
+        WHERE event_id = ?
+        """,
+        (
+            candidate.market_type_code,
+            candidate.market_name,
+            GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS,
+            overdue_seconds,
+            overdue_display,
+            iso_utc(alert_sent_at) if alert_sent_at else None,
+            1 if visible_in_hub else 0,
+            candidate.event_id,
+        ),
+    )
+    safe_commit(connection)
 
 
 def send_slack_message(
@@ -3089,7 +3265,7 @@ def verify_flashscore_same_event_markets(
     same_event_market_ids: list[str] = []
     exact_market_found = False
     for catalogue in catalogues:
-        candidate = catalogue_to_candidate(catalogue, EventType(pending.candidate.event_type_id, pending.candidate.sport_name))
+        candidate = catalogue_to_candidate(catalogue, EventType(pending.candidate.event_type_id, pending.candidate.sport_name), "MATCH_ODDS")
         if candidate.event_id and candidate.event_id != pending.candidate.event_id:
             continue
         if candidate.market_id:
@@ -4234,7 +4410,7 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
     rows = connection.execute(
         """
         SELECT event_id, market_id, event_name, flashscore_match_name, sport_name, flashscore_status,
-               trigger_source, scheduled_start_utc, alert_delay_seconds, overdue_threshold_seconds,
+               trigger_source, market_type_code, market_name, scheduled_start_utc, alert_delay_seconds, overdue_threshold_seconds,
                visible_in_hub, last_seen_run_id, verify_after, slack_alert_sent, alert_sent_at,
                final_verification_result, final_verification_reason, hidden_reason,
                betfair_last_seen_status, last_seen_status, betfair_last_seen_inplay, last_seen_inplay,
@@ -4256,6 +4432,8 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
             f"event={row['event_name'] or row['flashscore_match_name'] or ''} | "
             f"sport={row['sport_name'] or ''} | "
             f"trigger_source={row['trigger_source'] or ''} | "
+            f"market_type_code={row['market_type_code'] or ''} | "
+            f"market_name={row['market_name'] or ''} | "
             f"scheduled_start_utc={row['scheduled_start_utc'] or ''} | "
             f"visible={row['visible_in_hub']} | "
             f"why_visible={visible_row_reason(row, latest_run_id, now)} | "
@@ -4303,7 +4481,7 @@ def print_event_debug(connection: sqlite3.Connection, event_query: str) -> None:
         print("--- state row ---", flush=True)
         for key in (
             "event_id", "market_id", "sport_name", "event_name", "flashscore_match_name",
-            "trigger_source", "scheduled_start_utc", "flashscore_status", "flashscore_score", "final_verification_result",
+            "trigger_source", "market_type_code", "market_name", "scheduled_start_utc", "flashscore_status", "flashscore_score", "final_verification_result",
             "final_verification_reason", "last_seen_status", "last_seen_inplay",
             "betfair_last_seen_status", "betfair_last_seen_inplay", "match_confidence",
             "match_score", "match_reason", "flashscore_first_seen_live_at",
@@ -4370,6 +4548,17 @@ def fetch_overdue_candidates(
 
     db_log(connection, "INFO", "sports_discovered", f"Sports discovered: {len(event_types)}")
     for event_type in event_types:
+        if is_golf_cycling_sport(event_type.sport_name):
+            db_log(
+                connection,
+                "INFO",
+                "skipped",
+                "Skipped Golf/Cycling in MATCH_ODDS scheduled-time scan; handled by winner-market pipeline",
+                sport_name=event_type.sport_name,
+                details={"reason": "handled by winner-market pipeline", "event_type_id": event_type.event_type_id},
+            )
+            continue
+
         if is_excluded_sport(event_type.sport_name):
             excluded_sports.append(event_type.sport_name)
             stats.excluded_sports_count += 1
@@ -4408,7 +4597,7 @@ def fetch_overdue_candidates(
             details={"markets_scanned": len(catalogues), "event_type_id": event_type.event_type_id},
         )
         for catalogue in catalogues:
-            candidate = catalogue_to_candidate(catalogue, event_type)
+            candidate = catalogue_to_candidate(catalogue, event_type, "MATCH_ODDS")
             if not candidate.event_id:
                 stats.skipped_events += 1
                 db_log(
@@ -4577,6 +4766,412 @@ def process_candidates(
             )
 
 
+def process_golf_cycling_winner_markets(
+    connection: sqlite3.Connection,
+    client: APIClient,
+    config: Config,
+    args: argparse.Namespace,
+    stats: ScanStats,
+) -> None:
+    now = utc_now()
+    start_from = now - timedelta(hours=max(args.lookback_hours, 0))
+    start_to = now + timedelta(hours=max(args.lookahead_hours, 0))
+    db_log(
+        connection,
+        "INFO",
+        "golf_cycling_scan_started",
+        "Golf/Cycling winner-market scan started",
+        details={
+            "sports": sorted(GOLF_CYCLING_SPORT_NAMES),
+            "allowed_market_type_codes": sorted(GOLF_CYCLING_ALLOWED_MARKET_TYPE_CODES),
+            "overdue_threshold_seconds": GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS,
+        },
+    )
+    event_types = event_types_by_name(client, start_from, start_to)
+    eligible_by_market_id: dict[str, MarketCandidate] = {}
+    seen_count = 0
+    skipped_count = 0
+
+    for sport_name in sorted(GOLF_CYCLING_SPORT_NAMES):
+        event_type = event_types.get(normalize_sport_name(sport_name))
+        if event_type is None:
+            db_log(
+                connection,
+                "INFO",
+                "golf_cycling_scan_completed",
+                f"No Betfair event type found for {sport_name}",
+                sport_name=sport_name,
+                details={"sport": sport_name},
+            )
+            continue
+
+        try:
+            catalogues = list_golf_cycling_winner_catalogues(client, event_type, start_from, start_to, args.max_results)
+        except Exception as exc:
+            stats.api_errors += 1
+            db_log(
+                connection,
+                "ERROR",
+                "api_error",
+                f"Golf/Cycling winner catalogue fetch failed for {sport_name}: {exc}",
+                sport_name=sport_name,
+                details={"event_type_id": event_type.event_type_id},
+            )
+            continue
+
+        stats.markets_scanned += len(catalogues)
+        for catalogue in catalogues:
+            candidate = catalogue_to_candidate(catalogue, event_type, "WINNER")
+            seen_count += 1
+            market_details = {
+                "trigger_source": "betfair_winner_time",
+                "market_type_code": candidate.market_type_code,
+                "market_name": candidate.market_name,
+                "scheduled_start_utc": iso_utc(candidate.scheduled_start_utc),
+                "overdue_threshold_seconds": GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS,
+                "betfair_event_id": candidate.event_id,
+                "betfair_market_id": candidate.market_id,
+            }
+            db_log(
+                connection,
+                "INFO",
+                "golf_cycling_market_seen",
+                "Golf/Cycling winner market seen",
+                sport_name=candidate.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details=market_details,
+            )
+
+            if not is_golf_cycling_winner_market(candidate):
+                skipped_count += 1
+                stats.skipped_events += 1
+                db_log(
+                    connection,
+                    "INFO",
+                    "golf_cycling_market_skipped_wrong_type",
+                    "Golf/Cycling market skipped: not the main WINNER market type",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=candidate.market_id,
+                    event_name=candidate.event_name,
+                    details={**market_details, "final_verification_result": "golf_cycling_skipped_wrong_market_type"},
+                )
+                continue
+
+            if not candidate.event_id or not candidate.market_id:
+                skipped_count += 1
+                stats.skipped_events += 1
+                db_log(
+                    connection,
+                    "ERROR",
+                    "golf_cycling_missing_marketbook",
+                    "Golf/Cycling market skipped: missing event or market ID",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=candidate.market_id,
+                    event_name=candidate.event_name,
+                    details={**market_details, "final_verification_result": "golf_cycling_missing_marketbook"},
+                )
+                continue
+
+            if candidate.scheduled_start_utc is None or not is_betfair_time_overdue(candidate, now, GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS):
+                skipped_count += 1
+                stats.skipped_events += 1
+                db_log(
+                    connection,
+                    "DEBUG",
+                    "golf_cycling_market_skipped_not_overdue",
+                    "Golf/Cycling winner market skipped: not over the 2-minute threshold",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=candidate.market_id,
+                    event_name=candidate.event_name,
+                    details={**market_details, "final_verification_result": "golf_cycling_skipped_not_overdue"},
+                )
+                continue
+
+            if golf_cycling_dedupe_hit(connection, candidate):
+                skipped_count += 1
+                stats.skipped_events += 1
+                db_log(
+                    connection,
+                    "INFO",
+                    "golf_cycling_alert_deduped",
+                    "Golf/Cycling alert skipped: already sent for this winner market",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=candidate.market_id,
+                    event_name=candidate.event_name,
+                    details=market_details,
+                )
+                continue
+
+            eligible_by_market_id[candidate.market_id] = candidate
+
+    for batch in chunked(list(eligible_by_market_id), getattr(args, "market_book_batch_size", DEFAULT_MARKET_BOOK_BATCH_SIZE)):
+        api_called_at = utc_now()
+        try:
+            final_books = list_final_market_books(client, batch)
+        except Exception as exc:
+            stats.api_errors += 1
+            for market_id in batch:
+                candidate = eligible_by_market_id[market_id]
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    None,
+                    now=utc_now(),
+                    result="golf_cycling_missing_marketbook",
+                    reason=f"api_error: {exc}",
+                    visible_in_hub=True,
+                )
+                db_log(
+                    connection,
+                    "ERROR",
+                    "golf_cycling_missing_marketbook",
+                    "Golf/Cycling final MarketBook check failed; no Slack",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details={"trigger_source": "betfair_winner_time", "error": str(exc), "final_api_called_at": iso_utc(api_called_at)},
+                )
+            continue
+
+        for market_id in batch:
+            candidate = eligible_by_market_id[market_id]
+            snapshot = final_books.get(market_id)
+            decision_at = utc_now()
+            stats.events_checked += 1
+            details = {
+                "trigger_source": "betfair_winner_time",
+                "market_type_code": candidate.market_type_code,
+                "market_name": candidate.market_name,
+                "scheduled_start_utc": iso_utc(candidate.scheduled_start_utc),
+                "overdue_threshold_seconds": GOLF_CYCLING_OVERDUE_THRESHOLD_SECONDS,
+                "overdue_by_display": format_duration(decision_at - (candidate.scheduled_start_utc or decision_at)),
+                "betfair_event_id": candidate.event_id,
+                "betfair_market_id": candidate.market_id,
+                "final_api_called_at": iso_utc(api_called_at),
+                "final_marketbook_status_raw": raw_value_for_log(snapshot.status_raw) if snapshot else "",
+                "final_marketbook_inplay_raw": raw_value_for_log(snapshot.inplay_raw) if snapshot else "",
+                "final_marketbook_status_parsed": snapshot.status if snapshot else "",
+                "final_marketbook_inplay_parsed": snapshot.inplay if snapshot else None,
+            }
+
+            if snapshot is None:
+                stats.api_errors += 1
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    None,
+                    now=decision_at,
+                    result="golf_cycling_missing_marketbook",
+                    reason="final MarketBook missing",
+                    visible_in_hub=True,
+                )
+                db_log(
+                    connection,
+                    "ERROR",
+                    "golf_cycling_missing_marketbook",
+                    "Golf/Cycling final MarketBook missing; no Slack",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            if snapshot.inplay is True:
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_already_inplay",
+                    reason="Betfair winner market already in-play",
+                    visible_in_hub=False,
+                )
+                db_log(
+                    connection,
+                    "INFO",
+                    "golf_cycling_market_already_inplay",
+                    "Golf/Cycling winner market already in-play; no Slack",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            if snapshot.status == "CLOSED":
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_market_closed",
+                    reason="Betfair winner market closed",
+                    visible_in_hub=False,
+                )
+                db_log(
+                    connection,
+                    "INFO",
+                    "golf_cycling_market_closed",
+                    "Golf/Cycling winner market closed; no Slack",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            if snapshot.inplay is None or snapshot.status is None or snapshot.status not in ALERTABLE_STATUSES:
+                stats.api_errors += 1
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_missing_marketbook",
+                    reason=f"ambiguous MarketBook status={snapshot.status or 'unknown'} inplay={snapshot.inplay}",
+                    visible_in_hub=True,
+                )
+                db_log(
+                    connection,
+                    "ERROR",
+                    "golf_cycling_missing_marketbook",
+                    "Golf/Cycling final MarketBook ambiguous; no Slack",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            message = build_golf_cycling_slack_message(candidate, final_snapshot_to_market_book(snapshot, candidate.market_id), decision_at)
+            print("", flush=True)
+            print(message, flush=True)
+            if args.dry_run:
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_not_inplay_alert_sent",
+                    reason="dry_run_would_send_alert",
+                    visible_in_hub=True,
+                )
+                db_log(
+                    connection,
+                    "INFO",
+                    "dry_run_alert",
+                    "Dry-run: would send Golf/Cycling winner-market Slack alert",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            if is_placeholder(config.slack_webhook_url):
+                stats.slack_alert_failures += 1
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_not_inplay_alert_sent",
+                    reason=f"{SLACK_WEBHOOK_ENV_NAME} missing",
+                    visible_in_hub=True,
+                )
+                record_slack_error(connection, candidate.event_id, f"{SLACK_WEBHOOK_ENV_NAME} missing")
+                db_log(
+                    connection,
+                    "ERROR",
+                    "config_error",
+                    f"{SLACK_WEBHOOK_ENV_NAME} missing",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            try:
+                send_slack_message(config.slack_webhook_url, message)
+            except Exception as exc:
+                stats.slack_alert_failures += 1
+                record_golf_cycling_result(
+                    connection,
+                    candidate,
+                    snapshot,
+                    now=decision_at,
+                    result="golf_cycling_not_inplay_alert_sent",
+                    reason=f"slack_error: {exc}",
+                    visible_in_hub=True,
+                )
+                record_slack_error(connection, candidate.event_id, str(exc))
+                db_log(
+                    connection,
+                    "ERROR",
+                    "slack_alert_failed",
+                    f"Golf/Cycling winner-market Slack alert failed: {exc}",
+                    sport_name=candidate.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=market_id,
+                    event_name=candidate.event_name,
+                    details=details,
+                )
+                continue
+
+            sent_at = utc_now()
+            stats.flags_found += 1
+            stats.slack_alerts_sent += 1
+            record_golf_cycling_result(
+                connection,
+                candidate,
+                snapshot,
+                now=decision_at,
+                result="golf_cycling_not_inplay_alert_sent",
+                reason="alert_sent",
+                alert_sent_at=sent_at,
+                visible_in_hub=True,
+            )
+            db_log(
+                connection,
+                "INFO",
+                "golf_cycling_alert_sent",
+                "Golf/Cycling winner-market Slack alert sent",
+                sport_name=candidate.sport_name,
+                event_id=candidate.event_id,
+                market_id=market_id,
+                event_name=candidate.event_name,
+                details={**details, "alert_sent_at": iso_utc(sent_at)},
+            )
+
+    db_log(
+        connection,
+        "INFO",
+        "golf_cycling_scan_completed",
+        "Golf/Cycling winner-market scan completed",
+        details={
+            "markets_seen": seen_count,
+            "eligible_overdue_markets": len(eligible_by_market_id),
+            "skipped_markets": skipped_count,
+            "slack_alerts_sent": stats.slack_alerts_sent,
+        },
+    )
+
+
 def event_types_by_name(client: APIClient, start_from: datetime, start_to: datetime) -> dict[str, EventType]:
     return {normalize_sport_name(event_type.sport_name): event_type for event_type in list_event_types(client, start_from, start_to)}
 
@@ -4602,7 +5197,7 @@ def betfair_flashscore_candidates(
             db_log(connection, "ERROR", "flashscore_live_no_betfair_match", f"Betfair catalogue fetch failed for {sport}: {exc}", sport_name=sport)
             by_sport[sport] = []
             continue
-        by_sport[sport] = [catalogue_to_candidate(catalogue, event_type) for catalogue in catalogues]
+        by_sport[sport] = [catalogue_to_candidate(catalogue, event_type, "MATCH_ODDS") for catalogue in catalogues]
     return by_sport
 
 
@@ -5267,6 +5862,14 @@ def run_scan(args: argparse.Namespace, config: Config, connection: sqlite3.Conne
             db_log(connection, "ERROR", "api_error", f"Betfair scheduled-time scan failed: {exc}")
             traceback.print_exc(file=sys.stdout)
 
+        try:
+            process_golf_cycling_winner_markets(connection, client, config, args, stats)
+        except Exception as exc:
+            status = "partial_failure"
+            stats.api_errors += 1
+            db_log(connection, "ERROR", "api_error", f"Golf/Cycling winner-market scan failed: {exc}")
+            traceback.print_exc(file=sys.stdout)
+
         if args.disable_flashscore:
             stats.flashscore_scan_status = "disabled"
             db_log(connection, "INFO", "flashscore_scan_completed", "Flashscore live trigger scan disabled")
@@ -5604,6 +6207,100 @@ def run_self_test() -> int:
     assert not_ready_db.execute("SELECT COUNT(*) FROM inplay_alert_state WHERE event_id = ?", (not_ready_candidate.event_id,)).fetchone()[0] == 0
     not_ready_db.close()
 
+    def golf_cycling_catalogue(
+        sport_name: str,
+        event_type_id: str,
+        event_id: str,
+        market_id: str,
+        event_name: str,
+        start_utc: datetime,
+        *,
+        market_type_code: str = "WINNER",
+        market_name: str = "Winner",
+    ) -> dict[str, Any]:
+        return {
+            "market_id": market_id,
+            "market_name": market_name,
+            "market_type_code": market_type_code,
+            "market_description": {"marketType": market_type_code},
+            "event": {"id": event_id, "name": event_name},
+            "event_type": {"id": event_type_id, "name": sport_name},
+            "competition": {"name": "Test Competition"},
+            "market_start_time": start_utc,
+        }
+
+    class GolfCyclingFakeBetting:
+        def __init__(
+            self,
+            catalogues_by_sport: dict[str, list[dict[str, Any]]],
+            books_by_market_id: dict[str, Any],
+        ) -> None:
+            self.catalogues_by_sport = catalogues_by_sport
+            self.books_by_market_id = books_by_market_id
+            self.market_book_calls: list[list[str]] = []
+
+        def list_event_types(self, filter: Any) -> list[dict[str, Any]]:
+            event_types = []
+            if "Golf" in self.catalogues_by_sport:
+                event_types.append({"event_type": {"id": "3", "name": "Golf"}})
+            if "Cycling" in self.catalogues_by_sport:
+                event_types.append({"event_type": {"id": "11", "name": "Cycling"}})
+            return event_types
+
+        def list_market_catalogue(self, filter: Any, market_projection: list[str], sort: str, max_results: int) -> list[dict[str, Any]]:
+            event_type_ids = filter.get("eventTypeIds") or filter.get("event_type_ids") or []
+            event_type_id = str(event_type_ids[0]) if event_type_ids else ""
+            sport_name = "Golf" if event_type_id == "3" else "Cycling" if event_type_id == "11" else ""
+            return self.catalogues_by_sport.get(sport_name, [])[:max_results]
+
+        def list_market_book(self, market_ids: list[str]) -> list[dict[str, Any]]:
+            self.market_book_calls.append(list(market_ids))
+            books = []
+            for market_id in market_ids:
+                value = self.books_by_market_id.get(market_id)
+                if value is None:
+                    continue
+                if callable(value):
+                    value = value(market_id)
+                books.append(value)
+            return books
+
+    class GolfCyclingFakeClient:
+        def __init__(self, betting: GolfCyclingFakeBetting) -> None:
+            self.betting = betting
+
+    golf_cycling_args = argparse.Namespace(
+        dry_run=False,
+        market_book_batch_size=40,
+        lookback_hours=6,
+        lookahead_hours=24,
+        max_results=1000,
+    )
+
+    golf_match_odds_skip_db = sqlite3.connect(":memory:")
+    golf_match_odds_skip_db.row_factory = sqlite3.Row
+    init_db(golf_match_odds_skip_db)
+    golf_match_odds_skip_stats = ScanStats()
+    golf_match_odds_catalogue = golf_cycling_catalogue(
+        "Golf",
+        "3",
+        "golf-match-odds-side",
+        "1.golfmatchodds",
+        "Golf Match Bet",
+        utc_now() - timedelta(minutes=5),
+        market_type_code="MATCH_ODDS",
+        market_name="Match Odds",
+    )
+    golf_match_odds_candidates, _excluded = fetch_overdue_candidates(
+        golf_match_odds_skip_db,
+        GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_match_odds_catalogue]}, {})),  # type: ignore[arg-type]
+        argparse.Namespace(lookback_hours=6, lookahead_hours=24, max_results=1000, betfair_time_overdue_threshold_seconds=BETFAIR_TIME_OVERDUE_THRESHOLD_SECONDS),
+        golf_match_odds_skip_stats,
+    )
+    assert golf_match_odds_candidates == []
+    assert golf_match_odds_skip_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'skipped' AND details_json LIKE '%winner-market pipeline%'").fetchone()[0] == 1
+    golf_match_odds_skip_db.close()
+
     sent_messages: list[str] = []
 
     def fake_send_slack_message(webhook_url: str, text: str) -> None:
@@ -5612,6 +6309,196 @@ def run_self_test() -> int:
     real_send_slack_message = globals()["send_slack_message"]
     globals()["send_slack_message"] = fake_send_slack_message
     try:
+        golf_119_db = sqlite3.connect(":memory:")
+        golf_119_db.row_factory = sqlite3.Row
+        init_db(golf_119_db)
+        golf_119_stats = ScanStats()
+        golf_119_market = golf_cycling_catalogue(
+            "Golf",
+            "3",
+            "golf-119",
+            "1.golf119",
+            "Masters Tournament",
+            utc_now() - timedelta(seconds=119),
+        )
+        before_golf_119_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_119_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_119_market]}, {"1.golf119": {"market_id": "1.golf119", "status": "OPEN", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_119_stats,
+        )
+        assert golf_119_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_golf_119_messages
+        assert golf_119_db.execute("SELECT COUNT(*) FROM inplay_alert_state WHERE event_id = 'golf-119'").fetchone()[0] == 0
+        assert golf_119_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'golf_cycling_market_skipped_not_overdue'").fetchone()[0] == 1
+        golf_119_db.close()
+
+        golf_121_db = sqlite3.connect(":memory:")
+        golf_121_db.row_factory = sqlite3.Row
+        init_db(golf_121_db)
+        golf_121_stats = ScanStats()
+        golf_121_market = golf_cycling_catalogue(
+            "Golf",
+            "3",
+            "golf-121",
+            "1.golf121",
+            "US Open",
+            utc_now() - timedelta(seconds=121),
+        )
+        before_golf_121_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_121_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_121_market]}, {"1.golf121": {"market_id": "1.golf121", "status": "OPEN", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_121_stats,
+        )
+        assert golf_121_stats.slack_alerts_sent == 1
+        assert len(sent_messages) == before_golf_121_messages + 1
+        assert "Golf - US Open winner market is not in-play" in sent_messages[-1]
+        assert "Betfair Event ID: golf-121" in sent_messages[-1]
+        assert "Betfair Market ID: 1.golf121" in sent_messages[-1]
+        golf_121_state = golf_121_db.execute(
+            """
+            SELECT trigger_source, market_type_code, market_name, final_verification_result,
+                   verify_after, pending_verification_at, alert_delay_seconds, slack_alert_sent
+            FROM inplay_alert_state
+            WHERE event_id = 'golf-121'
+            """
+        ).fetchone()
+        assert golf_121_state["trigger_source"] == "betfair_winner_time"
+        assert golf_121_state["market_type_code"] == "WINNER"
+        assert golf_121_state["market_name"] == "Winner"
+        assert golf_121_state["final_verification_result"] == "golf_cycling_not_inplay_alert_sent"
+        assert golf_121_state["verify_after"] is None
+        assert golf_121_state["pending_verification_at"] is None
+        assert golf_121_state["alert_delay_seconds"] == 0
+        assert golf_121_state["slack_alert_sent"] == 1
+        assert golf_121_db.execute("SELECT COUNT(*) FROM inplay_alert_state WHERE final_verification_result = 'pending_verification'").fetchone()[0] == 0
+
+        before_golf_dedupe_messages = len(sent_messages)
+        second_golf_121_stats = ScanStats()
+        process_golf_cycling_winner_markets(
+            golf_121_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_121_market]}, {"1.golf121": {"market_id": "1.golf121", "status": "OPEN", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            second_golf_121_stats,
+        )
+        assert second_golf_121_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_golf_dedupe_messages
+        assert golf_121_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'golf_cycling_alert_deduped'").fetchone()[0] == 1
+        golf_121_db.close()
+
+        cycling_121_db = sqlite3.connect(":memory:")
+        cycling_121_db.row_factory = sqlite3.Row
+        init_db(cycling_121_db)
+        cycling_121_stats = ScanStats()
+        cycling_121_market = golf_cycling_catalogue(
+            "Cycling",
+            "11",
+            "cycling-121",
+            "1.cycling121",
+            "Tour de France",
+            utc_now() - timedelta(seconds=121),
+        )
+        before_cycling_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            cycling_121_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Cycling": [cycling_121_market]}, {"1.cycling121": {"market_id": "1.cycling121", "status": "SUSPENDED", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            cycling_121_stats,
+        )
+        assert cycling_121_stats.slack_alerts_sent == 1
+        assert len(sent_messages) == before_cycling_messages + 1
+        assert "Cycling - Tour de France winner market is not in-play" in sent_messages[-1]
+        cycling_121_db.close()
+
+        golf_inplay_db = sqlite3.connect(":memory:")
+        golf_inplay_db.row_factory = sqlite3.Row
+        init_db(golf_inplay_db)
+        golf_inplay_stats = ScanStats()
+        golf_inplay_market = golf_cycling_catalogue("Golf", "3", "golf-inplay", "1.golfinplay", "PGA Championship", utc_now() - timedelta(seconds=121))
+        before_golf_inplay_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_inplay_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_inplay_market]}, {"1.golfinplay": {"market_id": "1.golfinplay", "status": "OPEN", "inplay": True}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_inplay_stats,
+        )
+        assert golf_inplay_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_golf_inplay_messages
+        assert golf_inplay_db.execute("SELECT final_verification_result FROM inplay_alert_state WHERE event_id = 'golf-inplay'").fetchone()["final_verification_result"] == "golf_cycling_already_inplay"
+        golf_inplay_db.close()
+
+        golf_closed_db = sqlite3.connect(":memory:")
+        golf_closed_db.row_factory = sqlite3.Row
+        init_db(golf_closed_db)
+        golf_closed_stats = ScanStats()
+        golf_closed_market = golf_cycling_catalogue("Golf", "3", "golf-closed", "1.golfclosed", "The Open", utc_now() - timedelta(seconds=121))
+        before_golf_closed_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_closed_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_closed_market]}, {"1.golfclosed": {"market_id": "1.golfclosed", "status": "CLOSED", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_closed_stats,
+        )
+        assert golf_closed_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_golf_closed_messages
+        assert golf_closed_db.execute("SELECT final_verification_result FROM inplay_alert_state WHERE event_id = 'golf-closed'").fetchone()["final_verification_result"] == "golf_cycling_market_closed"
+        golf_closed_db.close()
+
+        golf_missing_db = sqlite3.connect(":memory:")
+        golf_missing_db.row_factory = sqlite3.Row
+        init_db(golf_missing_db)
+        golf_missing_stats = ScanStats()
+        golf_missing_market = golf_cycling_catalogue("Golf", "3", "golf-missing", "1.golfmissing", "Ryder Cup", utc_now() - timedelta(seconds=121))
+        before_golf_missing_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_missing_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_missing_market]}, {})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_missing_stats,
+        )
+        assert golf_missing_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_golf_missing_messages
+        assert golf_missing_db.execute("SELECT final_verification_result FROM inplay_alert_state WHERE event_id = 'golf-missing'").fetchone()["final_verification_result"] == "golf_cycling_missing_marketbook"
+        golf_missing_db.close()
+
+        golf_wrong_type_db = sqlite3.connect(":memory:")
+        golf_wrong_type_db.row_factory = sqlite3.Row
+        init_db(golf_wrong_type_db)
+        golf_wrong_type_stats = ScanStats()
+        golf_wrong_type_market = golf_cycling_catalogue(
+            "Golf",
+            "3",
+            "golf-top5",
+            "1.golftop5",
+            "US Open Top 5",
+            utc_now() - timedelta(seconds=121),
+            market_type_code="TOP_5",
+            market_name="Top 5 Finish",
+        )
+        before_wrong_type_messages = len(sent_messages)
+        process_golf_cycling_winner_markets(
+            golf_wrong_type_db,
+            GolfCyclingFakeClient(GolfCyclingFakeBetting({"Golf": [golf_wrong_type_market]}, {"1.golftop5": {"market_id": "1.golftop5", "status": "OPEN", "inplay": False}})),  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            golf_cycling_args,
+            golf_wrong_type_stats,
+        )
+        assert golf_wrong_type_stats.slack_alerts_sent == 0
+        assert len(sent_messages) == before_wrong_type_messages
+        assert golf_wrong_type_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'golf_cycling_market_skipped_wrong_type'").fetchone()[0] == 1
+        assert golf_wrong_type_db.execute("SELECT COUNT(*) FROM inplay_alert_state WHERE event_id = 'golf-top5'").fetchone()[0] == 0
+        golf_wrong_type_db.close()
+
         def insert_visible_test_row(
             connection: sqlite3.Connection,
             event_id: str,
