@@ -6,6 +6,7 @@ python-dotenv
 itsdangerous
 pandas
 requests
+playwright
 betfairlightweight
 selenium
 openpyxl

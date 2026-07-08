@@ -11,6 +11,7 @@ APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
 SCRIPTS_ROOT = PROJECT_ROOT / "scripts"
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
+CONFIG_DIR = RUNTIME_DIR / "config"
 LOG_DIR = RUNTIME_DIR / "logs"
 OUTPUT_DIR = RUNTIME_DIR / "output"
 SECRET_RUNTIME_DIR = RUNTIME_DIR / "secrets"
@@ -32,6 +33,7 @@ SECRET_KEYS = (
     "DUPE_MATCH_SLACK_WEBHOOK_URL",
     "SLACK_WEBHOOK_URL",
     "Slack_Webhook_TIP",
+    "UFC_IS_IT_INPLAY_WEBHOOK_URL",
     "DG_API_KEY",
     "CHROME_BINARY",
     "GOOGLE_CHROME_BIN",
@@ -44,7 +46,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 
 def ensure_runtime_dirs() -> None:
-    for path in (LOG_DIR, OUTPUT_DIR, SECRET_RUNTIME_DIR):
+    for path in (CONFIG_DIR, LOG_DIR, OUTPUT_DIR, SECRET_RUNTIME_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 

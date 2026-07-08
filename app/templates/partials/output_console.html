@@ -7,6 +7,13 @@
 {% if parsed_output_message %}
 <div class="message">{{ parsed_output_message }}</div>
 {% endif %}
+{% if ufc %}
+<div class="message">
+  <strong>Last check:</strong> {{ ufc.last_check_time or "Not checked yet" }} |
+  <strong>Last live fight:</strong> {{ ufc.last_detected_live_fight or "None detected" }} |
+  <strong>Last Slack alert:</strong> {{ ufc.last_slack_alert_sent or "None sent" }}
+</div>
+{% endif %}
 {% if state.duplicate_attempts %}
 <div class="message">Script is already running; {{ state.duplicate_attempts }} duplicate start ignored.</div>
 {% endif %}

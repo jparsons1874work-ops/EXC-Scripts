@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Form, Request
@@ -14,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
-from app.config import APP_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
+from app.config import APP_DIR, CONFIG_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
 from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.runner import RUNNING, STOPPING, default_args_for, runner
@@ -30,6 +32,8 @@ templates.env.cache = None
 logger = logging.getLogger("uvicorn.error")
 PARSER_TIMEOUT_SECONDS = 2.0
 _parser_locks = {script_id: threading.Lock() for script_id in SCRIPTS_BY_ID}
+UFC_SCRIPT_ID = "ufc-live-start-scanner"
+UFC_CONFIG_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
 
 
 class ParserBusyError(RuntimeError):
@@ -47,6 +51,46 @@ def _event(event: str, script_id: str, level: int = logging.INFO, **details: Any
         spec.name,
         f" {detail_text}" if detail_text else "",
     )
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _read_ufc_config() -> dict[str, Any]:
+    try:
+        if not UFC_CONFIG_PATH.exists():
+            return {}
+        data = json.loads(UFC_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("ufc_config_read_failed path=%s error=%r", UFC_CONFIG_PATH, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_ufc_config(data: dict[str, Any]) -> None:
+    ensure_runtime_dirs()
+    UFC_CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _ufc_context() -> dict[str, Any]:
+    data = _read_ufc_config()
+    return {
+        "ufc_event_url": str(data.get("ufc_event_url", "") or ""),
+        "last_saved_at": str(data.get("last_saved_at", "") or ""),
+        "last_check_time": str(data.get("last_check_time", "") or ""),
+        "last_detected_live_fight": str(data.get("last_detected_live_fight", "") or ""),
+        "last_slack_alert_sent": str(data.get("last_slack_alert_sent", "") or ""),
+        "alerted_fights": list(data.get("alerted_fights", []) or [])[-25:],
+    }
+
+
+def _default_args_for_start(spec, form: dict[str, str]) -> list[str]:
+    if spec.id != UFC_SCRIPT_ID:
+        return default_args_for(spec, form)
+    data = _read_ufc_config()
+    ufc_url = str(form.get("ufc_event_url", "") or data.get("ufc_event_url", "") or "").strip()
+    return ["--ufc-url", ufc_url] if ufc_url else []
 
 
 def _run_parser(script_id: str, parser: Callable[..., Any], *args: Any) -> Any:
@@ -194,6 +238,7 @@ async def script_detail(request: Request, script_id: str):
                 cricket=cricket,
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
+                ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
             ),
         )
     finally:
@@ -213,8 +258,44 @@ async def start_script(request: Request, script_id: str):
     form = dict(await request.form())
     if spec.needs_parameters and not str(form.get("identifier", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-identifier", status_code=303)
-    await asyncio.to_thread(runner.start, script_id, default_args_for(spec, form))
+    if script_id == UFC_SCRIPT_ID and not str(form.get("ufc_event_url", "") or _read_ufc_config().get("ufc_event_url", "")).strip():
+        return RedirectResponse(f"/scripts/{script_id}?error=missing-ufc-url", status_code=303)
+    await asyncio.to_thread(runner.start, script_id, _default_args_for_start(spec, form))
     return RedirectResponse(f"/scripts/{script_id}", status_code=303)
+
+
+@app.post("/scripts/ufc-live-start-scanner/config")
+async def save_ufc_config(request: Request, ufc_event_url: str = Form("")):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    data = _read_ufc_config()
+    url = ufc_event_url.strip()
+    previous_url = str(data.get("ufc_event_url", "") or "")
+    data["ufc_event_url"] = url
+    data["last_saved_at"] = _utc_timestamp()
+    if previous_url and previous_url != url:
+        data["alerted_fight_keys"] = []
+        data["alerted_fights"] = []
+        data["last_detected_live_fight"] = ""
+        data["last_slack_alert_sent"] = ""
+    await asyncio.to_thread(_write_ufc_config, data)
+    return RedirectResponse("/scripts/ufc-live-start-scanner", status_code=303)
+
+
+@app.post("/scripts/ufc-live-start-scanner/clear-alerted")
+async def clear_ufc_alerted(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    data = _read_ufc_config()
+    data["alerted_fight_keys"] = []
+    data["alerted_fights"] = []
+    data["last_detected_live_fight"] = ""
+    data["last_slack_alert_sent"] = ""
+    data["alerted_cleared_at"] = _utc_timestamp()
+    await asyncio.to_thread(_write_ufc_config, data)
+    return RedirectResponse("/scripts/ufc-live-start-scanner", status_code=303)
 
 
 @app.post("/scripts/{script_id}/stop")
@@ -260,6 +341,7 @@ async def script_output(request: Request, script_id: str):
                 cricket=cricket,
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
+                ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
             ),
         )
     finally:

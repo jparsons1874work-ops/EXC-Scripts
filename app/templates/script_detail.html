@@ -24,6 +24,20 @@
     {% if spec.long_running and not allowed %}
     <div class="warning">This long-running script cannot be started outside its configured run window.</div>
     {% endif %}
+    {% if spec.id == "ufc-live-start-scanner" %}
+    {% if request.query_params.get("error") == "missing-ufc-url" %}
+    <div class="error">Save a UFC event URL before starting the scanner.</div>
+    {% endif %}
+    <form method="post" action="/scripts/{{ spec.id }}/config" class="form-stack controls">
+      <label for="ufc_event_url">UFC event URL</label>
+      <input id="ufc_event_url" name="ufc_event_url" type="url" value="{{ ufc.ufc_event_url }}" placeholder="https://www.ufc.com/event/ufc-329">
+      <button class="button button-ghost" type="submit">Save URL</button>
+    </form>
+    <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
+      <input type="hidden" name="ufc_event_url" value="{{ ufc.ufc_event_url }}">
+      <button class="button button-primary" type="submit" {% if not ufc.ufc_event_url or state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
+    </form>
+    {% else %}
     <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
       {% if spec.needs_parameters %}
       <label for="signal_source">Signal source</label>
@@ -36,9 +50,37 @@
       {% endif %}
       <button class="button button-primary" type="submit" {% if state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
     </form>
+    {% endif %}
     <form method="post" action="/scripts/{{ spec.id }}/stop" class="controls">
       <button class="button button-danger" type="submit" {% if state.status != "running" and state.status != "stopping" %}disabled{% endif %}>Stop</button>
     </form>
+    {% if spec.id == "ufc-live-start-scanner" %}
+    <div class="panel-header">
+      <h2>Scanner State</h2>
+      {% if ufc.last_saved_at %}<span class="meta">Saved {{ ufc.last_saved_at }}</span>{% endif %}
+    </div>
+    <div class="message">
+      <strong>Last check:</strong> {{ ufc.last_check_time or "Not checked yet" }}<br>
+      <strong>Last live fight:</strong> {{ ufc.last_detected_live_fight or "None detected" }}<br>
+      <strong>Last Slack alert:</strong> {{ ufc.last_slack_alert_sent or "None sent" }}
+    </div>
+    <div class="panel-header">
+      <h2>Alerted Fights</h2>
+      <form method="post" action="/scripts/{{ spec.id }}/clear-alerted">
+        <button class="button button-ghost" type="submit">Clear</button>
+      </form>
+    </div>
+    {% if ufc.alerted_fights %}
+    <div class="message">
+      {% for fight in ufc.alerted_fights %}
+      <strong>{{ fight.fight_name }}</strong><br>
+      {{ fight.alerted_at }} | Betfair ID: {{ fight.betfair_event_id or "Not matched" }}{% if not loop.last %}<br><br>{% endif %}
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="message">No alerted fights recorded for this card.</div>
+    {% endif %}
+    {% endif %}
     <div class="script-path">{{ spec.relative_path }}</div>
   </div>
 

@@ -113,6 +113,15 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         parsed_output=True,
         timeout_seconds=16 * 60 * 60,
     ),
+    ScriptSpec(
+        id="ufc-live-start-scanner",
+        name="UFC - Live Start Scanner",
+        category="UFC",
+        description="Scans the current UFC card for LIVE NOW fights and alerts the in-play Slack channel.",
+        relative_path="scripts/UFC_Live_Start_Scanner.py",
+        long_running=True,
+        timeout_seconds=6 * 60 * 60,
+    ),
     script(
         "Tennis - Integrity Check",
         "Tennis",
