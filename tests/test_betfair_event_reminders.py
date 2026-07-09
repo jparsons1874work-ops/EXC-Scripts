@@ -11,7 +11,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import Betfair_Event_Reminders as reminders  # noqa: E402
 from Betfair_Event_Reminders import (  # noqa: E402
+    ConfigSource,
     EventReminder,
     UK_TZ,
     build_scan_window,
@@ -21,9 +23,12 @@ from Betfair_Event_Reminders import (  # noqa: E402
     missing_config_message,
     reminder_time,
     resolve_config_path,
+    resolve_config_source,
     select_reminders,
     slack_bucket_warnings,
     ConfigMissing,
+    ConfigPlaceholderError,
+    validate_config,
 )
 
 
@@ -106,10 +111,98 @@ class BetfairEventReminderTests(unittest.TestCase):
     def test_missing_config_does_not_create_real_placeholder(self) -> None:
         missing_path = ROOT / "runtime" / "output" / f"missing-{uuid.uuid4()}.json"
         with self.assertRaises(ConfigMissing) as context:
-            load_config(missing_path)
+            load_config(ConfigSource("json", missing_path))
         self.assertFalse(missing_path.exists())
-        self.assertIn("Do not commit the real config to Git.", str(context.exception))
-        self.assertEqual(str(context.exception), missing_config_message(missing_path))
+        self.assertIn("Do not commit real config or .env files to Git.", str(context.exception))
+        self.assertEqual(str(context.exception), missing_config_message(ConfigSource("json", missing_path)))
+
+    def test_loads_from_env_file(self) -> None:
+        env_path = ROOT / "runtime" / "output" / f"reminders-{uuid.uuid4()}.env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(
+            "\n".join(
+                [
+                    "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN=SAFE_TEST_SLACK_BOT_TOKEN",
+                    "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID=C123456789",
+                    "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_NAME=#exc_sports_ops",
+                    "BETFAIR_EVENT_REMINDERS_FALLBACK_WEBHOOK_URL=",
+                    "BETFAIR_APP_KEY=test-app-key",
+                    "BETFAIR_USERNAME=test-user",
+                    "BETFAIR_PASSWORD='test password'",
+                    "BETFAIR_CERTS_DIR=/opt/betfair-scripts/certs",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config = load_config(ConfigSource("env", env_path))
+        self.assertEqual(config.slack_channel_id, "C123456789")
+        self.assertEqual(config.slack_channel_name, "#exc_sports_ops")
+        self.assertEqual(config.betfair_password, "test password")
+
+    def test_env_source_is_used_when_json_is_missing(self) -> None:
+        env_path = ROOT / "runtime" / "output" / f"reminders-{uuid.uuid4()}.env"
+        json_path = ROOT / "runtime" / "output" / f"missing-{uuid.uuid4()}.json"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(
+            "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN=SAFE_TEST_SLACK_BOT_TOKEN\n"
+            "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID=C123456789\n"
+            "BETFAIR_APP_KEY=test-app-key\n"
+            "BETFAIR_USERNAME=test-user\n"
+            "BETFAIR_PASSWORD=test-password\n",
+            encoding="utf-8",
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            with patch.object(reminders, "EC2_ENV_PATH", env_path), patch.object(reminders, "WINDOWS_ENV_PATH", json_path):
+                source = resolve_config_source()
+        self.assertEqual(source, ConfigSource("env", env_path))
+        config = load_config(source)
+        validate_config(config, source)
+
+    def test_required_field_validation_from_env(self) -> None:
+        config = reminders.env_to_config({"BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN": "SAFE_TEST_SLACK_BOT_TOKEN"})
+        with self.assertRaises(ConfigPlaceholderError) as context:
+            validate_config(config, ConfigSource("env", Path("/opt/betfair-scripts/.env")))
+        message = str(context.exception)
+        self.assertIn("slack_channel_id", message)
+        self.assertIn("betfair_app_key", message)
+        self.assertIn("betfair_username", message)
+        self.assertIn("betfair_password", message)
+
+    def test_placeholder_detection_from_env(self) -> None:
+        config = reminders.env_to_config(
+            {
+                "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN": "xoxb-NEW-CHANNEL-BOT-TOKEN-PLACEHOLDER",
+                "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID": "C123456789",
+                "BETFAIR_APP_KEY": "test-app-key",
+                "BETFAIR_USERNAME": "test-user",
+                "BETFAIR_PASSWORD": "test-password",
+            }
+        )
+        with self.assertRaises(ConfigPlaceholderError) as context:
+            validate_config(config, ConfigSource("env", Path("/opt/betfair-scripts/.env")))
+        self.assertIn("slack_bot_token", str(context.exception))
+
+    def test_json_config_path_still_works(self) -> None:
+        json_path = ROOT / "runtime" / "output" / f"reminders-{uuid.uuid4()}.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            """{
+  "slack_bot_token": "SAFE_TEST_SLACK_BOT_TOKEN",
+  "slack_channel_id": "C123456789",
+  "slack_channel_name": "#exc_sports_ops",
+  "fallback_webhook_url": "",
+  "betfair_app_key": "test-app-key",
+  "betfair_username": "test-user",
+  "betfair_password": "test-password",
+  "certs_dir": "/opt/betfair-scripts/certs"
+}
+""",
+            encoding="utf-8",
+        )
+        source = ConfigSource("json", json_path)
+        config = load_config(source)
+        validate_config(config, source)
+        self.assertEqual(config.slack_channel_id, "C123456789")
 
 
 if __name__ == "__main__":

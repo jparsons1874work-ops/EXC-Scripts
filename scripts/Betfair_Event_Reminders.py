@@ -21,12 +21,19 @@ from zoneinfo import ZoneInfo
 import requests
 from betfairlightweight import APIClient
 from betfairlightweight.filters import market_filter
+from dotenv import dotenv_values
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
-CONFIG_PATH = CONFIG_DIR / "betfair_event_reminders_config.json"
+WINDOWS_ROOT = Path(r"C:\BetfairScripts")
+EC2_ROOT = Path("/opt/betfair-scripts")
+WINDOWS_ENV_PATH = WINDOWS_ROOT / ".env"
+EC2_ENV_PATH = EC2_ROOT / ".env"
+WINDOWS_CONFIG_PATH = WINDOWS_ROOT / "config" / "betfair_event_reminders_config.json"
+EC2_CONFIG_PATH = EC2_ROOT / "config" / "betfair_event_reminders_config.json"
+CONFIG_PATH = WINDOWS_CONFIG_PATH if os.name == "nt" else EC2_CONFIG_PATH
 EXAMPLE_CONFIG_PATH = CONFIG_DIR / "betfair_event_reminders_config.example.json"
 CONFIG_ENV_VAR = "BETFAIR_EVENT_REMINDERS_CONFIG"
 STATE_PATH = PROJECT_ROOT / "data" / "betfair_event_reminders_sent.json"
@@ -93,6 +100,12 @@ class Config:
     betfair_username: str
     betfair_password: str
     certs_dir: str
+
+
+@dataclass(frozen=True)
+class ConfigSource:
+    kind: str
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -268,13 +281,25 @@ def select_reminders(events: Iterable[EventReminder], rule: str) -> list[EventRe
     raise ValueError(f"Unknown selection rule: {rule}")
 
 
-def resolve_config_path(cli_config_path: str = "") -> Path:
+def default_json_config_path() -> Path:
+    return WINDOWS_CONFIG_PATH if os.name == "nt" else EC2_CONFIG_PATH
+
+
+def resolve_config_source(cli_config_path: str = "") -> ConfigSource:
     if cli_config_path.strip():
-        return Path(cli_config_path).expanduser()
+        return ConfigSource("json", Path(cli_config_path).expanduser())
     env_config_path = os.getenv(CONFIG_ENV_VAR, "").strip()
     if env_config_path:
-        return Path(env_config_path).expanduser()
-    return CONFIG_PATH
+        return ConfigSource("json", Path(env_config_path).expanduser())
+    if EC2_ENV_PATH.exists():
+        return ConfigSource("env", EC2_ENV_PATH)
+    if WINDOWS_ENV_PATH.exists():
+        return ConfigSource("env", WINDOWS_ENV_PATH)
+    return ConfigSource("json", default_json_config_path())
+
+
+def resolve_config_path(cli_config_path: str = "") -> Path:
+    return resolve_config_source(cli_config_path).path
 
 
 def read_json(path: Path) -> Any:
@@ -282,25 +307,71 @@ def read_json(path: Path) -> Any:
         return json.load(handle)
 
 
-def missing_config_message(path: Path) -> str:
+def read_env(path: Path) -> dict[str, str]:
+    values = dotenv_values(path)
+    return {str(key): str(value) for key, value in values.items() if value is not None}
+
+
+def first_env_value(values: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        value = values.get(key, "")
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def env_to_config(values: dict[str, str]) -> Config:
+    return Config(
+        slack_bot_token=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN", "SLACK_BOT_TOKEN"),
+        slack_channel_id=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID", "SLACK_CHANNEL_ID"),
+        slack_channel_name=first_env_value(
+            values,
+            "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_NAME",
+            "SLACK_CHANNEL_NAME",
+        )
+        or PLACEHOLDER_CONFIG["slack_channel_name"],
+        fallback_webhook_url=first_env_value(
+            values,
+            "BETFAIR_EVENT_REMINDERS_FALLBACK_WEBHOOK_URL",
+            "BETFAIR_EVENT_REMINDERS_WEBHOOK_URL",
+            "SLACK_WEBHOOK_URL",
+        ),
+        betfair_app_key=first_env_value(values, "BETFAIR_APP_KEY"),
+        betfair_username=first_env_value(values, "BETFAIR_USERNAME"),
+        betfair_password=first_env_value(values, "BETFAIR_PASSWORD"),
+        certs_dir=first_env_value(values, "BETFAIR_CERTS_DIR", "CERTS_DIR") or PLACEHOLDER_CONFIG["certs_dir"],
+    )
+
+
+def missing_config_message(source: ConfigSource) -> str:
+    if source.kind == "env":
+        return "\n".join(
+            [
+                f"Missing .env secrets file: {source.path}",
+                "Create /opt/betfair-scripts/.env on EC2 with the Betfair Event Reminders values.",
+                "Do not commit .env to Git.",
+            ]
+        )
     return "\n".join(
         [
-            f"Missing real config file: {path}",
-            "Create it on the EC2 server using config/betfair_event_reminders_config.example.json as the template.",
-            "Rename it to betfair_event_reminders_config.json, fill in the EC2-only real values, then run --dry-run first.",
-            "Do not commit the real config to Git.",
+            f"Missing real config file: {source.path}",
+            "Preferred EC2 setup: store secrets in /opt/betfair-scripts/.env, then run --dry-run first.",
+            "JSON is only needed when using --config or BETFAIR_EVENT_REMINDERS_CONFIG.",
+            "Do not commit real config or .env files to Git.",
         ]
     )
 
 
-def load_config(config_path: Path) -> Config:
-    if not config_path.exists():
+def load_config(source: ConfigSource) -> Config:
+    if not source.path.exists():
         raise ConfigMissing(
-            missing_config_message(config_path)
+            missing_config_message(source)
         )
-    data = read_json(config_path)
+    if source.kind == "env":
+        return env_to_config(read_env(source.path))
+    data = read_json(source.path)
     if not isinstance(data, dict):
-        raise RuntimeError(f"Config must be a JSON object: {config_path}")
+        raise RuntimeError(f"Config must be a JSON object: {source.path}")
     merged = {**PLACEHOLDER_CONFIG, **data}
     return Config(**{key: str(merged.get(key, "") or "") for key in PLACEHOLDER_CONFIG})
 
@@ -320,14 +391,14 @@ def placeholder_fields(config: Config) -> list[str]:
     return missing
 
 
-def validate_config(config: Config, config_path: Path) -> None:
+def validate_config(config: Config, source: ConfigSource) -> None:
     missing = placeholder_fields(config)
     if missing:
         raise ConfigPlaceholderError(
             "\n".join(
                 [
-                    f"Config still contains placeholder values: {', '.join(missing)}",
-                    f"Config path: {config_path}",
+                    f"Config source is missing required values or still contains placeholders: {', '.join(missing)}",
+                    f"Config source: {source.path}",
                     "Fill in the EC2-only real values, including the new Slack bot token and channel ID.",
                     "fallback_webhook_url is optional only and is not used for scheduled reminders.",
                     "No Betfair or Slack calls were made.",
@@ -476,10 +547,10 @@ def state_record(reminder: EventReminder, key: str, post_epoch: int, scheduled_m
     }
 
 
-def run_scan(args: argparse.Namespace, config: Config, config_path: Path) -> int:
+def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> int:
     log_path = setup_logging()
     log("Betfair Event Reminders starting")
-    log(f"Config path: {config_path}")
+    log(f"Config source: {source.path}")
     log(f"Log path: {log_path}")
     log(f"Slack channel: {config.slack_channel_name} ({config.slack_channel_id})")
     log("Scheduling method: Slack Web API chat.scheduleMessage")
@@ -488,7 +559,7 @@ def run_scan(args: argparse.Namespace, config: Config, config_path: Path) -> int
     if args.dry_run:
         log("Dry run enabled: no Slack messages will be scheduled and no state records will be written.")
 
-    validate_config(config, config_path)
+    validate_config(config, source)
     window = build_scan_window(lookahead_hours=args.lookahead_hours, start_now=args.start_now)
     log(f"UK scan window: {format_uk(window.start_uk)} -> {format_uk(window.end_uk)}")
     log(f"UTC scan window: {format_utc(window.start_utc)} -> {format_utc(window.end_utc)}")
@@ -599,13 +670,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Production config guidance:\n"
-            "  Copy config/betfair_event_reminders_config.example.json on EC2.\n"
-            "  Rename it to betfair_event_reminders_config.json and fill in EC2-only real values.\n"
-            "  Keep the real config out of Git, then run --dry-run first.\n"
-            f"  Linux override: set {CONFIG_ENV_VAR} or pass --config /opt/betfair-scripts/config/betfair_event_reminders_config.json."
+            "  Store EC2 production secrets in /opt/betfair-scripts/.env.\n"
+            "  Keep .env and real JSON config files out of Git, then run --dry-run first.\n"
+            f"  JSON override: set {CONFIG_ENV_VAR} or pass --config /opt/betfair-scripts/config/betfair_event_reminders_config.json."
         ),
     )
-    parser.add_argument("--config", default="", help="Path to the real EC2/local JSON config file.")
+    parser.add_argument("--config", default="", help="Path to an explicit real JSON config file.")
     parser.add_argument("--dry-run", action="store_true", help="Scan and print what would be scheduled without Slack/state writes.")
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     parser.add_argument("--lookahead-hours", type=float, default=24)
@@ -628,9 +698,9 @@ def main() -> int:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     try:
-        config_path = resolve_config_path(args.config)
-        config = load_config(config_path)
-        return run_scan(args, config, config_path)
+        source = resolve_config_source(args.config)
+        config = load_config(source)
+        return run_scan(args, config, source)
     except (ConfigMissing, ConfigPlaceholderError) as exc:
         print(str(exc), flush=True)
         return 2
