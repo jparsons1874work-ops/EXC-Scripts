@@ -23,6 +23,11 @@ runtime/secrets/
 /output/
 /logs/
 *.log
+C:/BetfairScripts/data/betfair_event_reminders_sent.json
+C:/BetfairScripts/logs/betfair_event_reminders_*.log
+data/betfair_event_reminders_sent.json
+logs/betfair_event_reminders_*.log
+config/betfair_event_reminders_config.json
 *.xlsx
 *.xls
 runtime/output/*.csv

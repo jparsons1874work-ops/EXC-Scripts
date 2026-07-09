@@ -1,0 +1,10 @@
+{
+  "slack_bot_token": "xoxb-NEW-CHANNEL-BOT-TOKEN-PLACEHOLDER",
+  "slack_channel_id": "C_NEW_CHANNEL_ID_PLACEHOLDER",
+  "slack_channel_name": "#exc_sports_ops",
+  "fallback_webhook_url": "https://hooks.slack.com/services/NEW/CHANNEL/WEBHOOK_PLACEHOLDER",
+  "betfair_app_key": "BETFAIR_APP_KEY_PLACEHOLDER",
+  "betfair_username": "BETFAIR_USERNAME_PLACEHOLDER",
+  "betfair_password": "BETFAIR_PASSWORD_PLACEHOLDER",
+  "certs_dir": "C:\\BetfairScripts\\certs"
+}

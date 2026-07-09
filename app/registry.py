@@ -113,6 +113,14 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         parsed_output=True,
         timeout_seconds=16 * 60 * 60,
     ),
+    script(
+        "Betfair Event Reminders",
+        "Betfair",
+        "Schedules Slack reminders for selected Betfair weekend sports events",
+        "scripts/Betfair_Event_Reminders.py",
+        ("--pause-on-exit",),
+        timeout_seconds=30 * 60,
+    ),
     ScriptSpec(
         id="ufc-live-start-scanner",
         name="UFC - Live Start Scanner",
