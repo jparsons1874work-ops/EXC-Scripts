@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -47,6 +48,9 @@ SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
 MATCH_ODDS = "MATCH_ODDS"
+CERT_FILE_NAME = "client-2048.crt"
+KEY_FILE_NAME = "client-2048.key"
+WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 PLACEHOLDER_CONFIG: dict[str, str] = {
     "slack_bot_token": "xoxb-NEW-CHANNEL-BOT-TOKEN-PLACEHOLDER",
@@ -100,6 +104,7 @@ class Config:
     betfair_username: str
     betfair_password: str
     certs_dir: str
+    certs_dir_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -320,7 +325,16 @@ def first_env_value(values: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def env_cert_values(values: dict[str, str]) -> tuple[str, ...]:
+    cert_values = [
+        first_env_value(values, "BETFAIR_CERTS_DIR"),
+        first_env_value(values, "CERTS_DIR"),
+    ]
+    return tuple(value for value in cert_values if value)
+
+
 def env_to_config(values: dict[str, str]) -> Config:
+    cert_values = env_cert_values(values)
     return Config(
         slack_bot_token=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN", "SLACK_BOT_TOKEN"),
         slack_channel_id=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID", "SLACK_CHANNEL_ID"),
@@ -339,7 +353,8 @@ def env_to_config(values: dict[str, str]) -> Config:
         betfair_app_key=first_env_value(values, "BETFAIR_APP_KEY"),
         betfair_username=first_env_value(values, "BETFAIR_USERNAME"),
         betfair_password=first_env_value(values, "BETFAIR_PASSWORD"),
-        certs_dir=first_env_value(values, "BETFAIR_CERTS_DIR", "CERTS_DIR") or PLACEHOLDER_CONFIG["certs_dir"],
+        certs_dir=cert_values[0] if cert_values else PLACEHOLDER_CONFIG["certs_dir"],
+        certs_dir_aliases=cert_values,
     )
 
 
@@ -419,10 +434,71 @@ def setup_logging() -> Path:
     return log_path
 
 
+def is_windows_drive_path(value: str) -> bool:
+    return bool(WINDOWS_DRIVE_PATH_RE.match(value.strip()))
+
+
+def missing_cert_files(certs_dir: Path) -> list[str]:
+    return [name for name in (CERT_FILE_NAME, KEY_FILE_NAME) if not (certs_dir / name).exists()]
+
+
+def resolve_betfair_certs_dir(
+    raw_config_value: str | Iterable[str],
+    repo_root: Path,
+    *,
+    is_windows_host: bool | None = None,
+    ec2_certs_dir: Path | None = None,
+) -> Path:
+    is_windows = os.name == "nt" if is_windows_host is None else is_windows_host
+    configured_values = (
+        [raw_config_value]
+        if isinstance(raw_config_value, str)
+        else list(raw_config_value or [])
+    )
+    candidates: list[Path] = []
+
+    for raw_value in configured_values:
+        configured = str(raw_value or "").strip()
+        if not configured:
+            continue
+        log(f"Configured Betfair cert path: {configured}")
+        if not is_windows and is_windows_drive_path(configured):
+            log(f"Ignoring Windows-style cert path on Linux: {configured}")
+            continue
+        configured_path = Path(configured).expanduser()
+        if not is_windows and configured.startswith("/"):
+            candidates.append(configured_path)
+        elif configured_path.is_absolute():
+            candidates.append(configured_path)
+        else:
+            candidates.append((repo_root / configured_path).resolve())
+
+    candidates.extend(
+        [
+            ec2_certs_dir or (EC2_ROOT / "certs"),
+            (repo_root / "certs").resolve(),
+        ]
+    )
+
+    seen: set[str] = set()
+    checked: list[str] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        missing = missing_cert_files(candidate)
+        if not missing:
+            return candidate
+        checked.append(f"{candidate} missing {', '.join(missing)}")
+
+    raise FileNotFoundError("Betfair certificate files not found. Checked: " + "; ".join(checked))
+
+
 def build_client(config: Config) -> APIClient:
-    certs_dir = Path(config.certs_dir).resolve()
-    cert_file = certs_dir / "client-2048.crt"
-    key_file = certs_dir / "client-2048.key"
+    certs_dir = resolve_betfair_certs_dir(config.certs_dir_aliases or config.certs_dir, PROJECT_ROOT)
+    cert_file = certs_dir / CERT_FILE_NAME
+    key_file = certs_dir / KEY_FILE_NAME
     log(f"Resolved Betfair cert path: {certs_dir}")
     if not cert_file.exists():
         raise FileNotFoundError(f"Betfair cert file not found: {cert_file}")

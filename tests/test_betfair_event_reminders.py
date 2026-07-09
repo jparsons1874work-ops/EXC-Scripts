@@ -22,6 +22,7 @@ from Betfair_Event_Reminders import (  # noqa: E402
     load_config,
     missing_config_message,
     reminder_time,
+    resolve_betfair_certs_dir,
     resolve_config_path,
     resolve_config_source,
     select_reminders,
@@ -203,6 +204,76 @@ class BetfairEventReminderTests(unittest.TestCase):
         config = load_config(source)
         validate_config(config, source)
         self.assertEqual(config.slack_channel_id, "C123456789")
+
+    def test_linux_windows_cert_path_falls_back_to_repo_certs(self) -> None:
+        repo_root = ROOT / "runtime" / "output" / f"repo-{uuid.uuid4()}"
+        repo_certs = repo_root / "certs"
+        repo_certs.mkdir(parents=True, exist_ok=True)
+        (repo_certs / "client-2048.crt").write_text("test cert", encoding="utf-8")
+        (repo_certs / "client-2048.key").write_text("test key", encoding="utf-8")
+        resolved = resolve_betfair_certs_dir(
+            r"C:\BetfairScripts\certs",
+            repo_root,
+            is_windows_host=False,
+            ec2_certs_dir=repo_root / "missing-ec2-certs",
+        )
+        self.assertEqual(resolved, repo_certs.resolve())
+
+    def test_linux_absolute_cert_path_resolves_directly(self) -> None:
+        repo_root = ROOT / "runtime" / "output" / f"repo-{uuid.uuid4()}"
+        configured_certs = "/opt/betfair-scripts/certs"
+        with patch.object(reminders, "missing_cert_files", return_value=[]):
+            resolved = resolve_betfair_certs_dir(
+                configured_certs,
+                repo_root,
+                is_windows_host=False,
+                ec2_certs_dir=repo_root / "missing-ec2-certs",
+            )
+        self.assertEqual(resolved, Path(configured_certs))
+
+    def test_relative_cert_path_resolves_against_repo_root(self) -> None:
+        repo_root = ROOT / "runtime" / "output" / f"repo-{uuid.uuid4()}"
+        repo_certs = repo_root / "certs"
+        repo_certs.mkdir(parents=True, exist_ok=True)
+        (repo_certs / "client-2048.crt").write_text("test cert", encoding="utf-8")
+        (repo_certs / "client-2048.key").write_text("test key", encoding="utf-8")
+        resolved = resolve_betfair_certs_dir(
+            "certs",
+            repo_root,
+            is_windows_host=False,
+            ec2_certs_dir=repo_root / "missing-ec2-certs",
+        )
+        self.assertEqual(resolved, repo_certs.resolve())
+
+    def test_linux_windows_cert_path_uses_valid_cert_alias(self) -> None:
+        repo_root = ROOT / "runtime" / "output" / f"repo-{uuid.uuid4()}"
+        alias_certs = repo_root / "alias-certs"
+        alias_certs.mkdir(parents=True, exist_ok=True)
+        (alias_certs / "client-2048.crt").write_text("test cert", encoding="utf-8")
+        (alias_certs / "client-2048.key").write_text("test key", encoding="utf-8")
+        resolved = resolve_betfair_certs_dir(
+            (r"C:\BetfairScripts\certs", "alias-certs"),
+            repo_root,
+            is_windows_host=False,
+            ec2_certs_dir=repo_root / "missing-ec2-certs",
+        )
+        self.assertEqual(resolved, alias_certs.resolve())
+
+    def test_missing_cert_files_raise_clear_error(self) -> None:
+        repo_root = ROOT / "runtime" / "output" / f"repo-{uuid.uuid4()}"
+        configured_certs = repo_root / "configured-certs"
+        configured_certs.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(FileNotFoundError) as context:
+            resolve_betfair_certs_dir(
+                str(configured_certs),
+                repo_root,
+                is_windows_host=False,
+                ec2_certs_dir=repo_root / "missing-ec2-certs",
+            )
+        message = str(context.exception)
+        self.assertIn("Betfair certificate files not found", message)
+        self.assertIn("client-2048.crt", message)
+        self.assertIn("client-2048.key", message)
 
 
 if __name__ == "__main__":
