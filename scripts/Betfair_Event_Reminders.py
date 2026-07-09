@@ -67,12 +67,15 @@ PLACEHOLDER_MARKERS = ("PLACEHOLDER", "CHANGE_ME", "YOUR_", "TODO", "PASTE_")
 
 SPORT_RULE_ALL = "all"
 SPORT_RULE_FIRST = "first"
-SPORT_RULE_DARTS_COMPETITION = "darts_first_per_competition"
+SPORT_RULE_BOXING_BATCHES = "boxing_first_and_gap_batches"
+SPORT_RULE_DARTS_GROUPS = "darts_first_competition_gap_and_new_date"
+DARTS_GROUP_GAP = timedelta(hours=1)
+BOXING_BATCH_GAP = timedelta(hours=2)
 
 SPORTS: tuple[dict[str, str], ...] = (
     {"name": "American Football", "rule": SPORT_RULE_ALL, "emoji": ":football:"},
-    {"name": "Boxing", "rule": SPORT_RULE_FIRST, "emoji": ":boxing_glove:"},
-    {"name": "Darts", "rule": SPORT_RULE_DARTS_COMPETITION, "emoji": ":dart:"},
+    {"name": "Boxing", "rule": SPORT_RULE_BOXING_BATCHES, "emoji": ":boxing_glove:"},
+    {"name": "Darts", "rule": SPORT_RULE_DARTS_GROUPS, "emoji": ":dart:"},
     {"name": "Gaelic Games", "rule": SPORT_RULE_ALL, "emoji": ":flag-ie:"},
     {"name": "Mixed Martial Arts", "rule": SPORT_RULE_FIRST, "emoji": ":martial_arts_uniform:"},
     {"name": "Rugby League", "rule": SPORT_RULE_ALL, "emoji": ":rugby_football:"},
@@ -137,6 +140,12 @@ class EventReminder:
     @property
     def event_start_uk(self) -> datetime:
         return self.event_start_utc.astimezone(UK_TZ)
+
+
+@dataclass(frozen=True)
+class SelectedReminder:
+    reminder: EventReminder
+    reasons: tuple[str, ...] = ()
 
 
 @dataclass
@@ -270,20 +279,96 @@ def dedupe_events(markets: Iterable[EventReminder]) -> list[EventReminder]:
     return list(by_event.values())
 
 
-def select_reminders(events: Iterable[EventReminder], rule: str) -> list[EventReminder]:
+def append_selected(
+    selected: list[SelectedReminder],
+    selected_indexes: dict[str, int],
+    event: EventReminder,
+    reason: str,
+) -> None:
+    existing_index = selected_indexes.get(event.event_id)
+    if existing_index is None:
+        selected_indexes[event.event_id] = len(selected)
+        selected.append(SelectedReminder(event, (reason,)))
+        return
+
+    existing = selected[existing_index]
+    if reason not in existing.reasons:
+        selected[existing_index] = SelectedReminder(existing.reminder, (*existing.reasons, reason))
+
+
+def competition_key(event: EventReminder) -> str:
+    return event.competition_id or event.competition_name or f"event:{event.event_id}"
+
+
+def select_darts_reminders(events: list[EventReminder], scan_start_uk: datetime | None) -> list[SelectedReminder]:
+    if not events:
+        return []
+    scan_date = (scan_start_uk or events[0].event_start_uk).astimezone(UK_TZ).date()
+    selected: list[SelectedReminder] = []
+    selected_indexes: dict[str, int] = {}
+    by_competition: dict[str, list[EventReminder]] = {}
+    for event in events:
+        by_competition.setdefault(competition_key(event), []).append(event)
+
+    for competition_events in by_competition.values():
+        previous_event: EventReminder | None = None
+        seen_dates: set[Any] = set()
+        for event in competition_events:
+            event_date = event.event_start_uk.date()
+            if previous_event is None:
+                append_selected(selected, selected_indexes, event, "first_in_competition")
+                seen_dates.add(event_date)
+                if event_date != scan_date:
+                    append_selected(selected, selected_indexes, event, "first_on_new_scan_date")
+                previous_event = event
+                continue
+
+            if event.event_start_uk - previous_event.event_start_uk > DARTS_GROUP_GAP:
+                append_selected(selected, selected_indexes, event, "new_group_gap_gt_1h")
+            if event_date != scan_date and event_date not in seen_dates:
+                append_selected(selected, selected_indexes, event, "first_on_new_scan_date")
+            seen_dates.add(event_date)
+            previous_event = event
+
+    return sorted(selected, key=lambda item: (item.reminder.event_start_utc, item.reminder.event_name.casefold(), item.reminder.event_id))
+
+
+def select_boxing_reminders(events: list[EventReminder]) -> list[SelectedReminder]:
+    selected: list[SelectedReminder] = []
+    selected_indexes: dict[str, int] = {}
+    previous_event: EventReminder | None = None
+    for event in events:
+        if previous_event is None:
+            append_selected(selected, selected_indexes, event, "first_boxing_fight")
+        elif event.event_start_uk - previous_event.event_start_uk > BOXING_BATCH_GAP:
+            append_selected(selected, selected_indexes, event, "new_boxing_batch_gap_gt_2h")
+        previous_event = event
+    return selected
+
+
+def select_reminders_with_reasons(
+    events: Iterable[EventReminder],
+    rule: str,
+    scan_start_uk: datetime | None = None,
+) -> list[SelectedReminder]:
     sorted_events = sorted(events, key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.event_id))
     if rule == SPORT_RULE_ALL:
-        return sorted_events
+        return [SelectedReminder(event) for event in sorted_events]
     if rule == SPORT_RULE_FIRST:
-        return sorted_events[:1]
-    if rule == SPORT_RULE_DARTS_COMPETITION:
-        first_by_competition: dict[str, EventReminder] = {}
-        for event in sorted_events:
-            competition_key = event.competition_id or event.competition_name or f"event:{event.event_id}"
-            if competition_key not in first_by_competition:
-                first_by_competition[competition_key] = event
-        return list(first_by_competition.values())
+        return [SelectedReminder(event) for event in sorted_events[:1]]
+    if rule == SPORT_RULE_BOXING_BATCHES:
+        return select_boxing_reminders(sorted_events)
+    if rule == SPORT_RULE_DARTS_GROUPS:
+        return select_darts_reminders(sorted_events, scan_start_uk)
     raise ValueError(f"Unknown selection rule: {rule}")
+
+
+def select_reminders(
+    events: Iterable[EventReminder],
+    rule: str,
+    scan_start_uk: datetime | None = None,
+) -> list[EventReminder]:
+    return [selected.reminder for selected in select_reminders_with_reasons(events, rule, scan_start_uk)]
 
 
 def default_json_config_path() -> Path:
@@ -642,6 +727,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
 
     stats = RunStats()
     all_selected: list[EventReminder] = []
+    selection_reasons: dict[str, tuple[str, ...]] = {}
     client = build_client(config)
     try:
         sport_ids = list_event_type_ids(client, window)
@@ -658,7 +744,15 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 if (reminder := catalogue_to_reminder(catalogue, sport_name, sport["emoji"], event_type_id)) is not None
             ]
             unique_events = dedupe_events(reminders)
-            selected = select_reminders(unique_events, sport["rule"])
+            selected_with_reasons = select_reminders_with_reasons(unique_events, sport["rule"], window.start_uk)
+            selected = [item.reminder for item in selected_with_reasons]
+            for item in selected_with_reasons:
+                if item.reasons:
+                    selection_reasons[item.reminder.event_id] = item.reasons
+                    log(
+                        f"Selected {sport_name} reminder: event_id={item.reminder.event_id} "
+                        f"reason={','.join(item.reasons)}"
+                    )
             stats.unique_events_found += len(unique_events)
             stats.reminders_selected += len(selected)
             all_selected.extend(selected)
@@ -689,7 +783,9 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
             f"/remind {config.slack_channel_name} {format_slack_text(reminder)} "
             f"at {post_time_uk.strftime('%H:%M')}"
         )
-        log(f"Reminder candidate: {readable_remind}")
+        reason_label = ",".join(selection_reasons.get(reminder.event_id, ()))
+        reason_suffix = f" reason={reason_label}" if reason_label else ""
+        log(f"Reminder candidate: {readable_remind}{reason_suffix}")
         if post_time_uk <= now_uk:
             stats.skipped_past_times += 1
             log(f"SKIP time in past: {reminder.sport} {reminder.event_name} post_at={format_uk(post_time_uk)}")

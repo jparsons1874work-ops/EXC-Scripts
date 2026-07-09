@@ -26,6 +26,7 @@ from Betfair_Event_Reminders import (  # noqa: E402
     resolve_config_path,
     resolve_config_source,
     select_reminders,
+    select_reminders_with_reasons,
     slack_bucket_warnings,
     ConfigMissing,
     ConfigPlaceholderError,
@@ -81,19 +82,153 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(unique[0].market_id, "m1")
 
     def test_first_event_per_sport_logic(self) -> None:
-        later = reminder("Boxing", "later", datetime(2026, 7, 9, 20, 0, tzinfo=timezone.utc))
-        earlier = reminder("Boxing", "earlier", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc))
+        later = reminder("Snooker", "later", datetime(2026, 7, 9, 20, 0, tzinfo=timezone.utc))
+        earlier = reminder("Snooker", "earlier", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc))
         selected = select_reminders([later, earlier], "first")
         self.assertEqual([item.event_id for item in selected], ["earlier"])
 
-    def test_darts_first_event_per_competition_logic(self) -> None:
+    def test_darts_first_match_per_competition_is_selected(self) -> None:
         events = [
-            reminder("Darts", "a-late", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc), competition_id="a"),
             reminder("Darts", "a-early", datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc), competition_id="a"),
             reminder("Darts", "b-only", datetime(2026, 7, 9, 17, 0, tzinfo=timezone.utc), competition_id="b"),
         ]
-        selected = select_reminders(events, "darts_first_per_competition")
+        selected = select_reminders(events, "darts_first_competition_gap_and_new_date", datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ))
         self.assertEqual([item.event_id for item in selected], ["a-early", "b-only"])
+
+    def test_darts_same_competition_within_one_hour_is_not_selected(self) -> None:
+        events = [
+            reminder("Darts", "first", datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "within", datetime(2026, 7, 9, 16, 59, tzinfo=timezone.utc), competition_id="a"),
+        ]
+        selected = select_reminders(events, "darts_first_competition_gap_and_new_date", datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ))
+        self.assertEqual([item.event_id for item in selected], ["first"])
+
+    def test_darts_same_competition_gap_greater_than_one_hour_is_selected(self) -> None:
+        events = [
+            reminder("Darts", "first", datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "gap", datetime(2026, 7, 9, 17, 1, tzinfo=timezone.utc), competition_id="a"),
+        ]
+        selected = select_reminders_with_reasons(
+            events,
+            "darts_first_competition_gap_and_new_date",
+            datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ),
+        )
+        self.assertEqual([item.reminder.event_id for item in selected], ["first", "gap"])
+        self.assertEqual(selected[1].reasons, ("new_group_gap_gt_1h",))
+
+    def test_darts_same_competition_exactly_one_hour_later_is_not_selected(self) -> None:
+        events = [
+            reminder("Darts", "first", datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "exact", datetime(2026, 7, 9, 17, 0, tzinfo=timezone.utc), competition_id="a"),
+        ]
+        selected = select_reminders(events, "darts_first_competition_gap_and_new_date", datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ))
+        self.assertEqual([item.event_id for item in selected], ["first"])
+
+    def test_darts_first_match_on_new_uk_calendar_date_is_selected(self) -> None:
+        events = [
+            reminder("Darts", "scan-date", datetime(2026, 7, 9, 22, 30, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "new-date", datetime(2026, 7, 9, 23, 15, tzinfo=timezone.utc), competition_id="a"),
+        ]
+        selected = select_reminders_with_reasons(
+            events,
+            "darts_first_competition_gap_and_new_date",
+            datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ),
+        )
+        self.assertEqual([item.reminder.event_id for item in selected], ["scan-date", "new-date"])
+        self.assertEqual(selected[1].reasons, ("first_on_new_scan_date",))
+
+    def test_darts_gap_and_new_date_qualifier_is_selected_once(self) -> None:
+        events = [
+            reminder("Darts", "scan-date", datetime(2026, 7, 9, 21, 30, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "both", datetime(2026, 7, 9, 23, 30, tzinfo=timezone.utc), competition_id="a"),
+        ]
+        selected = select_reminders_with_reasons(
+            events,
+            "darts_first_competition_gap_and_new_date",
+            datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ),
+        )
+        self.assertEqual([item.reminder.event_id for item in selected], ["scan-date", "both"])
+        self.assertEqual(selected[1].reasons, ("new_group_gap_gt_1h", "first_on_new_scan_date"))
+
+    def test_darts_multiple_competitions_are_handled_independently(self) -> None:
+        events = [
+            reminder("Darts", "a-first", datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "a-skip", datetime(2026, 7, 9, 16, 30, tzinfo=timezone.utc), competition_id="a"),
+            reminder("Darts", "b-first", datetime(2026, 7, 9, 16, 45, tzinfo=timezone.utc), competition_id="b"),
+        ]
+        selected = select_reminders(events, "darts_first_competition_gap_and_new_date", datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ))
+        self.assertEqual([item.event_id for item in selected], ["a-first", "b-first"])
+
+    def test_boxing_first_fight_is_selected(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "second", datetime(2026, 7, 9, 18, 30, tzinfo=timezone.utc)),
+        ]
+        selected = select_reminders_with_reasons(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.reminder.event_id for item in selected], ["first"])
+        self.assertEqual(selected[0].reasons, ("first_boxing_fight",))
+
+    def test_boxing_fight_within_two_hours_is_not_selected(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "within", datetime(2026, 7, 9, 19, 59, tzinfo=timezone.utc)),
+        ]
+        selected = select_reminders(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.event_id for item in selected], ["first"])
+
+    def test_boxing_fight_gap_greater_than_two_hours_is_selected(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "gap", datetime(2026, 7, 9, 20, 1, tzinfo=timezone.utc)),
+        ]
+        selected = select_reminders_with_reasons(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.reminder.event_id for item in selected], ["first", "gap"])
+        self.assertEqual(selected[1].reasons, ("new_boxing_batch_gap_gt_2h",))
+
+    def test_boxing_fight_exactly_two_hours_later_is_not_selected(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "exact", datetime(2026, 7, 9, 20, 0, tzinfo=timezone.utc)),
+        ]
+        selected = select_reminders(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.event_id for item in selected], ["first"])
+
+    def test_boxing_multiple_new_batches_are_selected(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "skip", datetime(2026, 7, 9, 18, 30, tzinfo=timezone.utc)),
+            reminder("Boxing", "second-batch", datetime(2026, 7, 9, 21, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "third-batch", datetime(2026, 7, 9, 23, 30, tzinfo=timezone.utc)),
+        ]
+        selected = select_reminders(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.event_id for item in selected], ["first", "second-batch", "third-batch"])
+
+    def test_boxing_dedupe_prevents_duplicate_selection(self) -> None:
+        fights = [
+            reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            reminder("Boxing", "first", datetime(2026, 7, 9, 21, 0, tzinfo=timezone.utc), market_id="second-market"),
+        ]
+        selected = select_reminders_with_reasons(fights, "boxing_first_and_gap_batches")
+        self.assertEqual([item.reminder.event_id for item in selected], ["first"])
+        self.assertEqual(len(selected), 1)
+
+    def test_all_event_sports_still_select_all_events(self) -> None:
+        for sport in ("American Football", "Gaelic Games", "Rugby League", "Rugby Union"):
+            events = [
+                reminder(sport, f"{sport}-1", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+                reminder(sport, f"{sport}-2", datetime(2026, 7, 9, 19, 0, tzinfo=timezone.utc)),
+            ]
+            selected = select_reminders(events, "all")
+            self.assertEqual([item.event_id for item in selected], [f"{sport}-1", f"{sport}-2"])
+
+    def test_mma_and_snooker_still_select_first_event_only(self) -> None:
+        for sport in ("Mixed Martial Arts", "Snooker"):
+            events = [
+                reminder(sport, f"{sport}-late", datetime(2026, 7, 9, 20, 0, tzinfo=timezone.utc)),
+                reminder(sport, f"{sport}-early", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            ]
+            selected = select_reminders(events, "first")
+            self.assertEqual([item.event_id for item in selected], [f"{sport}-early"])
 
     def test_duplicate_key_generation(self) -> None:
         item = reminder("Snooker", "123", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
