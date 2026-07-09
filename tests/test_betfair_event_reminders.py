@@ -4,6 +4,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
+import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +17,13 @@ from Betfair_Event_Reminders import (  # noqa: E402
     build_scan_window,
     dedupe_events,
     duplicate_key,
+    load_config,
+    missing_config_message,
     reminder_time,
+    resolve_config_path,
     select_reminders,
     slack_bucket_warnings,
+    ConfigMissing,
 )
 
 
@@ -91,6 +97,19 @@ class BetfairEventReminderTests(unittest.TestCase):
         warnings = slack_bucket_warnings([1783605300] * 31)
         self.assertEqual(len(warnings), 1)
         self.assertIn("31/30", warnings[0])
+
+    def test_config_resolution_order(self) -> None:
+        with patch.dict("os.environ", {"BETFAIR_EVENT_REMINDERS_CONFIG": "/tmp/ec2-config.json"}):
+            self.assertEqual(resolve_config_path("C:/explicit/config.json"), Path("C:/explicit/config.json"))
+            self.assertEqual(resolve_config_path(), Path("/tmp/ec2-config.json"))
+
+    def test_missing_config_does_not_create_real_placeholder(self) -> None:
+        missing_path = ROOT / "runtime" / "output" / f"missing-{uuid.uuid4()}.json"
+        with self.assertRaises(ConfigMissing) as context:
+            load_config(missing_path)
+        self.assertFalse(missing_path.exists())
+        self.assertIn("Do not commit the real config to Git.", str(context.exception))
+        self.assertEqual(str(context.exception), missing_config_message(missing_path))
 
 
 if __name__ == "__main__":
