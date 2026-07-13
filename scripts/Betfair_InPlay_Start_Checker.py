@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import sys
 import time
 import traceback
 import uuid
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -119,6 +121,21 @@ ACTIONABLE_FINAL_RESULTS = ("failed", "suppressed_unknown", "suppressed_ambiguou
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_BUSY_TIMEOUT_SECONDS * 1000
 DB_WRITE_RETRY_DELAYS = (0.2, 0.5, 1.0, 2.0)
+FLASHSCORE_TIMING_SCHEMA_COLUMNS = {
+    "flashscore_first_seen_at",
+    "flashscore_first_seen_live_at",
+    "flashscore_live_event_key",
+    "flashscore_detected_live_at",
+    "betfair_not_inplay_confirmed_at",
+    "candidate_first_seen_at",
+    "pending_verification_at",
+    "verify_after",
+    "alert_delay_seconds",
+    "overdue_threshold_seconds",
+    "slack_sent_at",
+    "overdue_by_seconds",
+    "overdue_by_display",
+}
 
 
 load_dotenv(PROJECT_ROOT / ".env")
@@ -971,6 +988,24 @@ def open_db_readonly(path: Path = STATE_DB_PATH) -> sqlite3.Connection | None:
     return connection
 
 
+def migrate_existing_db_if_present(path: Path = STATE_DB_PATH) -> bool:
+    if not path.exists():
+        return True
+    connection = None
+    try:
+        connection = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+        connection.row_factory = sqlite3.Row
+        configure_sqlite_connection(connection)
+        init_db(connection)
+        return True
+    except sqlite3.Error as exc:
+        log(f"ERROR: SQLite migration failed for {path}: {exc}")
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def init_db(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
@@ -1172,6 +1207,7 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, colum
     columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+        log(f"SQLite migration: added {column} to {table}")
 
 
 def db_log(
@@ -6372,6 +6408,103 @@ def run_self_test() -> int:
     assert "Flashscore first seen live:" in flashscore_message
     assert "Overdue by: 5m 18s" in flashscore_message
 
+    def state_columns(connection: sqlite3.Connection) -> set[str]:
+        return {str(row["name"]) for row in connection.execute("PRAGMA table_info(inplay_alert_state)").fetchall()}
+
+    new_schema_db = sqlite3.connect(":memory:")
+    new_schema_db.row_factory = sqlite3.Row
+    init_db(new_schema_db)
+    assert FLASHSCORE_TIMING_SCHEMA_COLUMNS <= state_columns(new_schema_db)
+    new_schema_db.close()
+
+    old_schema_connection = sqlite3.connect(":memory:")
+    old_schema_connection.row_factory = sqlite3.Row
+    old_schema_connection.execute(
+        """
+        CREATE TABLE inplay_alert_state (
+            event_id TEXT PRIMARY KEY,
+            market_id TEXT,
+            sport_name TEXT,
+            competition_name TEXT,
+            event_name TEXT,
+            trigger_source TEXT,
+            scheduled_start_utc TEXT,
+            scheduled_start_uk TEXT,
+            first_flagged_at TEXT,
+            alert_sent_at TEXT,
+            last_seen_status TEXT,
+            last_seen_inplay INTEGER,
+            recovered_at TEXT,
+            last_checked_at TEXT,
+            flashscore_first_seen_live_at TEXT
+        )
+        """
+    )
+    old_schema_connection.execute(
+        """
+        CREATE TABLE inplay_scan_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            level TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            sport_name TEXT,
+            event_id TEXT,
+            market_id TEXT,
+            details_json TEXT
+        )
+        """
+    )
+    old_schema_connection.execute(
+        """
+        CREATE TABLE inplay_scan_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_started_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            dry_run INTEGER NOT NULL
+        )
+        """
+    )
+    old_schema_connection.execute(
+        """
+        INSERT INTO inplay_alert_state (
+            event_id, market_id, sport_name, competition_name, event_name, trigger_source,
+            scheduled_start_utc, scheduled_start_uk, first_flagged_at, last_seen_status,
+            last_seen_inplay, last_checked_at, flashscore_first_seen_live_at
+        )
+        VALUES ('old-flashscore-row', '1.old', 'Tennis', 'Old Competition', 'Old Player A v Old Player B', 'flashscore_live', ?, ?, ?, 'OPEN', 0, ?, NULL)
+        """,
+        (iso_utc(now), format_uk_datetime(now), iso_utc(now), iso_utc(now)),
+    )
+    old_schema_connection.commit()
+    init_db(old_schema_connection)
+    init_db(old_schema_connection)
+    assert FLASHSCORE_TIMING_SCHEMA_COLUMNS <= state_columns(old_schema_connection)
+    old_row = old_schema_connection.execute(
+        """
+        SELECT event_id, market_id, sport_name, event_name, flashscore_first_seen_at,
+               flashscore_first_seen_live_at, flashscore_live_event_key
+        FROM inplay_alert_state
+        WHERE event_id = 'old-flashscore-row'
+        """
+    ).fetchone()
+    assert old_row["market_id"] == "1.old"
+    assert old_row["event_name"] == "Old Player A v Old Player B"
+    assert old_row["flashscore_first_seen_at"] is None
+    assert old_row["flashscore_first_seen_live_at"] is None
+    assert old_row["flashscore_live_event_key"] is None
+    old_schema_connection.execute("UPDATE inplay_alert_state SET visible_in_hub = 0 WHERE event_id = 'old-flashscore-row'")
+    old_schema_connection.commit()
+    debug_output = io.StringIO()
+    with redirect_stdout(debug_output):
+        print_visible_table_debug(old_schema_connection, Path("old_schema_selftest.sqlite3"))
+    debug_text = debug_output.getvalue()
+    assert "visible rows: 0" in debug_text
+    assert "pending rows: 0" in debug_text
+    assert "sample visible rows:" in debug_text
+    assert "  (none)" in debug_text
+    old_schema_connection.close()
+
     smith_match = participant_confidence(("Smith M.", "Jones D."), ("Michael Smith", "Dave Jones"), "", "")
     assert smith_match.level == "High"
     assert smith_match.flashscore_surname_1 == "smith"
@@ -8070,6 +8203,7 @@ def main() -> int:
         return run_self_test()
 
     if args.debug_visible_table or args.debug_event:
+        migration_ok = migrate_existing_db_if_present()
         connection = open_db_readonly()
         if connection is None:
             print(f"Database: {STATE_DB_PATH}", flush=True)
@@ -8077,11 +8211,18 @@ def main() -> int:
             print("State database does not exist.", flush=True)
             return 0
         try:
-            if args.debug_event:
-                print_event_debug(connection, str(args.debug_event))
-            else:
-                print_visible_table_debug(connection)
-            return 0
+            try:
+                if args.debug_event:
+                    print_event_debug(connection, str(args.debug_event))
+                else:
+                    print_visible_table_debug(connection)
+                return 0 if migration_ok else 1
+            except sqlite3.Error as exc:
+                print(f"Database: {STATE_DB_PATH}", flush=True)
+                print(f"SQLite debug query failed: {exc}", flush=True)
+                if not migration_ok:
+                    print("SQLite migration did not complete; check database file permissions.", flush=True)
+                return 1
         finally:
             connection.close()
     connection = open_db()
