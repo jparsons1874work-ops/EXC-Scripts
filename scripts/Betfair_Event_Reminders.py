@@ -13,7 +13,7 @@ import sys
 import tempfile
 import traceback
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -48,6 +48,10 @@ SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
 MATCH_ODDS = "MATCH_ODDS"
+WINNER = "WINNER"
+FIRST_TRY_SCORER = "FIRST_TRY_SCORER"
+TO_WIN_THE_TOSS = "TO_WIN_THE_TOSS"
+CRICKET_TOSS_LEAD_MINUTES = 40
 CERT_FILE_NAME = "client-2048.crt"
 KEY_FILE_NAME = "client-2048.key"
 WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -69,15 +73,24 @@ SPORT_RULE_ALL = "all"
 SPORT_RULE_FIRST = "first"
 SPORT_RULE_BOXING_BATCHES = "boxing_first_and_gap_batches"
 SPORT_RULE_DARTS_GROUPS = "darts_first_competition_gap_and_new_date"
+SPORT_RULE_POLITICS_MARKETS = "politics_markets"
+SPORT_RULE_WINNER_MARKETS = "winner_markets"
+SPORT_RULE_CRICKET_TOSS = "cricket_toss"
 DARTS_GROUP_GAP = timedelta(hours=1)
 BOXING_BATCH_GAP = timedelta(hours=2)
+DEDUP_EVENT = "event"
+DEDUP_MARKET = "market"
 
 SPORTS: tuple[dict[str, str], ...] = (
     {"name": "American Football", "rule": SPORT_RULE_ALL, "emoji": ":football:"},
     {"name": "Boxing", "rule": SPORT_RULE_BOXING_BATCHES, "emoji": ":boxing_glove:"},
+    {"name": "Cricket", "rule": SPORT_RULE_CRICKET_TOSS, "emoji": ":cricket:"},
+    {"name": "Cycling", "rule": SPORT_RULE_WINNER_MARKETS, "emoji": ":bicyclist:"},
     {"name": "Darts", "rule": SPORT_RULE_DARTS_GROUPS, "emoji": ":dart:"},
     {"name": "Gaelic Games", "rule": SPORT_RULE_ALL, "emoji": ":flag-ie:"},
+    {"name": "Golf", "rule": SPORT_RULE_WINNER_MARKETS, "emoji": ":golf:"},
     {"name": "Mixed Martial Arts", "rule": SPORT_RULE_FIRST, "emoji": ":martial_arts_uniform:"},
+    {"name": "Politics", "rule": SPORT_RULE_POLITICS_MARKETS, "emoji": ":classical_building:"},
     {"name": "Rugby League", "rule": SPORT_RULE_ALL, "emoji": ":rugby_football:"},
     {"name": "Rugby Union", "rule": SPORT_RULE_ALL, "emoji": ":rugby_football:"},
     {"name": "Snooker", "rule": SPORT_RULE_FIRST, "emoji": ":8ball:"},
@@ -88,9 +101,13 @@ SPORTS: tuple[dict[str, str], ...] = (
 FALLBACK_EVENT_TYPE_IDS: dict[str, str] = {
     "American Football": "6423",
     "Boxing": "6",
+    "Cricket": "4",
+    "Cycling": "11",
     "Darts": "3503",
     "Gaelic Games": "2152880",
+    "Golf": "3",
     "Mixed Martial Arts": "26420387",
+    "Politics": "2378961",
     "Rugby League": "1477",
     "Rugby Union": "5",
     "Snooker": "6422",
@@ -136,6 +153,15 @@ class EventReminder:
     market_id: str
     market_name: str
     event_start_utc: datetime
+    market_type_code: str = ""
+    lead_minutes: int = REMINDER_LEAD_MINUTES
+    duplicate_by: str = DEDUP_EVENT
+    selection_reason: str = ""
+    slack_message_override: str = ""
+    slack_message_suffix: str = ""
+    has_first_try_scorer: bool = False
+    first_try_scorer_market_id: str = ""
+    first_try_scorer_detection_reason: str = ""
 
     @property
     def event_start_uk(self) -> datetime:
@@ -154,6 +180,11 @@ class RunStats:
     raw_markets_found: int = 0
     unique_events_found: int = 0
     reminders_selected: int = 0
+    politics_markets_selected: int = 0
+    cycling_winner_reminders_selected: int = 0
+    golf_winner_reminders_selected: int = 0
+    rugby_tip_stream_reminders: int = 0
+    cricket_toss_reminders_selected: int = 0
     scheduled_in_slack: int = 0
     skipped_duplicates: int = 0
     skipped_past_times: int = 0
@@ -177,6 +208,66 @@ def object_get(obj: Any, name: str, default: Any = "") -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
+
+
+def object_get_any(obj: Any, names: Iterable[str], default: Any = "") -> Any:
+    for name in names:
+        value = object_get(obj, name, None)
+        if value is not None and str(value).strip() != "":
+            return value
+    return default
+
+
+def catalogue_market_description(catalogue: Any) -> Any:
+    return object_get_any(catalogue, ("market_description", "marketDescription", "description"), {})
+
+
+def catalogue_market_type_code(catalogue: Any, fallback: str = "") -> str:
+    description = catalogue_market_description(catalogue)
+    value = object_get_any(
+        catalogue,
+        ("market_type_code", "marketTypeCode", "market_type", "marketType"),
+        "",
+    )
+    if not str(value or "").strip():
+        value = object_get_any(description, ("market_type_code", "marketTypeCode", "market_type", "marketType"), "")
+    return str(value or fallback or "").strip().upper()
+
+
+def catalogue_market_name(catalogue: Any) -> str:
+    return str(object_get(catalogue, "market_name", "") or object_get(catalogue, "marketName", "") or "").strip()
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", value.casefold())).strip()
+
+
+def is_winner_market(reminder: EventReminder) -> bool:
+    return reminder.market_type_code.upper() == WINNER
+
+
+def is_first_try_scorer_market(reminder: EventReminder) -> tuple[bool, str]:
+    if reminder.market_type_code.upper() == FIRST_TRY_SCORER:
+        return True, f"market_type_code={FIRST_TRY_SCORER}"
+    if normalize_text(reminder.market_name) == "first try scorer":
+        return True, "market_name=First Try Scorer"
+    return False, ""
+
+
+def is_cricket_toss_market(reminder: EventReminder) -> tuple[bool, str]:
+    if reminder.market_type_code.upper() == TO_WIN_THE_TOSS:
+        return True, f"market_type_code={TO_WIN_THE_TOSS}"
+    if normalize_text(reminder.market_name) == "to win the toss":
+        return True, "market_name=To Win the Toss"
+    return False, ""
+
+
+def cricket_event_display_name(event_name: str) -> str:
+    name = re.sub(r"\s+", " ", event_name).strip()
+    parts = re.split(r"\s+v(?:s\.?)?\s+", name, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return f"{parts[0].strip()} vs {parts[1].strip()}"
+    return name
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -223,12 +314,13 @@ def build_scan_window(now_uk: datetime | None = None, lookahead_hours: float = 2
     return ScanWindow(start_uk, end_uk, start_uk.astimezone(UTC_TZ), end_uk.astimezone(UTC_TZ))
 
 
-def reminder_time(event_start: datetime) -> datetime:
-    return event_start.astimezone(UK_TZ) - timedelta(minutes=REMINDER_LEAD_MINUTES)
+def reminder_time(event_start: datetime, lead_minutes: int = REMINDER_LEAD_MINUTES) -> datetime:
+    return event_start.astimezone(UK_TZ) - timedelta(minutes=lead_minutes)
 
 
 def duplicate_key(reminder: EventReminder, scheduled_post_epoch: int, slack_channel_id: str) -> str:
-    return f"{reminder.sport}|{reminder.event_id}|{scheduled_post_epoch}|{slack_channel_id}"
+    identity = reminder.market_id if reminder.duplicate_by == DEDUP_MARKET and reminder.market_id else reminder.event_id
+    return f"{reminder.sport}|{identity}|{scheduled_post_epoch}|{slack_channel_id}"
 
 
 def slack_bucket_epoch(post_epoch: int) -> int:
@@ -254,7 +346,8 @@ def catalogue_to_reminder(catalogue: Any, sport: str, emoji: str, fallback_event
     competition = object_get(catalogue, "competition", {})
     start_utc = parse_datetime(object_get(catalogue, "market_start_time", None))
     event_id = str(object_get(event, "id", "") or "").strip()
-    event_name = str(object_get(event, "name", "") or object_get(catalogue, "market_name", "") or "").strip()
+    market_name = catalogue_market_name(catalogue)
+    event_name = str(object_get(event, "name", "") or market_name or "").strip()
     if not event_id or start_utc is None:
         return None
     return EventReminder(
@@ -266,8 +359,9 @@ def catalogue_to_reminder(catalogue: Any, sport: str, emoji: str, fallback_event
         competition_id=str(object_get(competition, "id", "") or ""),
         competition_name=str(object_get(competition, "name", "") or ""),
         market_id=str(object_get(catalogue, "market_id", "") or ""),
-        market_name=str(object_get(catalogue, "market_name", "") or ""),
+        market_name=market_name,
         event_start_utc=start_utc,
+        market_type_code=catalogue_market_type_code(catalogue),
     )
 
 
@@ -369,6 +463,89 @@ def select_reminders(
     scan_start_uk: datetime | None = None,
 ) -> list[EventReminder]:
     return [selected.reminder for selected in select_reminders_with_reasons(events, rule, scan_start_uk)]
+
+
+def in_scan_window(reminder: EventReminder, window: ScanWindow | None) -> bool:
+    if window is None:
+        return True
+    start_utc = reminder.event_start_utc.astimezone(UTC_TZ)
+    return window.start_utc <= start_utc < window.end_utc
+
+
+def select_market_reminders(
+    markets: Iterable[EventReminder],
+    sport: str,
+    window: ScanWindow | None = None,
+) -> list[EventReminder]:
+    selected: list[EventReminder] = []
+    for market in sorted(markets, key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.market_id)):
+        if not in_scan_window(market, window):
+            continue
+        if sport == "Politics":
+            selected.append(
+                replace(
+                    market,
+                    duplicate_by=DEDUP_MARKET,
+                    selection_reason="politics_market_in_window",
+                    slack_message_override=(
+                        f"{market.emoji} {market.event_name} - {market.market_name} "
+                        f"(Market ID: {market.market_id})"
+                    ),
+                )
+            )
+        elif sport in {"Cycling", "Golf"} and is_winner_market(market):
+            selected.append(
+                replace(
+                    market,
+                    duplicate_by=DEDUP_MARKET,
+                    selection_reason=f"{sport.casefold()}_winner_market",
+                )
+            )
+        elif sport == "Cricket":
+            is_toss, _reason = is_cricket_toss_market(market)
+            if is_toss:
+                selected.append(
+                    replace(
+                        market,
+                        duplicate_by=DEDUP_MARKET,
+                        lead_minutes=CRICKET_TOSS_LEAD_MINUTES,
+                        selection_reason="cricket_to_win_toss",
+                        slack_message_override=(
+                            f"{market.emoji} Suspend toss in {cricket_event_display_name(market.event_name)} "
+                            f"- Market ID: {market.market_id}"
+                        ),
+                    )
+                )
+    return selected
+
+
+def first_try_scorer_by_event(markets: Iterable[EventReminder]) -> dict[str, EventReminder]:
+    matches: dict[str, EventReminder] = {}
+    for market in sorted(markets, key=lambda item: (item.event_start_utc, item.market_id)):
+        is_match, reason = is_first_try_scorer_market(market)
+        if is_match and market.event_id not in matches:
+            matches[market.event_id] = replace(market, first_try_scorer_detection_reason=reason)
+    return matches
+
+
+def apply_rugby_first_try_flags(
+    selected: Iterable[SelectedReminder],
+    first_try_markets: dict[str, EventReminder],
+) -> list[SelectedReminder]:
+    enriched: list[SelectedReminder] = []
+    for item in selected:
+        reminder = item.reminder
+        first_try_market = first_try_markets.get(reminder.event_id)
+        if first_try_market:
+            reminder = replace(
+                reminder,
+                slack_message_suffix=" TIP with stream",
+                has_first_try_scorer=True,
+                first_try_scorer_market_id=first_try_market.market_id,
+                first_try_scorer_detection_reason=first_try_market.first_try_scorer_detection_reason,
+            )
+        enriched.append(SelectedReminder(reminder, item.reasons))
+    return enriched
 
 
 def default_json_config_path() -> Path:
@@ -620,18 +797,52 @@ def list_event_type_ids(client: APIClient, window: ScanWindow) -> dict[str, str]
     return sport_ids
 
 
-def list_market_catalogues(client: APIClient, event_type_id: str, window: ScanWindow) -> list[Any]:
-    fixture_filter = market_filter(
-        event_type_ids=[event_type_id],
-        market_type_codes=[MATCH_ODDS],
-        market_start_time={"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)},
-    )
+def list_market_catalogues(
+    client: APIClient,
+    event_type_id: str,
+    window: ScanWindow,
+    market_type_codes: Iterable[str] | None = (MATCH_ODDS,),
+) -> list[Any]:
+    filter_args: dict[str, Any] = {
+        "event_type_ids": [event_type_id],
+        "market_start_time": {"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)},
+    }
+    if market_type_codes is not None:
+        filter_args["market_type_codes"] = list(market_type_codes)
+    fixture_filter = market_filter(**filter_args)
     return client.betting.list_market_catalogue(
         filter=fixture_filter,
-        market_projection=["EVENT", "EVENT_TYPE", "COMPETITION", "MARKET_START_TIME"],
+        market_projection=["EVENT", "EVENT_TYPE", "COMPETITION", "MARKET_START_TIME", "MARKET_DESCRIPTION"],
         max_results=1000,
         sort="FIRST_TO_START",
     )
+
+
+def chunked(values: list[str], size: int) -> Iterable[list[str]]:
+    size = max(1, size)
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def list_market_catalogues_for_events(
+    client: APIClient,
+    event_ids: Iterable[str],
+    *,
+    batch_size: int = 40,
+) -> list[Any]:
+    catalogues: list[Any] = []
+    unique_event_ids = sorted({event_id for event_id in event_ids if event_id})
+    for event_id_batch in chunked(unique_event_ids, batch_size):
+        fixture_filter = market_filter(event_ids=event_id_batch)
+        catalogues.extend(
+            client.betting.list_market_catalogue(
+                filter=fixture_filter,
+                market_projection=["EVENT", "EVENT_TYPE", "COMPETITION", "MARKET_START_TIME", "MARKET_DESCRIPTION"],
+                max_results=1000,
+                sort="FIRST_TO_START",
+            )
+        )
+    return catalogues
 
 
 def load_state(path: Path = STATE_PATH) -> dict[str, Any]:
@@ -668,7 +879,9 @@ def scheduled_keys(state: dict[str, Any]) -> set[str]:
 
 
 def format_slack_text(reminder: EventReminder) -> str:
-    return f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id})"
+    if reminder.slack_message_override:
+        return reminder.slack_message_override
+    return f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}){reminder.slack_message_suffix}"
 
 
 def schedule_slack_message(config: Config, reminder: EventReminder, post_epoch: int) -> str:
@@ -700,9 +913,16 @@ def state_record(reminder: EventReminder, key: str, post_epoch: int, scheduled_m
         "competition_name": reminder.competition_name,
         "market_id": reminder.market_id,
         "market_name": reminder.market_name,
+        "market_type_code": reminder.market_type_code,
         "event_start_uk": format_uk(reminder.event_start_uk),
         "scheduled_slack_post_uk": format_uk(datetime.fromtimestamp(post_epoch, UTC_TZ)),
         "scheduled_slack_post_epoch": post_epoch,
+        "reminder_offset_minutes": reminder.lead_minutes,
+        "selection_reason": reminder.selection_reason,
+        "slack_text": format_slack_text(reminder),
+        "has_first_try_scorer": reminder.has_first_try_scorer,
+        "first_try_scorer_market_id": reminder.first_try_scorer_market_id,
+        "first_try_scorer_detection_reason": reminder.first_try_scorer_detection_reason,
         "slack_scheduled_message_id": scheduled_message_id,
         "created_at_uk": format_uk(datetime.now(UK_TZ)),
     }
@@ -727,7 +947,6 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
 
     stats = RunStats()
     all_selected: list[EventReminder] = []
-    selection_reasons: dict[str, tuple[str, ...]] = {}
     client = build_client(config)
     try:
         sport_ids = list_event_type_ids(client, window)
@@ -736,26 +955,104 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
             stats.sports_scanned += 1
             event_type_id = sport_ids[sport_name]
             log(f"Scanning {sport_name} eventTypeId={event_type_id}")
-            raw_catalogues = list_market_catalogues(client, event_type_id, window)
+            if sport["rule"] in {SPORT_RULE_POLITICS_MARKETS, SPORT_RULE_CRICKET_TOSS}:
+                raw_catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=None)
+            elif sport["rule"] == SPORT_RULE_WINNER_MARKETS:
+                raw_catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=[WINNER])
+            else:
+                raw_catalogues = list_market_catalogues(client, event_type_id, window)
             stats.raw_markets_found += len(raw_catalogues)
             reminders = [
                 reminder
                 for catalogue in raw_catalogues
                 if (reminder := catalogue_to_reminder(catalogue, sport_name, sport["emoji"], event_type_id)) is not None
             ]
-            unique_events = dedupe_events(reminders)
-            selected_with_reasons = select_reminders_with_reasons(unique_events, sport["rule"], window.start_uk)
-            selected = [item.reminder for item in selected_with_reasons]
-            for item in selected_with_reasons:
-                if item.reasons:
-                    selection_reasons[item.reminder.event_id] = item.reasons
-                    log(
-                        f"Selected {sport_name} reminder: event_id={item.reminder.event_id} "
-                        f"reason={','.join(item.reasons)}"
+            if sport["rule"] in {SPORT_RULE_POLITICS_MARKETS, SPORT_RULE_WINNER_MARKETS, SPORT_RULE_CRICKET_TOSS}:
+                unique_events = dedupe_events(reminders)
+                selected = select_market_reminders(reminders, sport_name, window)
+                if sport_name == "Politics":
+                    stats.politics_markets_selected += len(selected)
+                elif sport_name == "Cycling":
+                    stats.cycling_winner_reminders_selected += len(selected)
+                    for market in reminders:
+                        if not is_winner_market(market):
+                            log(
+                                f"Excluded Cycling market: event_id={market.event_id} market_id={market.market_id} "
+                                f"market_type_code={market.market_type_code} market_name={market.market_name!r} "
+                                f"reason=not_winner_market"
+                            )
+                elif sport_name == "Golf":
+                    stats.golf_winner_reminders_selected += len(selected)
+                    for market in reminders:
+                        if not is_winner_market(market):
+                            log(
+                                f"Excluded Golf market: event_id={market.event_id} market_id={market.market_id} "
+                                f"market_type_code={market.market_type_code} market_name={market.market_name!r} "
+                                f"reason=not_winner_market"
+                            )
+                elif sport_name == "Cricket":
+                    stats.cricket_toss_reminders_selected += len(selected)
+                    for market in reminders:
+                        is_toss, _reason = is_cricket_toss_market(market)
+                        if not is_toss:
+                            log(
+                                f"Excluded Cricket market: event_id={market.event_id} market_id={market.market_id} "
+                                f"market_type_code={market.market_type_code} market_name={market.market_name!r} "
+                                f"reason=not_to_win_the_toss"
+                            )
+            else:
+                unique_events = dedupe_events(reminders)
+                selected_with_reasons = select_reminders_with_reasons(unique_events, sport["rule"], window.start_uk)
+                if sport_name in {"Rugby League", "Rugby Union"}:
+                    rugby_event_ids = [item.reminder.event_id for item in selected_with_reasons]
+                    first_try_catalogues = list_market_catalogues_for_events(client, rugby_event_ids)
+                    first_try_reminders = [
+                        reminder
+                        for catalogue in first_try_catalogues
+                        if (
+                            reminder := catalogue_to_reminder(catalogue, sport_name, sport["emoji"], event_type_id)
+                        )
+                        is not None
+                    ]
+                    selected_with_reasons = apply_rugby_first_try_flags(
+                        selected_with_reasons,
+                        first_try_scorer_by_event(first_try_reminders),
                     )
+                selected = []
+                for item in selected_with_reasons:
+                    reason_label = ",".join(item.reasons)
+                    selection_reason = reason_label or (
+                        "rugby_match_odds_event" if sport_name in {"Rugby League", "Rugby Union"} else ""
+                    )
+                    selected.append(replace(item.reminder, selection_reason=selection_reason))
+                if sport_name in {"Rugby League", "Rugby Union"}:
+                    stats.rugby_tip_stream_reminders += sum(1 for item in selected if item.has_first_try_scorer)
+                    for item in selected:
+                        log(
+                            f"Selected {sport_name} reminder: event_id={item.event_id} "
+                            f"has_first_try_scorer={str(item.has_first_try_scorer).lower()} "
+                            f"first_try_scorer_market_id={item.first_try_scorer_market_id or 'none'} "
+                            f"detection={item.first_try_scorer_detection_reason or 'none'} "
+                            f"text={format_slack_text(item)!r} reason={item.selection_reason}"
+                        )
+                else:
+                    for item in selected:
+                        if item.selection_reason:
+                            log(
+                                f"Selected {sport_name} reminder: event_id={item.event_id} "
+                                f"reason={item.selection_reason}"
+                            )
             stats.unique_events_found += len(unique_events)
             stats.reminders_selected += len(selected)
             all_selected.extend(selected)
+            for item in selected:
+                log(
+                    f"Selected {sport_name}: event_name={item.event_name!r} event_id={item.event_id} "
+                    f"market_name={item.market_name!r} market_type_code={item.market_type_code} "
+                    f"market_id={item.market_id} start={format_uk(item.event_start_uk)} "
+                    f"reminder={format_uk(reminder_time(item.event_start_uk, item.lead_minutes))} "
+                    f"offset_minutes={item.lead_minutes} reason={item.selection_reason or 'selected'}"
+                )
             log(
                 f"{sport_name}: raw markets={len(raw_catalogues)}, "
                 f"unique events={len(unique_events)}, selected reminders={len(selected)}"
@@ -766,7 +1063,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
         except Exception:
             pass
 
-    post_epochs = [int(reminder_time(item.event_start_uk).timestamp()) for item in all_selected]
+    post_epochs = [int(reminder_time(item.event_start_uk, item.lead_minutes).timestamp()) for item in all_selected]
     for warning in slack_bucket_warnings(post_epochs):
         log(warning)
 
@@ -777,15 +1074,13 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
 
     now_uk = datetime.now(UK_TZ)
     for reminder in all_selected:
-        post_time_uk = reminder_time(reminder.event_start_uk)
+        post_time_uk = reminder_time(reminder.event_start_uk, reminder.lead_minutes)
         post_epoch = int(post_time_uk.timestamp())
-        readable_remind = (
-            f"/remind {config.slack_channel_name} {format_slack_text(reminder)} "
-            f"at {post_time_uk.strftime('%H:%M')}"
+        reason_suffix = f" reason={reminder.selection_reason}" if reminder.selection_reason else ""
+        log(
+            f"Reminder candidate: channel={config.slack_channel_name} post_at={format_uk(post_time_uk)} "
+            f"text={format_slack_text(reminder)!r}{reason_suffix}"
         )
-        reason_label = ",".join(selection_reasons.get(reminder.event_id, ()))
-        reason_suffix = f" reason={reason_label}" if reason_label else ""
-        log(f"Reminder candidate: {readable_remind}{reason_suffix}")
         if post_time_uk <= now_uk:
             stats.skipped_past_times += 1
             log(f"SKIP time in past: {reminder.sport} {reminder.event_name} post_at={format_uk(post_time_uk)}")
@@ -827,6 +1122,11 @@ def print_summary(window: ScanWindow, stats: RunStats) -> None:
         f"Raw markets found: {stats.raw_markets_found}",
         f"Unique events found: {stats.unique_events_found}",
         f"Reminders selected: {stats.reminders_selected}",
+        f"Politics markets selected: {stats.politics_markets_selected}",
+        f"Cycling winner reminders selected: {stats.cycling_winner_reminders_selected}",
+        f"Golf winner reminders selected: {stats.golf_winner_reminders_selected}",
+        f"Rugby reminders with TIP with stream: {stats.rugby_tip_stream_reminders}",
+        f"Cricket toss reminders selected: {stats.cricket_toss_reminders_selected}",
         f"Scheduled in Slack: {stats.scheduled_in_slack}",
         f"Skipped duplicates: {stats.skipped_duplicates}",
         f"Skipped past times: {stats.skipped_past_times}",

@@ -26,6 +26,7 @@ from Betfair_Event_Reminders import (  # noqa: E402
     resolve_config_path,
     resolve_config_source,
     select_reminders,
+    select_market_reminders,
     select_reminders_with_reasons,
     slack_bucket_warnings,
     ConfigMissing,
@@ -42,18 +43,23 @@ def reminder(
     competition_id: str = "",
     competition_name: str = "",
     market_id: str = "",
+    market_name: str = "Match Odds",
+    market_type_code: str = "MATCH_ODDS",
+    event_name: str | None = None,
+    emoji: str = ":test:",
 ) -> EventReminder:
     return EventReminder(
         sport=sport,
-        emoji=":test:",
+        emoji=emoji,
         event_type_id="1",
         event_id=event_id,
-        event_name=f"Event {event_id}",
+        event_name=event_name or f"Event {event_id}",
         competition_id=competition_id,
         competition_name=competition_name,
         market_id=market_id or f"market-{event_id}",
-        market_name="Match Odds",
+        market_name=market_name,
         event_start_utc=start_utc,
+        market_type_code=market_type_code,
     )
 
 
@@ -233,6 +239,185 @@ class BetfairEventReminderTests(unittest.TestCase):
     def test_duplicate_key_generation(self) -> None:
         item = reminder("Snooker", "123", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
         self.assertEqual(duplicate_key(item, 1783605300, "C123"), "Snooker|123|1783605300|C123")
+
+    def test_politics_market_inside_window_is_selected(self) -> None:
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        item = reminder(
+            "Politics",
+            "event-1",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            market_id="1.pol",
+            market_name="Next Prime Minister",
+            emoji=":classical_building:",
+        )
+        selected = select_market_reminders([item], "Politics", window)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].selection_reason, "politics_market_in_window")
+
+    def test_politics_multiple_markets_under_one_event_are_each_selected(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        markets = [
+            reminder("Politics", "event-1", start, market_id="1.pol-a", market_name="Seat A"),
+            reminder("Politics", "event-1", start, market_id="1.pol-b", market_name="Seat B"),
+        ]
+        selected = select_market_reminders(markets, "Politics")
+        self.assertEqual([item.market_id for item in selected], ["1.pol-a", "1.pol-b"])
+
+    def test_politics_market_outside_window_is_excluded(self) -> None:
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        item = reminder("Politics", "event-1", datetime(2026, 7, 10, 7, 1, tzinfo=UK_TZ))
+        self.assertEqual(select_market_reminders([item], "Politics", window), [])
+
+    def test_politics_reminder_is_five_minutes_before_market_start_and_dedupes_by_market_id(self) -> None:
+        item = select_market_reminders(
+            [
+                reminder(
+                    "Politics",
+                    "event-1",
+                    datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+                    market_id="1.pol",
+                    market_name="Next Prime Minister",
+                )
+            ],
+            "Politics",
+        )[0]
+        post_epoch = int(reminder_time(item.event_start_utc, item.lead_minutes).timestamp())
+        self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:55 BST")
+        self.assertEqual(duplicate_key(item, post_epoch, "C123"), "Politics|1.pol|1783605300|C123")
+
+    def test_cycling_winner_market_is_selected_and_side_market_excluded(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        selected = select_market_reminders(
+            [
+                reminder("Cycling", "event-1", start, market_id="1.cyc-win", market_type_code="WINNER"),
+                reminder("Cycling", "event-1", start, market_id="1.cyc-h2h", market_type_code="HEAD_TO_HEAD"),
+            ],
+            "Cycling",
+        )
+        self.assertEqual([item.market_id for item in selected], ["1.cyc-win"])
+        self.assertEqual(selected[0].selection_reason, "cycling_winner_market")
+
+    def test_cycling_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
+        item = select_market_reminders(
+            [reminder("Cycling", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.cyc", market_type_code="WINNER")],
+            "Cycling",
+        )[0]
+        post_epoch = int(reminder_time(item.event_start_utc, item.lead_minutes).timestamp())
+        self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:55 BST")
+        self.assertEqual(duplicate_key(item, post_epoch, "C123"), "Cycling|1.cyc|1783605300|C123")
+
+    def test_golf_winner_market_is_selected_and_top_five_excluded(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        selected = select_market_reminders(
+            [
+                reminder("Golf", "event-1", start, market_id="1.golf-win", market_type_code="WINNER"),
+                reminder("Golf", "event-1", start, market_id="1.golf-top5", market_type_code="TOP_5", market_name="Top 5 Finish"),
+            ],
+            "Golf",
+        )
+        self.assertEqual([item.market_id for item in selected], ["1.golf-win"])
+        self.assertEqual(selected[0].selection_reason, "golf_winner_market")
+
+    def test_golf_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
+        item = select_market_reminders(
+            [reminder("Golf", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.golf", market_type_code="WINNER")],
+            "Golf",
+        )[0]
+        post_epoch = int(reminder_time(item.event_start_utc, item.lead_minutes).timestamp())
+        self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:55 BST")
+        self.assertEqual(duplicate_key(item, post_epoch, "C123"), "Golf|1.golf|1783605300|C123")
+
+    def test_rugby_league_first_try_scorer_appends_tip_with_stream(self) -> None:
+        selected = [reminders.SelectedReminder(reminder("Rugby League", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)))]
+        first_try = reminders.first_try_scorer_by_event(
+            [reminder("Rugby League", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.fts", market_type_code="FIRST_TRY_SCORER")]
+        )
+        enriched = reminders.apply_rugby_first_try_flags(selected, first_try)[0].reminder
+        self.assertTrue(enriched.has_first_try_scorer)
+        self.assertTrue(reminders.format_slack_text(enriched).endswith(" TIP with stream"))
+
+    def test_rugby_union_first_try_scorer_name_fallback_appends_tip_with_stream(self) -> None:
+        selected = [reminders.SelectedReminder(reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)))]
+        first_try = reminders.first_try_scorer_by_event(
+            [reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.fts", market_name="First Try Scorer")]
+        )
+        enriched = reminders.apply_rugby_first_try_flags(selected, first_try)[0].reminder
+        self.assertTrue(enriched.has_first_try_scorer)
+        self.assertTrue(reminders.format_slack_text(enriched).endswith(" TIP with stream"))
+
+    def test_rugby_without_first_try_scorer_keeps_original_message(self) -> None:
+        selected = [reminders.SelectedReminder(reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)))]
+        enriched = reminders.apply_rugby_first_try_flags(selected, {})[0].reminder
+        self.assertFalse(enriched.has_first_try_scorer)
+        self.assertNotIn("TIP with stream", reminders.format_slack_text(enriched))
+
+    def test_anytime_try_scorer_does_not_trigger_tip_with_stream_or_create_reminder(self) -> None:
+        selected = [reminders.SelectedReminder(reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)))]
+        first_try = reminders.first_try_scorer_by_event(
+            [reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.any", market_name="Anytime Try Scorer")]
+        )
+        enriched = reminders.apply_rugby_first_try_flags(selected, first_try)
+        self.assertEqual(first_try, {})
+        self.assertEqual(len(enriched), 1)
+        self.assertNotIn("TIP with stream", reminders.format_slack_text(enriched[0].reminder))
+
+    def test_batched_cached_first_try_lookup_maps_per_event(self) -> None:
+        first_try = reminders.first_try_scorer_by_event(
+            [
+                reminder("Rugby Union", "event-2", datetime(2026, 7, 9, 15, 0, tzinfo=timezone.utc), market_id="1.fts-2", market_name="First Try Scorer"),
+                reminder("Rugby Union", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.any", market_name="Anytime Try Scorer"),
+            ]
+        )
+        self.assertEqual(set(first_try), {"event-2"})
+        self.assertEqual(first_try["event-2"].market_id, "1.fts-2")
+
+    def test_cricket_exact_to_win_the_toss_market_is_selected_and_others_excluded(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        selected = select_market_reminders(
+            [
+                reminder("Cricket", "event-1", start, market_id="1.toss", market_name="To Win the Toss"),
+                reminder("Cricket", "event-1", start, market_id="1.match", market_name="Match Odds", market_type_code="MATCH_ODDS"),
+            ],
+            "Cricket",
+        )
+        self.assertEqual([item.market_id for item in selected], ["1.toss"])
+        self.assertEqual(selected[0].selection_reason, "cricket_to_win_toss")
+
+    def test_cricket_toss_reminder_is_forty_minutes_before_start(self) -> None:
+        item = select_market_reminders(
+            [reminder("Cricket", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.toss", market_name="To Win the Toss")],
+            "Cricket",
+        )[0]
+        self.assertEqual(item.lead_minutes, 40)
+        self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:20 BST")
+
+    def test_cricket_slack_message_uses_vs_and_market_id_not_event_id(self) -> None:
+        item = select_market_reminders(
+            [
+                reminder(
+                    "Cricket",
+                    "event-123",
+                    datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+                    market_id="213681787",
+                    market_name="To Win the Toss",
+                    event_name="Team A v Team B",
+                    emoji=":cricket:",
+                )
+            ],
+            "Cricket",
+        )[0]
+        self.assertEqual(reminders.format_slack_text(item), ":cricket: Suspend toss in Team A vs Team B - Market ID: 213681787")
+        self.assertNotIn("event-123", reminders.format_slack_text(item))
+
+    def test_cricket_toss_reminder_in_past_can_be_identified_and_dedupes_by_market_id(self) -> None:
+        item = select_market_reminders(
+            [reminder("Cricket", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.toss", market_name="To Win the Toss")],
+            "Cricket",
+        )[0]
+        post_time = reminder_time(item.event_start_utc, item.lead_minutes)
+        now_after_post = datetime(2026, 7, 9, 14, 21, tzinfo=UK_TZ)
+        self.assertLessEqual(post_time, now_after_post)
+        self.assertEqual(duplicate_key(item, int(post_time.timestamp()), "C123"), "Cricket|1.toss|1783603200|C123")
 
     def test_slack_30_per_5_minute_bucket_warning(self) -> None:
         warnings = slack_bucket_warnings([1783605300] * 31)
