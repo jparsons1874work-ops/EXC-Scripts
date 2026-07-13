@@ -303,6 +303,16 @@ def normalize_match_name(value: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
+def flashscore_live_event_key(match: FlashscoreMatch) -> str:
+    match_id = normalize_match_name(match.match_id)
+    if match_id:
+        return f"id:{match.sport_name.casefold()}:{match_id}"
+    event_date = match.detected_live_at.astimezone(UK_TZ).date().isoformat()
+    participants = "|".join(normalize_match_name(participant) for participant in match.participants)
+    competition = normalize_match_name(match.competition_name)
+    return f"fallback:{match.sport_name.casefold()}:{participants}:{competition}:{event_date}"
+
+
 def name_similarity(first: str, second: str) -> float:
     first_norm = normalize_match_name(first)
     second_norm = normalize_match_name(second)
@@ -990,7 +1000,9 @@ def init_db(connection: sqlite3.Connection) -> None:
             flashscore_competition TEXT,
             flashscore_status TEXT,
             flashscore_score TEXT,
+            flashscore_first_seen_at TEXT,
             flashscore_detected_live_at TEXT,
+            flashscore_live_event_key TEXT,
             match_confidence TEXT,
             match_reason TEXT,
             betfair_last_checked_at TEXT,
@@ -1021,11 +1033,13 @@ def init_db(connection: sqlite3.Connection) -> None:
             pending_verification_at TEXT,
             verify_after TEXT,
             alert_delay_seconds INTEGER,
+            betfair_not_inplay_confirmed_at TEXT,
             candidate_first_seen_at TEXT,
             flashscore_first_seen_live_at TEXT,
             overdue_threshold_seconds INTEGER,
             overdue_by_seconds INTEGER,
             overdue_by_display TEXT,
+            slack_sent_at TEXT,
             final_marketbook_status_raw TEXT,
             final_marketbook_inplay_raw TEXT,
             final_marketbook_inplay_parsed INTEGER,
@@ -1051,7 +1065,9 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_alert_state", "flashscore_competition", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_status", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_score", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_first_seen_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_detected_live_at", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "flashscore_live_event_key", "TEXT")
     ensure_column(connection, "inplay_alert_state", "match_confidence", "TEXT")
     ensure_column(connection, "inplay_alert_state", "match_reason", "TEXT")
     ensure_column(connection, "inplay_alert_state", "betfair_last_checked_at", "TEXT")
@@ -1082,11 +1098,13 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_alert_state", "pending_verification_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "verify_after", "TEXT")
     ensure_column(connection, "inplay_alert_state", "alert_delay_seconds", "INTEGER")
+    ensure_column(connection, "inplay_alert_state", "betfair_not_inplay_confirmed_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "candidate_first_seen_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "flashscore_first_seen_live_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "overdue_threshold_seconds", "INTEGER")
     ensure_column(connection, "inplay_alert_state", "overdue_by_seconds", "INTEGER")
     ensure_column(connection, "inplay_alert_state", "overdue_by_display", "TEXT")
+    ensure_column(connection, "inplay_alert_state", "slack_sent_at", "TEXT")
     ensure_column(connection, "inplay_alert_state", "final_marketbook_status_raw", "TEXT")
     ensure_column(connection, "inplay_alert_state", "final_marketbook_inplay_raw", "TEXT")
     ensure_column(connection, "inplay_alert_state", "final_marketbook_inplay_parsed", "INTEGER")
@@ -1219,6 +1237,70 @@ def db_log(
             except sqlite3.Error:
                 pass
             return
+
+
+def normalize_legacy_flashscore_live_anchors(connection: sqlite3.Connection) -> None:
+    try:
+        rows = connection.execute(
+            """
+            SELECT event_id, market_id, sport_name, event_name, flashscore_match_name,
+                   flashscore_first_seen_live_at, flashscore_detected_live_at,
+                   flashscore_live_event_key, final_verification_result
+            FROM inplay_alert_state
+            WHERE trigger_source = 'flashscore_live'
+              AND alert_sent_at IS NULL
+              AND COALESCE(flashscore_live_event_key, '') = ''
+              AND flashscore_first_seen_live_at IS NOT NULL
+            LIMIT 100
+            """
+        ).fetchall()
+    except sqlite3.Error as exc:
+        fallback_db_log("ERROR", "flashscore_live_anchor_migration_failed", "Could not inspect legacy Flashscore live anchors", error=str(exc))
+        return
+    for row in rows:
+        first_live_at = parse_datetime(row["flashscore_first_seen_live_at"])
+        detected_live_at = parse_datetime(row["flashscore_detected_live_at"])
+        if detected_live_at is not None and first_live_at is not None and first_live_at >= detected_live_at - timedelta(minutes=10):
+            continue
+        result = str(row["final_verification_result"] or "")
+        connection.execute(
+            """
+            UPDATE inplay_alert_state
+            SET flashscore_first_seen_live_at = NULL,
+                candidate_first_seen_at = NULL,
+                betfair_not_inplay_confirmed_at = NULL,
+                pending_verification_at = NULL,
+                verify_after = NULL,
+                final_verification_result = CASE
+                    WHEN COALESCE(final_verification_result, '') = 'pending_verification' THEN 'suppressed_unknown'
+                    ELSE final_verification_result
+                END,
+                final_verification_reason = CASE
+                    WHEN COALESCE(final_verification_result, '') = 'pending_verification' THEN 'missing_flashscore_first_seen_live_at'
+                    ELSE final_verification_reason
+                END
+            WHERE event_id = ?
+            """,
+            (row["event_id"],),
+        )
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_live_anchor_reset",
+            "Flashscore first-live anchor reset for legacy active row",
+            sport_name=str(row["sport_name"] or ""),
+            event_id=str(row["event_id"] or ""),
+            market_id=str(row["market_id"] or ""),
+            event_name=str(row["event_name"] or row["flashscore_match_name"] or ""),
+            details={
+                "previous_flashscore_first_seen_live_at": row["flashscore_first_seen_live_at"],
+                "flashscore_detected_live_at": row["flashscore_detected_live_at"],
+                "previous_final_verification_result": result,
+                "reason": "legacy row had no live-event key and an unsafe first-live anchor",
+            },
+        )
+    if rows:
+        safe_commit(connection, "normalize_legacy_flashscore_live_anchors")
 
 
 def lock_file_metadata(path: Path) -> dict[str, Any]:
@@ -1973,7 +2055,8 @@ def upsert_alert_state(
     first_flagged_at = iso_utc(now)
     existing = connection.execute(
         """
-        SELECT first_flagged_at, alert_sent_at, recovered_at, final_verification_result, final_verification_reason, flashscore_first_seen_live_at
+        SELECT first_flagged_at, alert_sent_at, recovered_at, final_verification_result, final_verification_reason,
+               flashscore_first_seen_at, flashscore_first_seen_live_at, flashscore_live_event_key
         FROM inplay_alert_state
         WHERE event_id = ?
         """,
@@ -2055,6 +2138,63 @@ def upsert_alert_state(
         ),
     )
     if flashscore_match is not None:
+        live_event_key = flashscore_live_event_key(flashscore_match)
+        existing_live_event_key = str(existing["flashscore_live_event_key"] or "") if existing else ""
+        existing_first_live_at = existing["flashscore_first_seen_live_at"] if existing else None
+        if existing_live_event_key and existing_live_event_key != live_event_key:
+            first_seen_live_value = iso_utc(flashscore_match.detected_live_at)
+            db_log(
+                connection,
+                "INFO",
+                "flashscore_live_anchor_reset",
+                "Flashscore first-live anchor reset for a new live occurrence",
+                sport_name=flashscore_match.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details={
+                    "previous_flashscore_live_event_key": existing_live_event_key,
+                    "flashscore_live_event_key": live_event_key,
+                    "previous_flashscore_first_seen_live_at": existing_first_live_at,
+                    "new_flashscore_first_seen_live_at": iso_utc(flashscore_match.detected_live_at),
+                },
+            )
+        elif existing_first_live_at:
+            first_seen_live_value = existing_first_live_at
+            db_log(
+                connection,
+                "INFO",
+                "flashscore_live_anchor_preserved",
+                "Flashscore first-live anchor preserved",
+                sport_name=flashscore_match.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details={
+                    "flashscore_live_event_key": live_event_key,
+                    "flashscore_first_seen_live_at": existing_first_live_at,
+                    "flashscore_detected_live_at": iso_utc(flashscore_match.detected_live_at),
+                },
+            )
+        else:
+            allow_new_first_live_anchor = final_verification_result not in {"confirmed_not_inplay", "suppressed_unknown"}
+            first_seen_live_value = iso_utc(flashscore_match.detected_live_at) if allow_new_first_live_anchor else None
+            if allow_new_first_live_anchor:
+                db_log(
+                    connection,
+                    "INFO",
+                    "flashscore_first_seen_live",
+                    "Flashscore match first seen in confirmed live state",
+                    sport_name=flashscore_match.sport_name,
+                    event_id=candidate.event_id,
+                    market_id=candidate.market_id,
+                    event_name=candidate.event_name,
+                    details={
+                        "flashscore_live_event_key": live_event_key,
+                        "flashscore_first_seen_live_at": first_seen_live_value,
+                        "flashscore_status": flashscore_match.status_text,
+                    },
+                )
         connection.execute(
             """
             UPDATE inplay_alert_state
@@ -2065,8 +2205,10 @@ def upsert_alert_state(
                 flashscore_competition = ?,
                 flashscore_status = ?,
                 flashscore_score = ?,
+                flashscore_first_seen_at = COALESCE(flashscore_first_seen_at, ?),
                 flashscore_detected_live_at = ?,
-                flashscore_first_seen_live_at = COALESCE(flashscore_first_seen_live_at, ?),
+                flashscore_live_event_key = ?,
+                flashscore_first_seen_live_at = ?,
                 match_confidence = ?,
                 match_reason = ?,
                 flashscore_participant_1 = ?,
@@ -2099,8 +2241,10 @@ def upsert_alert_state(
                 flashscore_match.competition_name,
                 flashscore_match.status_text,
                 flashscore_match.score,
+                existing["flashscore_first_seen_at"] if existing and existing["flashscore_first_seen_at"] else iso_utc(flashscore_match.detected_live_at),
                 iso_utc(flashscore_match.detected_live_at),
-                existing["flashscore_first_seen_live_at"] if existing and existing["flashscore_first_seen_live_at"] else iso_utc(flashscore_match.detected_live_at),
+                live_event_key,
+                first_seen_live_value,
                 match_confidence.level if match_confidence else "",
                 match_confidence.reason if match_confidence else "",
                 match_confidence.flashscore_participant_1 if match_confidence else "",
@@ -2128,8 +2272,8 @@ def upsert_alert_state(
         )
     if alert_sent_at is not None:
         connection.execute(
-            "UPDATE inplay_alert_state SET slack_alert_sent = 1, slack_error = '' WHERE event_id = ?",
-            (candidate.event_id,),
+            "UPDATE inplay_alert_state SET slack_alert_sent = 1, slack_sent_at = ?, slack_error = '' WHERE event_id = ?",
+            (iso_utc(alert_sent_at), candidate.event_id),
         )
     if trigger_source == "flashscore_live":
         visible = True
@@ -2425,12 +2569,20 @@ def record_flashscore_match_diagnostic(
 ) -> None:
     existing = connection.execute(
         """
-        SELECT first_flagged_at, alert_sent_at, recovered_at
+        SELECT first_flagged_at, alert_sent_at, recovered_at, flashscore_first_seen_at,
+               flashscore_first_seen_live_at, flashscore_live_event_key
         FROM inplay_alert_state
         WHERE event_id = ?
         """,
         (candidate.event_id,),
     ).fetchone()
+    live_event_key = flashscore_live_event_key(flashscore_match)
+    existing_live_event_key = str(existing["flashscore_live_event_key"] or "") if existing else ""
+    existing_first_live_at = existing["flashscore_first_seen_live_at"] if existing else None
+    if existing_live_event_key and existing_live_event_key != live_event_key:
+        first_seen_live_value = iso_utc(flashscore_match.detected_live_at)
+    else:
+        first_seen_live_value = existing_first_live_at or iso_utc(flashscore_match.detected_live_at)
     connection.execute(
         """
         INSERT INTO inplay_alert_state (
@@ -2533,6 +2685,8 @@ def record_flashscore_match_diagnostic(
             betfair_side_2_players = ?,
             betfair_side_1_surnames = ?,
             betfair_side_2_surnames = ?,
+            flashscore_first_seen_at = COALESCE(flashscore_first_seen_at, ?),
+            flashscore_live_event_key = ?,
             flashscore_first_seen_live_at = COALESCE(flashscore_first_seen_live_at, ?),
             visible_in_hub = ?,
             run_id = COALESCE(run_id, ?),
@@ -2554,7 +2708,9 @@ def record_flashscore_match_diagnostic(
             confidence.betfair_side_2_players,
             confidence.betfair_side_1_surnames,
             confidence.betfair_side_2_surnames,
-            iso_utc(flashscore_match.detected_live_at),
+            existing["flashscore_first_seen_at"] if existing and existing["flashscore_first_seen_at"] else iso_utc(flashscore_match.detected_live_at),
+            live_event_key,
+            first_seen_live_value,
             1 if "ambiguous" in reason.casefold() else 0,
             CURRENT_SCAN_RUN_ID,
             CURRENT_SCAN_RUN_ID,
@@ -2752,7 +2908,8 @@ def mark_candidate_pending(
 ) -> None:
     existing = connection.execute(
         """
-        SELECT candidate_first_seen_at, flashscore_first_seen_live_at, verify_after, final_verification_result, final_verification_reason
+        SELECT candidate_first_seen_at, flashscore_first_seen_live_at, betfair_not_inplay_confirmed_at,
+               verify_after, final_verification_result, final_verification_reason
         FROM inplay_alert_state
         WHERE event_id = ?
         """,
@@ -2760,11 +2917,7 @@ def mark_candidate_pending(
     ).fetchone()
     first_seen_at = parse_datetime(existing["candidate_first_seen_at"]) if existing else None
     if pending.trigger_source == "flashscore_live":
-        flashscore_first_seen_at = parse_datetime(existing["flashscore_first_seen_live_at"]) if existing else None
-        if flashscore_first_seen_at is not None:
-            first_seen_at = flashscore_first_seen_at
-        elif pending.flashscore_match is not None:
-            first_seen_at = pending.flashscore_match.detected_live_at
+        first_seen_at = parse_datetime(existing["betfair_not_inplay_confirmed_at"]) if existing else None
     if first_seen_at is None:
         first_seen_at = now
     verify_after = first_seen_at + timedelta(seconds=max(alert_delay_seconds, 0))
@@ -2773,6 +2926,7 @@ def mark_candidate_pending(
     if pending.trigger_source != "flashscore_live" and pending.candidate.scheduled_start_utc is not None:
         overdue_by_seconds = max(0, int((now - pending.candidate.scheduled_start_utc).total_seconds()))
         overdue_by_display = format_duration(timedelta(seconds=overdue_by_seconds))
+    flashscore_live_anchor = pending.flashscore_match.detected_live_at if pending.flashscore_match is not None else None
     existing_verify_after = parse_datetime(existing["verify_after"]) if existing else None
     if pending.trigger_source == "flashscore_live" and existing_verify_after and existing_verify_after > now:
         verify_after = existing_verify_after
@@ -2808,6 +2962,10 @@ def mark_candidate_pending(
         SET pending_verification_at = COALESCE(pending_verification_at, ?),
             verify_after = ?,
             alert_delay_seconds = ?,
+            betfair_not_inplay_confirmed_at = CASE
+                WHEN ? = 'flashscore_live' THEN COALESCE(betfair_not_inplay_confirmed_at, ?)
+                ELSE betfair_not_inplay_confirmed_at
+            END,
             candidate_first_seen_at = COALESCE(candidate_first_seen_at, ?),
             overdue_threshold_seconds = COALESCE(?, overdue_threshold_seconds),
             overdue_by_seconds = COALESCE(?, overdue_by_seconds),
@@ -2822,12 +2980,14 @@ def mark_candidate_pending(
             iso_utc(now),
             iso_utc(verify_after),
             alert_delay_seconds,
+            pending.trigger_source,
+            iso_utc(first_seen_at),
             iso_utc(first_seen_at),
             overdue_threshold_seconds,
             overdue_by_seconds,
             overdue_by_display,
             pending.trigger_source,
-            iso_utc(first_seen_at),
+            iso_utc(flashscore_live_anchor),
             pending.candidate.event_id,
         ),
     )
@@ -2858,6 +3018,7 @@ def mark_candidate_pending(
             "overdue_threshold_seconds": overdue_threshold_seconds,
             "alert_delay_seconds": alert_delay_seconds,
             "candidate_first_seen_at": iso_utc(first_seen_at),
+            "betfair_not_inplay_confirmed_at": iso_utc(first_seen_at) if pending.trigger_source == "flashscore_live" else "",
             "overdue_by_display": overdue_by_display,
         },
     )
@@ -2876,6 +3037,8 @@ def mark_candidate_pending(
                 "verify_after": iso_utc(verify_after),
                 "alert_delay_seconds": alert_delay_seconds,
                 "candidate_first_seen_at": iso_utc(first_seen_at),
+                "betfair_not_inplay_confirmed_at": iso_utc(first_seen_at),
+                "flashscore_first_seen_live_at": existing["flashscore_first_seen_live_at"] if existing else "",
             },
         )
 
@@ -2891,7 +3054,6 @@ def send_verified_alert(
 ) -> None:
     candidate = pending.candidate
     alert_now = utc_now()
-    stats.flags_found += 1
     if pending.trigger_source == "flashscore_live" and pending.flashscore_match and pending.match_confidence:
         first_seen_live_at = flashscore_first_seen_live_at_for_event(
             connection,
@@ -2899,6 +3061,36 @@ def send_verified_alert(
             pending.flashscore_match,
             alert_now,
         )
+        if first_seen_live_at is None:
+            upsert_alert_state(
+                connection,
+                candidate,
+                final_book,
+                now=alert_now,
+                trigger_source=pending.trigger_source,
+                flashscore_match=pending.flashscore_match,
+                match_confidence=pending.match_confidence,
+                final_verification_at=alert_now,
+                final_verification_result="suppressed_unknown",
+                final_verification_reason="missing_flashscore_first_seen_live_at",
+            )
+            db_log(
+                connection,
+                "ERROR",
+                "missing_flashscore_first_seen_live_at",
+                "Flashscore alert suppressed because first-live anchor is missing",
+                sport_name=candidate.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details={
+                    "flashscore_match_id": pending.flashscore_match.match_id,
+                    "flashscore_match_name": pending.flashscore_match.match_name,
+                    "final_verification_result": "suppressed_unknown",
+                    "final_verification_reason": "missing_flashscore_first_seen_live_at",
+                },
+            )
+            return
         _overdue_seconds, overdue_display = update_flashscore_overdue_fields(
             connection,
             candidate.event_id,
@@ -2929,6 +3121,7 @@ def send_verified_alert(
             },
         )
     else:
+        stats.flags_found += 1
         _overdue_seconds, overdue_display = update_betfair_overdue_fields(connection, candidate, alert_now)
         message = build_slack_message(candidate, final_book, alert_now)
         db_log(
@@ -2946,6 +3139,8 @@ def send_verified_alert(
                 "trigger_source": pending.trigger_source,
             },
         )
+    if pending.trigger_source == "flashscore_live":
+        stats.flags_found += 1
 
     print("", flush=True)
     print(message, flush=True)
@@ -3022,8 +3217,29 @@ def send_verified_alert(
         event_id=candidate.event_id,
         market_id=candidate.market_id,
         event_name=candidate.event_name,
-        details={"trigger_source": pending.trigger_source},
+        details={"trigger_source": pending.trigger_source, "slack_sent_at": iso_utc(sent_at)},
     )
+    if pending.trigger_source == "flashscore_live":
+        row = connection.execute(
+            "SELECT flashscore_first_seen_live_at, overdue_by_seconds, overdue_by_display FROM inplay_alert_state WHERE event_id = ?",
+            (candidate.event_id,),
+        ).fetchone()
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_alert_sent",
+            "Flashscore Slack alert sent",
+            sport_name=candidate.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={
+                "slack_sent_at": iso_utc(sent_at),
+                "flashscore_first_seen_live_at": row["flashscore_first_seen_live_at"] if row else "",
+                "overdue_by_seconds": row["overdue_by_seconds"] if row else None,
+                "overdue_by_display": row["overdue_by_display"] if row else "",
+            },
+        )
 
 
 def flashscore_final_diagnostic_details(
@@ -3044,6 +3260,8 @@ def flashscore_final_diagnostic_details(
         "flashscore_match_name": flashscore_match.match_name if flashscore_match else "",
         "flashscore_status": flashscore_match.status_text if flashscore_match else "",
         "flashscore_score": flashscore_match.score if flashscore_match else "",
+        "flashscore_live_event_key": flashscore_live_event_key(flashscore_match) if flashscore_match else "",
+        "flashscore_detected_live_at": iso_utc(flashscore_match.detected_live_at) if flashscore_match else "",
         "flashscore_participant_1": confidence.flashscore_participant_1 if confidence else "",
         "flashscore_participant_2": confidence.flashscore_participant_2 if confidence else "",
         "betfair_participant_1": confidence.betfair_participant_1 if confidence else "",
@@ -3181,6 +3399,18 @@ def record_flashscore_no_slack(
         event_name=pending.candidate.event_name,
         details={"decision": decision, "reason": reason},
     )
+    if event_type != "flashscore_alert_suppressed":
+        db_log(
+            connection,
+            level,
+            "flashscore_alert_suppressed",
+            "Flashscore alert suppressed",
+            sport_name=pending.candidate.sport_name,
+            event_id=pending.candidate.event_id,
+            market_id=pending.candidate.market_id,
+            event_name=pending.candidate.event_name,
+            details={"decision": decision, "reason": reason, "result": result},
+        )
     if result == "suppressed_flashscore_not_live":
         connection.execute(
             """
@@ -3349,6 +3579,17 @@ def process_flashscore_final_pending(
             message="Flashscore final decision: already alerted",
             decision="suppress_ambiguous",
             api_called_at=api_called_at,
+        )
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_final_verification_inplay",
+            "Flashscore final verification found Betfair in-play",
+            sport_name=pending.candidate.sport_name,
+            event_id=pending.candidate.event_id,
+            market_id=pending.candidate.market_id,
+            event_name=pending.candidate.event_name,
+            details={"status": exact_snapshot.status, "inplay": exact_snapshot.inplay},
         )
         return
 
@@ -3587,13 +3828,46 @@ def process_pending_alert_group(
         details={"started_at": iso_utc(started_at), "completed_at": iso_utc(utc_now())},
     )
 
+    if flashscore_group:
+        still_live_pending: list[PendingAlert] = []
+        for pending in pending_alerts:
+            db_log(
+                connection,
+                "INFO",
+                "flashscore_final_verification_started",
+                "Flashscore final verification started",
+                sport_name=pending.candidate.sport_name,
+                event_id=pending.candidate.event_id,
+                market_id=pending.candidate.market_id,
+                event_name=pending.candidate.event_name,
+                details={"verify_after": iso_utc(utc_now()), "step": "flashscore_still_live_recheck"},
+            )
+            if flashscore_pending_still_live(connection, pending, args):
+                still_live_pending.append(pending)
+                continue
+            record_flashscore_no_slack(
+                connection,
+                pending,
+                None,
+                now=utc_now(),
+                result="suppressed_flashscore_not_live",
+                reason="Flashscore match no longer live at verification time",
+                event_type="flashscore_pending_suppressed_not_live_at_verification",
+                message="Flashscore pending candidate suppressed because match is no longer live",
+                decision="suppress_flashscore_not_live",
+                api_called_at=utc_now(),
+            )
+        pending_alerts = still_live_pending
+        if not pending_alerts:
+            return
+
     already_alerted = alerted_event_ids(connection)
     by_market_id = {pending.candidate.market_id: pending for pending in pending_alerts if pending.candidate.market_id}
     for batch in chunked(list(by_market_id), getattr(args, "market_book_batch_size", DEFAULT_MARKET_BOOK_BATCH_SIZE)):
         db_log(
             connection,
             "INFO",
-            "flashscore_delayed_verification_started" if flashscore_group else "final_verification_started",
+            "flashscore_final_verification_started" if flashscore_group else "final_verification_started",
             "Flashscore delayed verification started" if flashscore_group else "Delayed final verification started",
             details={"market_ids": batch},
         )
@@ -3931,7 +4205,7 @@ def pending_alert_from_state_row(row: sqlite3.Row) -> PendingAlert:
             score=str(row["flashscore_score"] or ""),
             match_id=str(row["flashscore_match_id"] or ""),
             url=str(row["flashscore_url"] or ""),
-            detected_live_at=parse_datetime(row["flashscore_detected_live_at"]) or parse_datetime(row["flashscore_first_seen_live_at"]) or parse_datetime(row["candidate_first_seen_at"]) or utc_now(),
+            detected_live_at=parse_datetime(row["flashscore_detected_live_at"]) or parse_datetime(row["flashscore_first_seen_live_at"]) or utc_now(),
             participants=(str(row["flashscore_participant_1"] or ""), str(row["flashscore_participant_2"] or "")),
             match_format=str(row["match_format"] or "singles"),
             side_1_player_1=str(row["side_1_player_1"] or ""),
@@ -4414,8 +4688,10 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
                visible_in_hub, last_seen_run_id, verify_after, slack_alert_sent, alert_sent_at,
                final_verification_result, final_verification_reason, hidden_reason,
                betfair_last_seen_status, last_seen_status, betfair_last_seen_inplay, last_seen_inplay,
-               match_confidence, match_score, match_reason, flashscore_first_seen_live_at,
-               candidate_first_seen_at, overdue_by_seconds, overdue_by_display, slack_error
+               match_confidence, match_score, match_reason, flashscore_match_id,
+               flashscore_first_seen_at, flashscore_first_seen_live_at, flashscore_detected_live_at,
+               flashscore_live_event_key, betfair_not_inplay_confirmed_at,
+               candidate_first_seen_at, overdue_by_seconds, overdue_by_display, slack_sent_at, slack_error
         FROM inplay_alert_state
         WHERE COALESCE(visible_in_hub, 1) = 1
         ORDER BY COALESCE(last_seen_in_scan_at, last_checked_at, first_flagged_at, event_name, flashscore_match_name) DESC
@@ -4435,6 +4711,8 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
             f"market_type_code={row['market_type_code'] or ''} | "
             f"market_name={row['market_name'] or ''} | "
             f"scheduled_start_utc={row['scheduled_start_utc'] or ''} | "
+            f"flashscore_event_key={row['flashscore_live_event_key'] or row['flashscore_match_id'] or ''} | "
+            f"flashscore_current_status={row['flashscore_status'] or ''} | "
             f"visible={row['visible_in_hub']} | "
             f"why_visible={visible_row_reason(row, latest_run_id, now)} | "
             f"last_seen_run_id={row['last_seen_run_id'] or ''} | "
@@ -4442,8 +4720,12 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
             f"verify_after={row['verify_after'] or ''} | "
             f"overdue_threshold_seconds={row['overdue_threshold_seconds'] if row['overdue_threshold_seconds'] is not None else ''} | "
             f"alert_delay_seconds={row['alert_delay_seconds'] if row['alert_delay_seconds'] is not None else ''} | "
+            f"flashscore_first_seen_at={row['flashscore_first_seen_at'] or ''} | "
+            f"flashscore_first_seen_live_at={row['flashscore_first_seen_live_at'] or ''} | "
+            f"betfair_not_inplay_confirmed_at={row['betfair_not_inplay_confirmed_at'] or ''} | "
             f"candidate_first_seen_at={row['candidate_first_seen_at'] or ''} | "
             f"slack_alert_sent={row['slack_alert_sent'] or 0} | "
+            f"slack_sent_at={row['slack_sent_at'] or row['alert_sent_at'] or ''} | "
             f"final_verification_result={row['final_verification_result'] or ''} | "
             f"final_verification_reason={row['final_verification_reason'] or ''} | "
             f"betfair_event_id={row['event_id'] or ''} | "
@@ -4453,8 +4735,8 @@ def print_visible_table_debug(connection: sqlite3.Connection, db_path: Path = ST
             f"match_confidence={row['match_confidence'] or ''} | "
             f"match_score={row['match_score'] if row['match_score'] is not None else ''} | "
             f"match_reason={row['match_reason'] or ''} | "
-            f"flashscore_first_seen_live_at={row['flashscore_first_seen_live_at'] or ''} | "
-            f"overdue_by={row['overdue_by_display'] or ''} | "
+            f"overdue_by_seconds={row['overdue_by_seconds'] if row['overdue_by_seconds'] is not None else ''} | "
+            f"overdue_by_display={row['overdue_by_display'] or ''} | "
             f"hidden_reason={row['hidden_reason'] or ''}",
             flush=True,
         )
@@ -4480,12 +4762,13 @@ def print_event_debug(connection: sqlite3.Connection, event_query: str) -> None:
     for row in rows:
         print("--- state row ---", flush=True)
         for key in (
-            "event_id", "market_id", "sport_name", "event_name", "flashscore_match_name",
+            "event_id", "market_id", "sport_name", "event_name", "flashscore_match_id", "flashscore_live_event_key", "flashscore_match_name",
             "trigger_source", "market_type_code", "market_name", "scheduled_start_utc", "flashscore_status", "flashscore_score", "final_verification_result",
             "final_verification_reason", "last_seen_status", "last_seen_inplay",
             "betfair_last_seen_status", "betfair_last_seen_inplay", "match_confidence",
-            "match_score", "match_reason", "flashscore_first_seen_live_at",
-            "candidate_first_seen_at", "verify_after", "overdue_threshold_seconds", "alert_delay_seconds", "overdue_by_seconds",
+            "match_score", "match_reason", "flashscore_first_seen_at", "flashscore_detected_live_at", "flashscore_first_seen_live_at",
+            "betfair_not_inplay_confirmed_at", "candidate_first_seen_at", "verify_after", "slack_sent_at", "alert_sent_at",
+            "overdue_threshold_seconds", "alert_delay_seconds", "overdue_by_seconds",
             "overdue_by_display", "visible_in_hub", "hidden_reason", "slack_error",
         ):
             if key in row.keys():
@@ -5349,7 +5632,7 @@ def flashscore_first_seen_live_at_for_event(
         try:
             row = connection.execute(
                 """
-                SELECT flashscore_first_seen_live_at, candidate_first_seen_at, flashscore_detected_live_at
+                SELECT flashscore_first_seen_live_at
                 FROM inplay_alert_state
                 WHERE event_id = ?
                 """,
@@ -5357,17 +5640,7 @@ def flashscore_first_seen_live_at_for_event(
             ).fetchone()
         except sqlite3.Error:
             row = None
-    for value in (
-        row["flashscore_first_seen_live_at"] if row else None,
-        row["candidate_first_seen_at"] if row else None,
-        row["flashscore_detected_live_at"] if row else None,
-        flashscore_match.detected_live_at if flashscore_match else None,
-        fallback_now,
-    ):
-        parsed = parse_datetime(value)
-        if parsed is not None:
-            return parsed
-    return None
+    return parse_datetime(row["flashscore_first_seen_live_at"]) if row else None
 
 
 def update_flashscore_overdue_fields(
@@ -5522,6 +5795,22 @@ def process_flashscore_live_matches(
                     "reason": confidence.reason,
                 },
             )
+            db_log(
+                connection,
+                "INFO",
+                "skipped_no_betfair_match",
+                "Flashscore live match skipped: no confident Betfair MATCH_ODDS match",
+                sport_name=flashscore_match.sport_name,
+                event_name=flashscore_match.match_name,
+                details={
+                    "flashscore_match_name": flashscore_match.match_name,
+                    "flashscore_competition": flashscore_match.competition_name,
+                    "flashscore_status": flashscore_match.status_text,
+                    "flashscore_live_event_key": flashscore_live_event_key(flashscore_match),
+                    "final_verification_result": "skipped_no_betfair_match",
+                    "reason": confidence.reason,
+                },
+            )
             continue
         if ambiguous:
             record_flashscore_match_diagnostic(
@@ -5598,6 +5887,23 @@ def process_flashscore_live_matches(
                 "match_confidence": confidence.level,
                 "match_reason": confidence.reason,
                 "score": confidence.score,
+            },
+        )
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_betfair_match_found",
+            "Flashscore live match mapped to Betfair MATCH_ODDS market",
+            sport_name=flashscore_match.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={
+                "flashscore_match_name": flashscore_match.match_name,
+                "flashscore_live_event_key": flashscore_live_event_key(flashscore_match),
+                "match_confidence": confidence.level,
+                "match_score": confidence.score,
+                "match_reason": confidence.reason,
             },
         )
 
@@ -5716,6 +6022,17 @@ def process_flashscore_live_matches(
                     "inplay": current_book.inplay,
                 },
             )
+            db_log(
+                connection,
+                "INFO",
+                "flashscore_betfair_already_inplay",
+                "Flashscore candidate discarded because Betfair is already in-play",
+                sport_name=flashscore_match.sport_name,
+                event_id=candidate.event_id,
+                market_id=candidate.market_id,
+                event_name=candidate.event_name,
+                details={"flashscore_match_name": flashscore_match.match_name, "status": current_book.status, "inplay": current_book.inplay},
+            )
             continue
 
         if current_book.status == "CLOSED":
@@ -5795,6 +6112,21 @@ def process_flashscore_live_matches(
             now=utc_now(),
             alert_delay_seconds=pending.alert_delay_seconds,
         )
+        db_log(
+            connection,
+            "INFO",
+            "flashscore_pending_started",
+            "Flashscore pending timer started after Betfair not-in-play confirmation",
+            sport_name=flashscore_match.sport_name,
+            event_id=candidate.event_id,
+            market_id=candidate.market_id,
+            event_name=candidate.event_name,
+            details={
+                "flashscore_match_name": flashscore_match.match_name,
+                "alert_delay_seconds": pending.alert_delay_seconds,
+                "betfair_not_inplay_confirmed_at": iso_utc(utc_now()),
+            },
+        )
 
     stats.flashscore_scan_status = "complete"
     db_log(connection, "INFO", "flashscore_scan_completed", f"Flashscore live trigger scan completed: {len(live_matches)} live matches")
@@ -5802,6 +6134,7 @@ def process_flashscore_live_matches(
 
 def run_scan(args: argparse.Namespace, config: Config, connection: sqlite3.Connection) -> int:
     run_id = start_scan_run(connection, args)
+    normalize_legacy_flashscore_live_anchors(connection)
     stats = ScanStats()
     excluded_sports: list[str] = []
     status = "complete"
@@ -7059,6 +7392,13 @@ def run_self_test() -> int:
             utc_now(),
             ("Player A", "Player B"),
         )
+        scheduled_first_seen_at = datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
+        first_live_at = datetime(2026, 6, 19, 14, 5, tzinfo=timezone.utc)
+        later_live_at = datetime(2026, 6, 19, 14, 7, tzinfo=timezone.utc)
+        latest_live_at = datetime(2026, 6, 19, 14, 9, tzinfo=timezone.utc)
+        first_live_flash = replace(tennis_flash, detected_live_at=first_live_at)
+        later_live_flash = replace(tennis_flash, detected_live_at=later_live_at)
+        latest_live_flash = replace(tennis_flash, detected_live_at=latest_live_at)
         darts_flash = FlashscoreMatch(
             "Darts",
             "Luke Littler v Michael Smith",
@@ -7124,6 +7464,111 @@ def run_self_test() -> int:
         assert ambiguous_confidence.level == "Low"
         assert ambiguous_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'name_match_candidate_scored'").fetchone()[0] == 2
         ambiguous_db.close()
+
+        assert not flashscore_row_live_decision("13:00", "", "", full_text="Player A v Player B", sport_name="Tennis").is_live
+        assert not flashscore_row_live_decision("Finished", "2-0", "", full_text="Finished Player A v Player B", sport_name="Tennis").is_live
+        assert not flashscore_row_live_decision("Postponed", "", "", full_text="Postponed Player A v Player B", sport_name="Tennis").is_live
+        assert not flashscore_row_live_decision("Cancelled", "", "", full_text="Cancelled Player A v Player B", sport_name="Tennis").is_live
+        anchor_delay_args = argparse.Namespace(
+            dry_run=False,
+            flashscore_timeout_seconds=1,
+            flashscore_lookback_hours=12.0,
+            flashscore_lookahead_hours=24.0,
+            market_book_batch_size=40,
+            alert_delay_seconds=60,
+            flashscore_alert_delay_seconds=300,
+            flashscore_live_verifier=lambda pending: True,
+        )
+
+        first_live_anchor_db = sqlite3.connect(":memory:")
+        first_live_anchor_db.row_factory = sqlite3.Row
+        init_db(first_live_anchor_db)
+        first_live_anchor_db.execute(
+            """
+            INSERT INTO inplay_alert_state (event_id, sport_name, event_name, trigger_source, flashscore_first_seen_at)
+            VALUES ('bf-tennis-1', 'Tennis', 'Player A v Player B', 'flashscore_live', ?)
+            """,
+            (iso_utc(scheduled_first_seen_at),),
+        )
+        first_live_anchor_db.commit()
+        first_live_anchor_stats = ScanStats()
+        first_live_anchor_client = FlashscoreFakeClient(FlashscoreFakeBetting())
+        process_flashscore_live_matches(
+            first_live_anchor_db,
+            first_live_anchor_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            anchor_delay_args,
+            first_live_anchor_stats,
+            [first_live_flash],
+        )
+        first_live_anchor_state = first_live_anchor_db.execute(
+            """
+            SELECT flashscore_first_seen_at, flashscore_first_seen_live_at,
+                   betfair_not_inplay_confirmed_at, candidate_first_seen_at, verify_after
+            FROM inplay_alert_state
+            WHERE event_id = 'bf-tennis-1'
+            """
+        ).fetchone()
+        assert parse_datetime(first_live_anchor_state["flashscore_first_seen_at"]) == scheduled_first_seen_at
+        assert parse_datetime(first_live_anchor_state["flashscore_first_seen_live_at"]) == first_live_at
+        assert parse_datetime(first_live_anchor_state["verify_after"]) == parse_datetime(first_live_anchor_state["betfair_not_inplay_confirmed_at"]) + timedelta(seconds=300)
+        process_flashscore_live_matches(
+            first_live_anchor_db,
+            first_live_anchor_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            anchor_delay_args,
+            first_live_anchor_stats,
+            [later_live_flash, latest_live_flash],
+        )
+        repeated_anchor_state = first_live_anchor_db.execute(
+            "SELECT flashscore_first_seen_live_at FROM inplay_alert_state WHERE event_id = 'bf-tennis-1'"
+        ).fetchone()
+        assert parse_datetime(repeated_anchor_state["flashscore_first_seen_live_at"]) == first_live_at
+
+        different_day_flash = replace(
+            tennis_flash,
+            match_id="",
+            detected_live_at=first_live_at + timedelta(days=1),
+        )
+        process_flashscore_live_matches(
+            first_live_anchor_db,
+            first_live_anchor_client,  # type: ignore[arg-type]
+            Config("", "", "", "", "https://hooks.slack.com/services/test", "test"),
+            anchor_delay_args,
+            first_live_anchor_stats,
+            [different_day_flash],
+        )
+        different_day_state = first_live_anchor_db.execute(
+            "SELECT flashscore_first_seen_live_at FROM inplay_alert_state WHERE event_id = 'bf-tennis-1'"
+        ).fetchone()
+        assert parse_datetime(different_day_state["flashscore_first_seen_live_at"]) == first_live_at + timedelta(days=1)
+        first_live_anchor_db.close()
+
+        legacy_anchor_db = sqlite3.connect(":memory:")
+        legacy_anchor_db.row_factory = sqlite3.Row
+        init_db(legacy_anchor_db)
+        legacy_anchor_db.execute(
+            """
+            INSERT INTO inplay_alert_state (
+                event_id, market_id, sport_name, event_name, trigger_source,
+                flashscore_first_seen_live_at, flashscore_detected_live_at,
+                final_verification_result, verify_after
+            )
+            VALUES ('legacy-flashscore', '1.legacy', 'Tennis', 'Player A v Player B', 'flashscore_live', ?, ?, 'pending_verification', ?)
+            """,
+            (iso_utc(scheduled_first_seen_at), iso_utc(first_live_at), iso_utc(first_live_at + timedelta(minutes=5))),
+        )
+        legacy_anchor_db.commit()
+        normalize_legacy_flashscore_live_anchors(legacy_anchor_db)
+        legacy_anchor_state = legacy_anchor_db.execute(
+            "SELECT flashscore_first_seen_live_at, verify_after, final_verification_result, final_verification_reason FROM inplay_alert_state WHERE event_id = 'legacy-flashscore'"
+        ).fetchone()
+        assert legacy_anchor_state["flashscore_first_seen_live_at"] is None
+        assert legacy_anchor_state["verify_after"] is None
+        assert legacy_anchor_state["final_verification_result"] == "suppressed_unknown"
+        assert legacy_anchor_state["final_verification_reason"] == "missing_flashscore_first_seen_live_at"
+        assert legacy_anchor_db.execute("SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'flashscore_live_anchor_reset'").fetchone()[0] == 1
+        legacy_anchor_db.close()
 
         flash_db = sqlite3.connect(":memory:")
         flash_db.row_factory = sqlite3.Row
