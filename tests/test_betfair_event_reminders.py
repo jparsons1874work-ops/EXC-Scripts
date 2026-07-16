@@ -295,7 +295,67 @@ class BetfairEventReminderTests(unittest.TestCase):
             "Cycling",
         )
         self.assertEqual([item.market_id for item in selected], ["1.cyc-win"])
-        self.assertEqual(selected[0].selection_reason, "cycling_winner_market")
+        self.assertEqual(selected[0].selection_reason, "cycling_main_winner:market_type_code=WINNER")
+
+    def test_cycling_observed_outright_winner_market_is_selected(self) -> None:
+        item = reminder(
+            "Cycling",
+            "tour-event",
+            datetime(2026, 7, 16, 11, 30, tzinfo=timezone.utc),
+            market_id="1.246865525",
+            market_name="Tour Winner",
+            market_type_code="OUTRIGHT_WINNER",
+            event_name="Tour de France",
+        )
+        self.assertEqual([market.market_id for market in select_market_reminders([item], "Cycling")], ["1.246865525"])
+
+    def test_cycling_stage_winner_side_market_is_excluded_for_tour_event(self) -> None:
+        item = reminder(
+            "Cycling",
+            "tour-event",
+            datetime(2026, 7, 16, 11, 30, tzinfo=timezone.utc),
+            market_id="1.stage",
+            market_name="Stage 10 Winner",
+            market_type_code="STAGE_WINNER",
+            event_name="Tour de France",
+        )
+        self.assertEqual(select_market_reminders([item], "Cycling"), [])
+
+    def test_cycling_stage_winner_is_selected_for_specific_stage_event(self) -> None:
+        item = reminder(
+            "Cycling",
+            "stage-event",
+            datetime(2026, 7, 16, 11, 30, tzinfo=timezone.utc),
+            market_id="1.stage",
+            market_name="Tour de France Stage 10 Winner",
+            market_type_code="STAGE_WINNER",
+            event_name="Tour de France Stage 10",
+        )
+        self.assertEqual([market.market_id for market in select_market_reminders([item], "Cycling")], ["1.stage"])
+
+    def test_cycling_classification_markets_are_excluded(self) -> None:
+        start = datetime(2026, 7, 16, 11, 30, tzinfo=timezone.utc)
+        markets = [
+            reminder("Cycling", "tour", start, market_id="1.points", market_name="Points Classification", market_type_code="POINTS_WINNER"),
+            reminder("Cycling", "tour", start, market_id="1.team", market_name="Team Classification", market_type_code="TEAM_WINNER"),
+            reminder("Cycling", "tour", start, market_id="1.young", market_name="Young Rider Classification", market_type_code="YOUNG_RIDER_WINNER"),
+        ]
+        self.assertEqual(select_market_reminders(markets, "Cycling"), [])
+
+    def test_cycling_match_bets_and_head_to_heads_are_excluded(self) -> None:
+        start = datetime(2026, 7, 16, 11, 30, tzinfo=timezone.utc)
+        markets = [
+            reminder("Cycling", "tour", start, market_id="1.match", market_name="Rider Match Bet", market_type_code="MATCH_BET"),
+            reminder("Cycling", "tour", start, market_id="1.h2h", market_name="Rider Head To Head", market_type_code="HEAD_TO_HEAD"),
+        ]
+        self.assertEqual(select_market_reminders(markets, "Cycling"), [])
+
+    def test_cycling_catalogue_has_no_api_side_market_type_filter(self) -> None:
+        self.assertIsNone(reminders.api_market_type_filter_for_sport("Cycling", reminders.SPORT_RULE_WINNER_MARKETS))
+        self.assertEqual(
+            reminders.api_market_type_filter_for_sport("Golf", reminders.SPORT_RULE_WINNER_MARKETS),
+            ("WINNER",),
+        )
 
     def test_cycling_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
         item = select_market_reminders(

@@ -49,6 +49,8 @@ SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
 MATCH_ODDS = "MATCH_ODDS"
 WINNER = "WINNER"
+OUTRIGHT_WINNER = "OUTRIGHT_WINNER"
+STAGE_WINNER = "STAGE_WINNER"
 FIRST_TRY_SCORER = "FIRST_TRY_SCORER"
 TO_WIN_THE_TOSS = "TO_WIN_THE_TOSS"
 CRICKET_TOSS_LEAD_MINUTES = 40
@@ -244,6 +246,48 @@ def normalize_text(value: str) -> str:
 
 def is_winner_market(reminder: EventReminder) -> bool:
     return reminder.market_type_code.upper() == WINNER
+
+
+CYCLING_SIDE_MARKET_TERMS: tuple[tuple[str, str], ...] = (
+    ("classification", "classification_market"),
+    ("points", "points_market"),
+    ("mountain", "mountains_market"),
+    ("young rider", "young_rider_market"),
+    ("jersey", "jersey_market"),
+    ("head to head", "head_to_head_market"),
+    ("match bet", "match_bet_market"),
+    ("top 3", "top_finish_market"),
+    ("top 10", "top_finish_market"),
+    ("special", "special_market"),
+    ("nationality", "nationality_market"),
+    ("winning nation", "nationality_market"),
+    ("winning team", "team_market"),
+)
+
+
+def cycling_market_selection(reminder: EventReminder) -> tuple[bool, str]:
+    market_type = reminder.market_type_code.upper()
+    market_name = normalize_text(reminder.market_name)
+    event_name = normalize_text(reminder.event_name)
+
+    for term, reason in CYCLING_SIDE_MARKET_TERMS:
+        if term in market_name:
+            return False, reason
+
+    if market_type in {WINNER, OUTRIGHT_WINNER}:
+        return True, f"market_type_code={market_type}"
+
+    if market_type == STAGE_WINNER:
+        event_is_specific_stage = "stage" in event_name and (
+            event_name in market_name or market_name in event_name or market_name == "winner"
+        )
+        if event_is_specific_stage:
+            return True, "stage_winner_for_specific_stage_event"
+        return False, "stage_winner_side_market"
+
+    if market_type in {"MATCH_BET", "HEAD_TO_HEAD"}:
+        return False, "match_bet_or_head_to_head_type"
+    return False, f"market_type_code_not_main_winner:{market_type or 'missing'}"
 
 
 def is_first_try_scorer_market(reminder: EventReminder) -> tuple[bool, str]:
@@ -493,7 +537,17 @@ def select_market_reminders(
                     ),
                 )
             )
-        elif sport in {"Cycling", "Golf"} and is_winner_market(market):
+        elif sport == "Cycling":
+            is_selected, reason = cycling_market_selection(market)
+            if is_selected:
+                selected.append(
+                    replace(
+                        market,
+                        duplicate_by=DEDUP_MARKET,
+                        selection_reason=f"cycling_main_winner:{reason}",
+                    )
+                )
+        elif sport == "Golf" and is_winner_market(market):
             selected.append(
                 replace(
                     market,
@@ -818,6 +872,47 @@ def list_market_catalogues(
     )
 
 
+def api_market_type_filter_for_sport(sport_name: str, rule: str) -> tuple[str, ...] | None:
+    if sport_name in {"Politics", "Cricket", "Cycling"}:
+        return None
+    if rule == SPORT_RULE_WINNER_MARKETS:
+        return (WINNER,)
+    return (MATCH_ODDS,)
+
+
+def catalogue_total_matched(catalogue: Any) -> str:
+    value = object_get_any(catalogue, ("total_matched", "totalMatched"), "")
+    return str(value) if value != "" else "unavailable"
+
+
+def log_cycling_market_diagnostic(catalogue: Any, event_type_id: str) -> None:
+    reminder = catalogue_to_reminder(catalogue, "Cycling", ":bicyclist:", event_type_id)
+    if reminder is None:
+        log(f"Cycling diagnostic skipped malformed catalogue: {catalogue!r}")
+        return
+    log(
+        "Cycling catalogue market: "
+        f"event_name={reminder.event_name!r} event_id={reminder.event_id} "
+        f"competition_name={reminder.competition_name!r} competition_id={reminder.competition_id or 'none'} "
+        f"market_name={reminder.market_name!r} market_id={reminder.market_id} "
+        f"market_type_code={reminder.market_type_code or 'none'} "
+        f"market_start_utc={format_utc(reminder.event_start_utc)} "
+        f"market_start_uk={format_uk(reminder.event_start_uk)} "
+        f"total_matched={catalogue_total_matched(catalogue)}"
+    )
+
+
+def run_cycling_market_diagnostic(client: APIClient, window: ScanWindow, event_type_id: str) -> int:
+    log("Cycling diagnostic mode: broad catalogue query; Slack scheduling and reminder state writes are disabled.")
+    catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=None)
+    log(f"Cycling catalogue markets before filter: {len(catalogues)}")
+    market_types = sorted({catalogue_market_type_code(item) or "<none>" for item in catalogues})
+    log(f"Cycling market types observed: {', '.join(market_types) if market_types else 'none'}")
+    for catalogue in catalogues:
+        log_cycling_market_diagnostic(catalogue, event_type_id)
+    return 0
+
+
 def chunked(values: list[str], size: int) -> Iterable[list[str]]:
     size = max(1, size)
     for index in range(0, len(values), size):
@@ -950,17 +1045,20 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
     client = build_client(config)
     try:
         sport_ids = list_event_type_ids(client, window)
+        if args.debug_cycling_markets:
+            return run_cycling_market_diagnostic(client, window, sport_ids["Cycling"])
         for sport in SPORTS:
             sport_name = sport["name"]
             stats.sports_scanned += 1
             event_type_id = sport_ids[sport_name]
             log(f"Scanning {sport_name} eventTypeId={event_type_id}")
-            if sport["rule"] in {SPORT_RULE_POLITICS_MARKETS, SPORT_RULE_CRICKET_TOSS}:
-                raw_catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=None)
-            elif sport["rule"] == SPORT_RULE_WINNER_MARKETS:
-                raw_catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=[WINNER])
-            else:
-                raw_catalogues = list_market_catalogues(client, event_type_id, window)
+            market_type_filter = api_market_type_filter_for_sport(sport_name, sport["rule"])
+            raw_catalogues = list_market_catalogues(
+                client,
+                event_type_id,
+                window,
+                market_type_codes=market_type_filter,
+            )
             stats.raw_markets_found += len(raw_catalogues)
             reminders = [
                 reminder
@@ -974,13 +1072,25 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                     stats.politics_markets_selected += len(selected)
                 elif sport_name == "Cycling":
                     stats.cycling_winner_reminders_selected += len(selected)
+                    log(f"Cycling catalogue markets before filter: {len(reminders)}")
+                    market_types = sorted({market.market_type_code or "<none>" for market in reminders})
+                    log(f"Cycling market types observed: {', '.join(market_types) if market_types else 'none'}")
                     for market in reminders:
-                        if not is_winner_market(market):
+                        is_selected, reason = cycling_market_selection(market)
+                        if is_selected:
+                            log(
+                                f"Selected Cycling main winner: event_name={market.event_name!r} "
+                                f"event_id={market.event_id} market_name={market.market_name!r} "
+                                f"market_id={market.market_id} market_type_code={market.market_type_code} "
+                                f"reason={reason}"
+                            )
+                        else:
                             log(
                                 f"Excluded Cycling market: event_id={market.event_id} market_id={market.market_id} "
                                 f"market_type_code={market.market_type_code} market_name={market.market_name!r} "
-                                f"reason=not_winner_market"
+                                f"reason={reason}"
                             )
+                    log(f"Cycling selected after filter: {len(selected)}")
                 elif sport_name == "Golf":
                     stats.golf_winner_reminders_selected += len(selected)
                     for market in reminders:
@@ -1149,6 +1259,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", default="", help="Path to an explicit real JSON config file.")
     parser.add_argument("--dry-run", action="store_true", help="Scan and print what would be scheduled without Slack/state writes.")
+    parser.add_argument(
+        "--debug-cycling-markets",
+        action="store_true",
+        help="Print a broad Cycling catalogue scan, without scheduling Slack or writing reminder state.",
+    )
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     parser.add_argument("--lookahead-hours", type=float, default=24)
     parser.add_argument("--start-now", action="store_true", help="Use current UK time as scan start.")
