@@ -59,6 +59,49 @@ Using the detected Python directly:
 
 Open `http://127.0.0.1:8000`.
 
+## Decimal Cricket Fixture API
+
+The Hub exposes cached Decimal cricket fixture JSON through a bearer-token protected API:
+
+```text
+GET /api/v1/cricket-fixtures/status
+GET /api/v1/cricket-fixtures/all
+GET /api/v1/cricket-fixtures/all/{event_id}
+GET /api/v1/cricket-fixtures/today
+GET /api/v1/cricket-fixtures/tomorrow
+GET /api/v1/cricket-fixtures/YYYY-MM-DD
+GET /api/v1/cricket-fixtures/YYYY-MM-DD/{event_id}
+```
+
+Set a long random `CRICKET_FIXTURE_API_KEY` in `.env`, then call an endpoint with:
+
+```powershell
+$headers = @{ Authorization = "Bearer YOUR_API_KEY" }
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/cricket-fixtures/today" -Headers $headers
+```
+
+The `/all` endpoint returns every fixture collected from Decimal's This Month and combined
+Next Month and Beyond panels. It is cached in `runtime/output/decimal_cricket_fixtures_all.json` using
+the same fixture structure as the daily responses. The full-date and all-fixtures endpoints
+return their saved JSON payloads unchanged. Response headers include
+`X-Fixture-Generated-At` and `X-Fixture-Data-Stale`. Missing files, invalid dates, and unknown
+event IDs return structured JSON errors.
+
+By default, the Hub refreshes today, tomorrow, and the combined all-upcoming file 30 seconds after
+startup and every 180 minutes thereafter. The refresh opens both forward panels explicitly,
+deduplicates their fixtures, and runs outside the web request. Each cache is
+replaced atomically. Configure this with:
+
+- `CRICKET_FIXTURE_REFRESH_ENABLED`
+- `CRICKET_FIXTURE_REFRESH_INTERVAL_MINUTES`
+- `CRICKET_FIXTURE_REFRESH_INITIAL_DELAY_SECONDS`
+- `CRICKET_FIXTURE_REFRESH_TIMEOUT_SECONDS`
+- `CRICKET_FIXTURE_API_MAX_AGE_MINUTES`
+
+Automatic refresh requires `DECIMAL_USERNAME`, `DECIMAL_PASSWORD`, Chrome, and a working
+ChromeDriver/Selenium Manager setup on the Hub server. Set `CRICKET_FIXTURE_REFRESH_ENABLED=false`
+if another scheduler owns fixture generation.
+
 ## Runtime Files
 
 Runtime logs and generated files are written under:

@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
 from app.config import APP_DIR, CONFIG_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
+from app.cricket_fixture_api import fixture_refresh_service, router as cricket_fixture_api_router
 from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.runner import RUNNING, STOPPING, default_args_for, runner
@@ -26,6 +27,7 @@ from app.scheduler import window_status
 ensure_runtime_dirs()
 
 app = FastAPI(title="Betfair Scripts Hub")
+app.include_router(cricket_fixture_api_router)
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=APP_DIR / "templates")
 templates.env.cache = None
@@ -144,10 +146,12 @@ async def startup() -> None:
     ensure_runtime_dirs()
     await asyncio.to_thread(runner.startup_cleanup)
     app.state.window_monitor_task = asyncio.create_task(_window_monitor())
+    app.state.cricket_fixture_refresh_task = fixture_refresh_service.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    await fixture_refresh_service.stop()
     task = getattr(app.state, "window_monitor_task", None)
     if task is None:
         return

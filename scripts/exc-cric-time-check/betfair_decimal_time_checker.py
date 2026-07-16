@@ -14,7 +14,7 @@ import subprocess
 import sys
 import traceback
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -114,6 +114,30 @@ DECIMAL_LEGACY_IN_PLAY_ROW_SELECTORS = (
     f"#running_container {DECIMAL_LEGACY_ROW_SELECTOR}",
     f"#running {DECIMAL_LEGACY_ROW_SELECTOR}",
 )
+DECIMAL_LEGACY_THIS_MONTH_ROW_SELECTORS = (
+    f"#ThisMonth_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#thismonth_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#this_month_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#ThisMonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#thisMonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#thismonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#this_month {DECIMAL_LEGACY_ROW_SELECTOR}",
+)
+DECIMAL_LEGACY_NEXT_MONTH_ROW_SELECTORS = (
+    f"#NextMonth_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#nextmonth_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#next_month_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#NextMonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#nextMonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#nextmonth {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#next_month {DECIMAL_LEGACY_ROW_SELECTOR}",
+)
+DECIMAL_LEGACY_BEYOND_ROW_SELECTORS = (
+    f"#Beyond_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#beyond_container {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#Beyond {DECIMAL_LEGACY_ROW_SELECTOR}",
+    f"#beyond {DECIMAL_LEGACY_ROW_SELECTOR}",
+)
 DECIMAL_LEGACY_READY_ROOT_SELECTORS = (
     "div.accordion#date",
     "#Today_container",
@@ -124,6 +148,24 @@ DECIMAL_LEGACY_READY_ROOT_SELECTORS = (
     "#Tomorrow",
     "#tomorrow",
     "#running",
+    "#ThisMonth_container",
+    "#thismonth_container",
+    "#this_month_container",
+    "#NextMonth_container",
+    "#nextmonth_container",
+    "#next_month_container",
+    "#Beyond_container",
+    "#beyond_container",
+    "#ThisMonth",
+    "#thisMonth",
+    "#thismonth",
+    "#this_month",
+    "#NextMonth",
+    "#nextMonth",
+    "#nextmonth",
+    "#next_month",
+    "#Beyond",
+    "#beyond",
 )
 DECIMAL_HEADLESS = True
 DECIMAL_WAIT_SECONDS = 8
@@ -161,7 +203,9 @@ class Fixture:
     competition: str
     start_time: datetime
     source: str
+    venue: str = ""
     event_id: Optional[str] = None
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -583,6 +627,7 @@ def build_decimal_fixtures_fast_path(
         return None
 
     competition_column = column_map.get("competition")
+    venue_column = column_map.get("venue") or column_map.get("ground") or column_map.get("location")
     fixtures: list[Fixture] = []
     for _, row in dataframe.iterrows():
         time_text = str(row[start_column])
@@ -595,6 +640,11 @@ def build_decimal_fixtures_fast_path(
             competition = normalize_whitespace(str(row[competition_column]))
             if competition.lower() == "nan":
                 competition = ""
+        venue = ""
+        if venue_column is not None:
+            venue = normalize_whitespace(str(row[venue_column]))
+            if venue.lower() == "nan":
+                venue = ""
 
         start_time = parse_decimal_datetime(time_text, target_day, verbose=verbose)
         if start_time is None or start_time.date() != target_day:
@@ -606,6 +656,7 @@ def build_decimal_fixtures_fast_path(
                 competition=competition,
                 start_time=start_time,
                 source="decimal",
+                venue=venue,
             )
         )
 
@@ -1187,9 +1238,14 @@ def open_decimal_menu_item(
     raise RuntimeError(f"{description} could not be opened.") from last_error
 
 
-def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verbose: bool) -> dict[str, object]:
+def extract_decimal_legacy_rows_via_js(
+    driver: WebDriver,
+    target_day: date,
+    verbose: bool,
+    target_section_override: str | None = None,
+) -> dict[str, object]:
     """Extract Decimal Legacy Developer fixtures using in-page JS."""
-    target_section = decimal_target_section(target_day)
+    target_section = target_section_override or decimal_target_section(target_day)
     payload = driver.execute_async_script(
         """
         const done = arguments[arguments.length - 1];
@@ -1198,8 +1254,11 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         const todaySelectors = arguments[2];
         const inPlaySelectors = arguments[3];
         const tomorrowSelectors = arguments[4];
-        const readyRootSelectors = arguments[5];
-        const targetSection = arguments[6];
+        const thisMonthSelectors = arguments[5];
+        const nextMonthSelectors = arguments[6];
+        const beyondSelectors = arguments[7];
+        const readyRootSelectors = arguments[8];
+        const targetSection = arguments[9];
 
         const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
         const isVisible = (el) => {
@@ -1294,18 +1353,43 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         };
 
         const findSectionButton = (kind) => {
-          const exactText = kind === "today" ? "Today" : (kind === "tomorrow" ? "Tomorrow" : "In Play");
-          const textNeedle = exactText.toUpperCase();
-          const targetSelector = kind === "today"
-            ? 'button[data-target="#Today"], button[data-bs-target="#Today"], button[data-target*="today" i], button[data-bs-target*="today" i]'
-            : kind === "tomorrow"
-              ? 'button[data-target="#Tomorrow"], button[data-bs-target="#Tomorrow"], button[data-target="#tomorrow"], button[data-bs-target="#tomorrow"], button[data-target*="tomorrow" i], button[data-bs-target*="tomorrow" i]'
-              : 'button[data-target="#running"], button[data-bs-target="#running"], button[data-target*="running" i], button[data-bs-target*="running" i]';
+          const definitions = {
+            today: {
+              labels: ["TODAY"],
+              selector: 'button[data-target="#Today"], button[data-bs-target="#Today"], button[data-target*="today" i], button[data-bs-target*="today" i]',
+            },
+            tomorrow: {
+              labels: ["TOMORROW"],
+              selector: 'button[data-target="#Tomorrow"], button[data-bs-target="#Tomorrow"], button[data-target="#tomorrow"], button[data-bs-target="#tomorrow"], button[data-target*="tomorrow" i], button[data-bs-target*="tomorrow" i]',
+            },
+            in_play: {
+              labels: ["IN PLAY", "IN-PLAY"],
+              selector: 'button[data-target="#running"], button[data-bs-target="#running"], button[data-target*="running" i], button[data-bs-target*="running" i]',
+            },
+            this_month: {
+              labels: ["THIS MONTH"],
+              selector: 'button[data-target*="thismonth" i], button[data-bs-target*="thismonth" i], button[data-target*="this_month" i], button[data-bs-target*="this_month" i]',
+            },
+            next_month: {
+              labels: ["NEXT MONTH"],
+              selector: 'button[data-target*="nextmonth" i], button[data-bs-target*="nextmonth" i], button[data-target*="next_month" i], button[data-bs-target*="next_month" i]',
+            },
+            beyond: {
+              labels: ["BEYOND"],
+              selector: 'button[data-target*="beyond" i], button[data-bs-target*="beyond" i]',
+              exactTextOnly: true,
+            },
+          };
+          const definition = definitions[kind];
+          if (!definition) return null;
+          const targetSelector = definition.selector;
           const direct = queryFirstDeep(targetSelector);
           if (direct) return direct;
           return queryAllDeep("button,a,[role='button']").find((button) => {
             const text = clean(button.innerText || button.textContent || "").toUpperCase();
-            return text === textNeedle || text.includes(textNeedle);
+            return definition.labels.some(
+              (label) => text === label || (!definition.exactTextOnly && text.includes(label))
+            );
           }) || null;
         };
 
@@ -1315,6 +1399,17 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
             if (rows.length) return rows;
           }
           return [];
+        };
+
+        const queryPanelRows = (panel) => {
+          if (!panel || !panel.querySelectorAll) return [];
+          try {
+            return Array.from(panel.querySelectorAll(rowSelector)).filter(
+              (row) => row && (row.getAttribute("data-id") || row.getAttribute("data-name"))
+            );
+          } catch (error) {
+            return [];
+          }
         };
 
         const findContainer = (selectors) => {
@@ -1331,7 +1426,11 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
           while (current) {
             const id = clean(current.id || "");
             const loweredId = id.toLowerCase();
+            const normalizedId = loweredId.replace(/[^a-z0-9]/g, "");
             if (loweredId.includes("running")) return "in_play";
+            if (normalizedId.includes("nextmonth")) return "next_month";
+            if (normalizedId.includes("thismonth")) return "this_month";
+            if (normalizedId.includes("beyond")) return "beyond";
             if (loweredId.includes("today")) return "today";
             if (loweredId.includes("tomorrow")) return "tomorrow";
             if (current.parentElement) {
@@ -1348,32 +1447,73 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
           return "other";
         };
 
-        const serializeRow = (row) => {
+        const serializeRow = (row, sectionOverride = "") => {
+          const dataAttrs = {};
+          try {
+            for (const attr of Array.from(row.attributes || [])) {
+              if (attr.name && attr.name.toLowerCase().startsWith("data-")) {
+                dataAttrs[attr.name.slice(5)] = clean(attr.value || "");
+              }
+            }
+          } catch (error) {}
+          const findTextBySelectors = (selectors) => {
+            for (const selector of selectors) {
+              try {
+                const node = row.querySelector(selector);
+                const text = clean(node?.innerText || node?.textContent || node?.getAttribute("value") || "");
+                if (text) return text;
+              } catch (error) {}
+            }
+            return "";
+          };
+          const attrValue = (...names) => {
+            for (const name of names) {
+              const value = clean(row.getAttribute(name) || dataAttrs[name.replace(/^data-/, "")] || "");
+              if (value) return value;
+            }
+            return "";
+          };
           const teamA = clean(row.querySelector('div[data-id="A"]')?.innerText || row.querySelector('div[data-id="A"]')?.textContent || "");
           const teamB = clean(row.querySelector('div[data-id="B"]')?.innerText || row.querySelector('div[data-id="B"]')?.textContent || "");
           const dataName = clean(row.getAttribute("data-name") || "");
           const dataStart = clean(row.getAttribute("data-start") || row.getAttribute("datetime") || row.querySelector("[datetime]")?.getAttribute("datetime") || "");
           const rawText = clean(row.innerText || row.textContent || "");
+          const labelledValue = (label) => {
+            const pattern = new RegExp(`${label}\\s*[:|-]\\s*([^|\\n\\r]+)`, "i");
+            return clean(rawText.match(pattern)?.[1] || "");
+          };
           const matchText = clean(rawText.match(/[^\\n\\r|]+\\s+v(?:s)?\\s+[^\\n\\r|]+/i)?.[0] || "");
           const timeText = clean(dataStart || rawText.match(/\\b\\d{4}-\\d{2}-\\d{2}[T\\s]\\d{1,2}:\\d{2}(?::\\d{2})?(?:Z|[+-]\\d{2}:?\\d{2})?\\b/)?.[0] || rawText.match(/\\b\\d{1,2}\\/\\d{1,2}\\/\\d{2,4}\\s+\\d{1,2}:\\d{2}\\b/)?.[0] || rawText.match(/\\b\\d{1,2}:\\d{2}\\b/)?.[0] || "");
+          const competition = clean(
+            attrValue("data-competition", "data-comp", "data-league", "data-tournament", "data-series", "competition", "league", "tournament", "series") ||
+            findTextBySelectors(['[data-id="competition"]', '[data-id="league"]', '[data-id="tournament"]', '[data-id="series"]', '[class*="competition" i]', '[class*="league" i]', '[class*="tournament" i]', '[class*="series" i]']) ||
+            labelledValue("competition") || labelledValue("league") || labelledValue("tournament") || labelledValue("series")
+          );
+          const venue = clean(
+            attrValue("data-venue", "data-ground", "data-location", "data-stadium", "venue", "ground", "location", "stadium") ||
+            findTextBySelectors(['[data-id="venue"]', '[data-id="ground"]', '[data-id="location"]', '[data-id="stadium"]', '[class*="venue" i]', '[class*="ground" i]', '[class*="location" i]', '[class*="stadium" i]']) ||
+            labelledValue("venue") || labelledValue("ground") || labelledValue("location") || labelledValue("stadium")
+          );
           return {
             match_id: clean(row.getAttribute("data-id") || ""),
             display_name: teamA && teamB ? `${teamA} v ${teamB}` : (dataName || matchText),
             data_name: dataName,
             teamA,
             teamB,
-            section: inferSection(row),
+            competition,
+            venue,
+            data_attrs: dataAttrs,
+            section: sectionOverride || inferSection(row),
             start_time: timeText,
             raw_text: rawText,
             outer_html: row.outerHTML || "",
           };
         };
 
-        const dedupeRows = (rows) => {
+        const dedupeFixtures = (fixtureRows) => {
           const fixtures = [];
           const seen = new Set();
-          for (const row of rows) {
-            const fixture = serializeRow(row);
+          for (const fixture of fixtureRows) {
             const key = fixture.match_id || `${fixture.display_name}|${fixture.start_time}` || fixture.outer_html;
             if (!key || seen.has(key)) continue;
             seen.add(key);
@@ -1382,13 +1522,32 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
           return fixtures;
         };
 
+        const dedupeRows = (rows, sectionOverride = "") => dedupeFixtures(
+          rows.map((row) => serializeRow(row, sectionOverride))
+        );
+
         const extractSnapshot = () => {
+          const todayButton = findSectionButton("today");
+          const inPlayButton = findSectionButton("in_play");
+          const tomorrowButton = findSectionButton("tomorrow");
+          const thisMonthButton = findSectionButton("this_month");
+          const nextMonthButton = findSectionButton("next_month");
+          const beyondButton = findSectionButton("beyond");
           const todayContainer = findContainer(todaySelectors);
           const inPlayContainer = findContainer(inPlaySelectors);
           const tomorrowContainer = findContainer(tomorrowSelectors);
+          const thisMonthContainer = findContainer(thisMonthSelectors) || resolvePanelFromButton(thisMonthButton);
+          const nextMonthContainer = findContainer(nextMonthSelectors) || resolvePanelFromButton(nextMonthButton);
+          const beyondContainer = findContainer(beyondSelectors) || resolvePanelFromButton(beyondButton);
           const todayRows = querySectionRows(todaySelectors);
           const inPlayRows = querySectionRows(inPlaySelectors);
           const tomorrowRows = querySectionRows(tomorrowSelectors);
+          const selectedThisMonthRows = querySectionRows(thisMonthSelectors);
+          const selectedNextMonthRows = querySectionRows(nextMonthSelectors);
+          const selectedBeyondRows = querySectionRows(beyondSelectors);
+          const thisMonthRows = selectedThisMonthRows.length ? selectedThisMonthRows : queryPanelRows(thisMonthContainer);
+          const nextMonthRows = selectedNextMonthRows.length ? selectedNextMonthRows : queryPanelRows(nextMonthContainer);
+          const beyondRows = selectedBeyondRows.length ? selectedBeyondRows : queryPanelRows(beyondContainer);
           const fallbackSelector = `${rowSelector}, [data-id][data-start], [data-name][data-start], tr, .card, .fixture, [class*="fixture" i]`;
           const allRows = queryAllDeep(fallbackSelector).filter((row) => {
             if (!row) return false;
@@ -1398,21 +1557,29 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
           });
           const candidateRows = queryAllDeep(candidateSelector).filter((row) => isVisible(row) && clean(row.innerText || row.textContent || ""));
           const readyRootExists = readyRootSelectors.some((selector) => !!queryFirstDeep(selector));
-          const inPlayButton = findSectionButton("in_play");
-          const tomorrowButton = findSectionButton("tomorrow");
           const preferredRows = [...inPlayRows, ...todayRows];
           return {
+            todayButton,
             todayContainer,
             inPlayContainer,
             tomorrowContainer,
+            thisMonthContainer,
+            nextMonthContainer,
+            beyondContainer,
             inPlayButton,
             tomorrowButton,
+            thisMonthButton,
+            nextMonthButton,
+            beyondButton,
             todayRows,
             inPlayRows,
             tomorrowRows,
+            thisMonthRows,
+            nextMonthRows,
+            beyondRows,
             allRows,
             candidateRows,
-            ready: todayRows.length > 0 || tomorrowRows.length > 0 || inPlayRows.length > 0 || (readyRootExists && allRows.length > 0) || (!!inPlayButton && allRows.length > 0) || (!!tomorrowButton && allRows.length > 0),
+            ready: todayRows.length > 0 || tomorrowRows.length > 0 || inPlayRows.length > 0 || thisMonthRows.length > 0 || nextMonthRows.length > 0 || beyondRows.length > 0 || (readyRootExists && allRows.length > 0) || (!!inPlayButton && allRows.length > 0) || (!!tomorrowButton && allRows.length > 0) || (!!thisMonthButton && allRows.length > 0) || (!!nextMonthButton && allRows.length > 0) || (!!beyondButton && allRows.length > 0),
             readyRootExists,
           };
         };
@@ -1420,7 +1587,15 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         const maybeExpandSection = (kind, snapshot) => {
           const button = findSectionButton(kind);
           const panel = resolvePanelFromButton(button);
-          const rows = kind === "today" ? snapshot.todayRows : (kind === "tomorrow" ? snapshot.tomorrowRows : snapshot.inPlayRows);
+          const rowsBySection = {
+            today: snapshot.todayRows,
+            in_play: snapshot.inPlayRows,
+            tomorrow: snapshot.tomorrowRows,
+            this_month: snapshot.thisMonthRows,
+            next_month: snapshot.nextMonthRows,
+            beyond: snapshot.beyondRows,
+          };
+          const rows = rowsBySection[kind] || [];
           if (!button || !panel || rows.length > 0 || panelLooksExpanded(panel)) return false;
           try {
             button.click();
@@ -1435,9 +1610,15 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         let scrollAttempted = false;
         let scrollPasses = 0;
         let snapshot = extractSnapshot();
-        expanded = maybeExpandSection("today", snapshot) || expanded;
-        expanded = maybeExpandSection("in_play", snapshot) || expanded;
-        expanded = maybeExpandSection("tomorrow", snapshot) || expanded;
+        if (targetSection === "upcoming") {
+          expanded = maybeExpandSection("this_month", snapshot) || expanded;
+          expanded = maybeExpandSection("next_month", snapshot) || expanded;
+          expanded = maybeExpandSection("beyond", snapshot) || expanded;
+        } else {
+          expanded = maybeExpandSection("today", snapshot) || expanded;
+          expanded = maybeExpandSection("in_play", snapshot) || expanded;
+          expanded = maybeExpandSection("tomorrow", snapshot) || expanded;
+        }
 
         const trimFixture = (fixture) => ({
           match_id: fixture.match_id,
@@ -1445,6 +1626,9 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
           data_name: fixture.data_name,
           teamA: fixture.teamA,
           teamB: fixture.teamB,
+          competition: fixture.competition,
+          venue: fixture.venue,
+          data_attrs: fixture.data_attrs,
           section: fixture.section,
           start_time: fixture.start_time,
           raw_text: fixture.raw_text,
@@ -1452,7 +1636,7 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
 
         const scrollTargets = () => {
           const targets = [document.scrollingElement || document.documentElement || document.body];
-          for (const selector of ["#date", "#Today_container", "#Tomorrow_container", "#tomorrow_container", "#running_container", "#Today", "#Tomorrow", "#tomorrow", "#running"]) {
+          for (const selector of ["#date", "#Today_container", "#Tomorrow_container", "#tomorrow_container", "#running_container", "#ThisMonth_container", "#thismonth_container", "#this_month_container", "#NextMonth_container", "#nextmonth_container", "#next_month_container", "#Beyond_container", "#beyond_container", "#Today", "#Tomorrow", "#tomorrow", "#running", "#ThisMonth", "#thisMonth", "#thismonth", "#this_month", "#NextMonth", "#nextMonth", "#nextmonth", "#next_month", "#Beyond", "#beyond"]) {
             const node = queryFirstDeep(selector);
             if (node && !targets.includes(node)) targets.push(node);
           }
@@ -1509,12 +1693,29 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
 
         const finish = (scrolledRows = []) => {
           snapshot = extractSnapshot();
+          const describeSection = (button, container, rows) => ({
+            button_text: clean(button?.innerText || button?.textContent || ""),
+            button_target: clean(button?.getAttribute("data-target") || button?.getAttribute("data-bs-target") || ""),
+            button_aria_controls: clean(button?.getAttribute("aria-controls") || ""),
+            container_id: clean(container?.id || ""),
+            row_count: rows.length,
+          });
           const preferredRows = targetSection === "tomorrow"
             ? snapshot.tomorrowRows
             : targetSection === "today"
               ? [...snapshot.inPlayRows, ...snapshot.todayRows]
               : snapshot.allRows;
-          const preferredFixtures = dedupeRows(preferredRows);
+          const upcomingFixtures = dedupeFixtures([
+            ...dedupeRows(snapshot.thisMonthRows, "this_month"),
+            ...dedupeRows(
+              snapshot.nextMonthRows,
+              clean(snapshot.nextMonthButton?.innerText || snapshot.nextMonthButton?.textContent || "").toUpperCase().includes("BEYOND")
+                ? "next_month_and_beyond"
+                : "next_month"
+            ),
+            ...dedupeRows(snapshot.beyondRows, "beyond"),
+          ]);
+          const preferredFixtures = targetSection === "upcoming" ? upcomingFixtures : dedupeRows(preferredRows);
           const allFixtures = dedupeRows([...snapshot.allRows, ...snapshot.candidateRows, ...scrolledRows]);
           const source = preferredFixtures.length ? `${targetSection}_section` : "date_fallback";
           done({
@@ -1525,11 +1726,22 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
             todayRowsCount: snapshot.todayRows.length,
             inPlayRowsCount: snapshot.inPlayRows.length,
             tomorrowRowsCount: snapshot.tomorrowRows.length,
+            thisMonthRowsCount: snapshot.thisMonthRows.length,
+            nextMonthRowsCount: snapshot.nextMonthRows.length,
+            beyondRowsCount: snapshot.beyondRows.length,
             allRowsCount: snapshot.allRows.length,
             candidateRowsCount: snapshot.candidateRows.length,
             foundTodayContainer: !!snapshot.todayContainer,
             foundInPlayContainer: !!snapshot.inPlayContainer,
             foundTomorrowContainer: !!snapshot.tomorrowContainer,
+            foundThisMonthContainer: !!snapshot.thisMonthContainer,
+            foundNextMonthContainer: !!snapshot.nextMonthContainer,
+            foundBeyondContainer: !!snapshot.beyondContainer,
+            section_diagnostics: {
+              this_month: describeSection(snapshot.thisMonthButton, snapshot.thisMonthContainer, snapshot.thisMonthRows),
+              next_month: describeSection(snapshot.nextMonthButton, snapshot.nextMonthContainer, snapshot.nextMonthRows),
+              beyond: describeSection(snapshot.beyondButton, snapshot.beyondContainer, snapshot.beyondRows),
+            },
             targetSection,
             scrollAttempted,
             scrollPasses,
@@ -1542,10 +1754,15 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         const tick = () => {
           snapshot = extractSnapshot();
           const waitedLongEnough = Date.now() - start >= 1500;
-          const targetReady = targetSection === "tomorrow"
-            ? snapshot.tomorrowRows.length > 0
-            : snapshot.ready;
-          if (targetReady || !expanded || waitedLongEnough) {
+          const targetReady = targetSection === "upcoming"
+            ? snapshot.thisMonthRows.length > 0 || snapshot.nextMonthRows.length > 0 || snapshot.beyondRows.length > 0
+            : targetSection === "tomorrow"
+              ? snapshot.tomorrowRows.length > 0
+              : snapshot.ready;
+          const shouldFinish = targetSection === "upcoming"
+            ? waitedLongEnough
+            : targetReady || !expanded || waitedLongEnough;
+          if (shouldFinish) {
             scrollAndCollect(finish);
             return;
           }
@@ -1559,6 +1776,9 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
         list(DECIMAL_LEGACY_TODAY_ROW_SELECTORS),
         list(DECIMAL_LEGACY_IN_PLAY_ROW_SELECTORS),
         list(DECIMAL_LEGACY_TOMORROW_ROW_SELECTORS),
+        list(DECIMAL_LEGACY_THIS_MONTH_ROW_SELECTORS),
+        list(DECIMAL_LEGACY_NEXT_MONTH_ROW_SELECTORS),
+        list(DECIMAL_LEGACY_BEYOND_ROW_SELECTORS),
         list(DECIMAL_LEGACY_READY_ROOT_SELECTORS),
         target_section,
     )
@@ -1569,30 +1789,47 @@ def extract_decimal_legacy_rows_via_js(driver: WebDriver, target_day: date, verb
 
 
 def wait_for_decimal_legacy_rows_via_js(
-    driver: WebDriver, target_day: date, timeout: int, verbose: bool
+    driver: WebDriver,
+    target_day: date,
+    timeout: int,
+    verbose: bool,
+    target_section_override: str | None = None,
 ) -> dict[str, object]:
-    """Wait for Decimal Legacy Developer Today/In Play rows to become available."""
+    """Wait for Decimal Legacy Developer rows to become available."""
     payload: dict[str, object] = {}
 
     def poll(current_driver: WebDriver) -> bool:
         nonlocal payload
-        payload = extract_decimal_legacy_rows_via_js(current_driver, target_day, verbose)
+        payload = extract_decimal_legacy_rows_via_js(
+            current_driver,
+            target_day,
+            verbose,
+            target_section_override,
+        )
         return (
             bool(payload.get("allRowsCount"))
             or bool(payload.get("candidateRowsCount"))
             or bool(payload.get("todayRowsCount"))
             or bool(payload.get("tomorrowRowsCount"))
             or bool(payload.get("inPlayRowsCount"))
+            or bool(payload.get("thisMonthRowsCount"))
+            or bool(payload.get("nextMonthRowsCount"))
+            or bool(payload.get("beyondRowsCount"))
         )
 
     try:
         WebDriverWait(driver, timeout).until(poll)
     except TimeoutException as exc:
-        raise RuntimeError("Decimal Legacy Developer Today/In Play sections could not be found.") from exc
+        raise RuntimeError("Decimal Legacy Developer fixture sections could not be found.") from exc
     return payload
 
 
-def open_decimal_legacy_developer(driver: WebDriver, target_day: date, verbose: bool) -> dict[str, object]:
+def open_decimal_legacy_developer(
+    driver: WebDriver,
+    target_day: date,
+    verbose: bool,
+    target_section_override: str | None = None,
+) -> dict[str, object]:
     """Navigate Decimal to the Legacy Developer viewer and return JS extraction payload."""
     verbose_log(verbose, f"Opening Decimal dec page: {DECIMAL_DEC_URL}")
     try:
@@ -1624,10 +1861,19 @@ def open_decimal_legacy_developer(driver: WebDriver, target_day: date, verbose: 
     except Exception as exc:
         raise RuntimeError("Decimal Legacy Developer menu could not be opened.") from exc
 
-    payload = wait_for_decimal_legacy_rows_via_js(driver, target_day, DECIMAL_WAIT_SECONDS, verbose)
+    payload = wait_for_decimal_legacy_rows_via_js(
+        driver,
+        target_day,
+        DECIMAL_WAIT_SECONDS,
+        verbose,
+        target_section_override,
+    )
     verbose_log(verbose, f"Decimal Legacy Developer Today rows found: {int(payload.get('todayRowsCount', 0))}")
     verbose_log(verbose, f"Decimal Legacy Developer Tomorrow rows found: {int(payload.get('tomorrowRowsCount', 0))}")
     verbose_log(verbose, f"Decimal Legacy Developer In Play rows found: {int(payload.get('inPlayRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer This Month rows found: {int(payload.get('thisMonthRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer Next Month rows found: {int(payload.get('nextMonthRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal Legacy Developer Beyond rows found: {int(payload.get('beyondRowsCount', 0))}")
     return payload
 
 
@@ -1691,10 +1937,135 @@ def infer_decimal_match_name(row_payload: dict[str, object], start_time_text: st
     return raw_text
 
 
+def row_payload_value(row_payload: dict[str, object], keys: Iterable[str]) -> str:
+    """Return the first non-empty direct or data-attribute payload value."""
+    data_attrs = row_payload.get("data_attrs")
+    attr_values = data_attrs if isinstance(data_attrs, dict) else {}
+    for key in keys:
+        direct = normalize_whitespace(str(row_payload.get(key, "")))
+        if direct:
+            return direct
+        attr_key = key.removeprefix("data_").replace("_", "-")
+        attr_value = normalize_whitespace(str(attr_values.get(attr_key, "")))
+        if attr_value:
+            return attr_value
+    return ""
+
+
+def infer_labelled_decimal_value(row_payload: dict[str, object], labels: Iterable[str]) -> str:
+    """Infer labelled metadata from visible row text."""
+    raw_text = normalize_whitespace(str(row_payload.get("raw_text", "")))
+    if not raw_text:
+        return ""
+    for label in labels:
+        match = re.search(rf"\b{re.escape(label)}\b\s*[:|-]\s*([^|\n\r]+)", raw_text, flags=re.IGNORECASE)
+        if match:
+            return normalize_whitespace(match.group(1))
+    return ""
+
+
+def infer_decimal_competition(row_payload: dict[str, object]) -> str:
+    """Infer Decimal competition metadata from structured fields or visible labels."""
+    return (
+        row_payload_value(
+            row_payload,
+            (
+                "competition",
+                "league",
+                "tournament",
+                "series",
+                "comp",
+                "data_competition",
+                "data_league",
+                "data_tournament",
+                "data_series",
+            ),
+        )
+        or infer_labelled_decimal_value(row_payload, ("competition", "league", "tournament", "series"))
+        or infer_decimal_competition_from_data_name(row_payload)
+    )
+
+
+def infer_decimal_competition_from_data_name(row_payload: dict[str, object]) -> str:
+    """Infer competition from Decimal data-name text after the fixture name."""
+    data_name = normalize_whitespace(str(row_payload.get("data_name", "")))
+    if not data_name:
+        return ""
+
+    match_name = normalize_whitespace(str(row_payload.get("display_name", "")))
+    if not match_name:
+        team_a = normalize_whitespace(str(row_payload.get("teamA", "")))
+        team_b = normalize_whitespace(str(row_payload.get("teamB", "")))
+        if team_a and team_b:
+            match_name = f"{team_a} v {team_b}"
+
+    remainder = data_name
+    if match_name and remainder.lower().startswith(match_name.lower()):
+        remainder = remainder[len(match_name):]
+
+    remainder = normalize_whitespace(remainder.strip(" ,.-"))
+    if not remainder:
+        return ""
+
+    before_venue = re.split(r"\bfrom\b", remainder, maxsplit=1, flags=re.IGNORECASE)[0]
+    return normalize_whitespace(before_venue.strip(" ,.-"))
+
+
+def infer_decimal_venue(row_payload: dict[str, object]) -> str:
+    """Infer Decimal venue metadata from structured fields or visible labels."""
+    return (
+        row_payload_value(
+            row_payload,
+            (
+                "venue",
+                "ground",
+                "location",
+                "stadium",
+                "data_venue",
+                "data_ground",
+                "data_location",
+                "data_stadium",
+            ),
+        )
+        or infer_labelled_decimal_value(row_payload, ("venue", "ground", "location", "stadium"))
+        or infer_decimal_venue_from_data_name(row_payload)
+    )
+
+
+def infer_decimal_venue_from_data_name(row_payload: dict[str, object]) -> str:
+    """Infer venue from Decimal data-name text after the word 'from'."""
+    data_name = normalize_whitespace(str(row_payload.get("data_name", "")))
+    if not data_name:
+        return ""
+    match = re.search(r"\bfrom\s+(.+)$", data_name, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return normalize_whitespace(match.group(1).strip(" ,.-"))
+
+
+def decimal_fixture_metadata(row_payload: dict[str, object]) -> dict[str, object]:
+    """Keep the original Decimal row data that is useful in downstream JSON."""
+    data_attrs = row_payload.get("data_attrs")
+    return {
+        "match_id": normalize_whitespace(str(row_payload.get("match_id", ""))),
+        "display_name": normalize_whitespace(str(row_payload.get("display_name", ""))),
+        "data_name": normalize_whitespace(str(row_payload.get("data_name", ""))),
+        "teamA": normalize_whitespace(str(row_payload.get("teamA", ""))),
+        "teamB": normalize_whitespace(str(row_payload.get("teamB", ""))),
+        "competition": infer_decimal_competition(row_payload),
+        "venue": infer_decimal_venue(row_payload),
+        "section": normalize_whitespace(str(row_payload.get("section", ""))),
+        "start_time": normalize_whitespace(str(row_payload.get("start_time", ""))),
+        "raw_text": normalize_whitespace(str(row_payload.get("raw_text", "")))[:1000],
+        "data_attrs": data_attrs if isinstance(data_attrs, dict) else {},
+    }
+
+
 def parse_decimal_legacy_fixture_payload_with_reason(
     row_payload: dict[str, object],
     target_day: date,
     verbose: bool,
+    require_target_day: bool = True,
 ) -> tuple[Optional[Fixture], str]:
     """Convert a JS-extracted row into a fixture and explain discarded rows."""
     start_time_text = infer_decimal_start_text(row_payload)
@@ -1706,9 +2077,10 @@ def parse_decimal_legacy_fixture_payload_with_reason(
         return None, "missing match name"
 
     start_time = parse_decimal_datetime(start_time_text, target_day, verbose=verbose)
-    if start_time is None or start_time.date() != target_day:
-        parsed_text = start_time.isoformat() if start_time else "unparsed"
-        return None, f"start time not on target day ({parsed_text})"
+    if start_time is None:
+        return None, "unparsed start time"
+    if require_target_day and start_time.date() != target_day:
+        return None, f"start time not on target day ({start_time.isoformat()})"
 
     if is_rejected_fixture_text(match_name):
         return None, "rejected non-fixture text"
@@ -1718,9 +2090,12 @@ def parse_decimal_legacy_fixture_payload_with_reason(
     return (
         Fixture(
             match_name=match_name,
-            competition="",
+            competition=infer_decimal_competition(row_payload),
             start_time=start_time,
             source="decimal",
+            venue=infer_decimal_venue(row_payload),
+            event_id=normalize_whitespace(str(row_payload.get("match_id", ""))) or None,
+            metadata=decimal_fixture_metadata(row_payload),
         ),
         "kept",
     )
@@ -1774,17 +2149,86 @@ def build_decimal_legacy_fixtures_from_rows(
     return sorted(fixtures, key=lambda item: item.start_time)
 
 
+def build_decimal_legacy_upcoming_fixtures_from_rows(
+    row_payloads: Iterable[dict[str, object]],
+    reference_day: date,
+    verbose: bool,
+    debug_rows: Optional[list[dict[str, object]]] = None,
+) -> list[Fixture]:
+    """Convert future-section rows into deduplicated fixtures across multiple dates."""
+    fixtures: list[Fixture] = []
+    seen_keys: set[tuple[str, datetime]] = set()
+    for row_payload in row_payloads:
+        row_dict = dict(row_payload)
+        fixture, reason = parse_decimal_legacy_fixture_payload_with_reason(
+            row_dict,
+            reference_day,
+            verbose,
+            require_target_day=False,
+        )
+        if fixture is None:
+            if debug_rows is not None:
+                debug_rows.append(
+                    {
+                        "status": "discarded",
+                        "reason": reason,
+                        "row": sanitize_decimal_candidate(row_dict),
+                    }
+                )
+            continue
+        if fixture.start_time.astimezone(UK_TZ).date() < reference_day:
+            if debug_rows is not None:
+                debug_rows.append(
+                    {
+                        "status": "discarded",
+                        "reason": "fixture is before the forward scan date",
+                        "row": sanitize_decimal_candidate(row_dict),
+                        "parsed": fixture_to_debug_dict(fixture),
+                    }
+                )
+            continue
+        identity = fixture.event_id or normalize_name(fixture.match_name)
+        dedupe_key = (identity, fixture.start_time)
+        if dedupe_key in seen_keys:
+            if debug_rows is not None:
+                debug_rows.append(
+                    {
+                        "status": "discarded",
+                        "reason": "duplicate fixture",
+                        "row": sanitize_decimal_candidate(row_dict),
+                        "parsed": fixture_to_debug_dict(fixture),
+                    }
+                )
+            continue
+        seen_keys.add(dedupe_key)
+        if debug_rows is not None:
+            debug_rows.append(
+                {
+                    "status": "kept",
+                    "reason": reason,
+                    "row": sanitize_decimal_candidate(row_dict),
+                    "parsed": fixture_to_debug_dict(fixture),
+                }
+            )
+        fixtures.append(fixture)
+    return sorted(fixtures, key=lambda item: item.start_time)
+
+
 def sanitize_decimal_candidate(row_payload: dict[str, object]) -> dict[str, object]:
     """Keep useful Decimal candidate fields without bloating debug JSON."""
+    data_attrs = row_payload.get("data_attrs")
     return {
         "match_id": normalize_whitespace(str(row_payload.get("match_id", ""))),
         "display_name": normalize_whitespace(str(row_payload.get("display_name", ""))),
         "data_name": normalize_whitespace(str(row_payload.get("data_name", ""))),
         "teamA": normalize_whitespace(str(row_payload.get("teamA", ""))),
         "teamB": normalize_whitespace(str(row_payload.get("teamB", ""))),
+        "competition": normalize_whitespace(str(row_payload.get("competition", ""))),
+        "venue": normalize_whitespace(str(row_payload.get("venue", ""))),
         "section": normalize_whitespace(str(row_payload.get("section", ""))),
         "start_time": normalize_whitespace(str(row_payload.get("start_time", ""))),
         "raw_text": normalize_whitespace(str(row_payload.get("raw_text", "")))[:1000],
+        "data_attrs": data_attrs if isinstance(data_attrs, dict) else {},
     }
 
 
@@ -1793,6 +2237,7 @@ def fixture_to_debug_dict(fixture: Fixture) -> dict[str, str]:
     return {
         "match_name": fixture.match_name,
         "competition": fixture.competition,
+        "venue": fixture.venue,
         "start_time": fixture.start_time.isoformat(),
         "source": fixture.source,
     }
@@ -1837,12 +2282,16 @@ def write_decimal_debug_artifacts(
             "today_rows": int(payload.get("todayRowsCount", 0)),
             "tomorrow_rows": int(payload.get("tomorrowRowsCount", 0)),
             "in_play_rows": int(payload.get("inPlayRowsCount", 0)),
+            "this_month_rows": int(payload.get("thisMonthRowsCount", 0)),
+            "next_month_rows": int(payload.get("nextMonthRowsCount", 0)),
+            "beyond_rows": int(payload.get("beyondRowsCount", 0)),
             "all_rows_visible_at_finish": int(payload.get("allRowsCount", 0)),
         },
         "scroll": {
             "attempted": bool(payload.get("scrollAttempted")),
             "passes": int(payload.get("scrollPasses", 0)),
         },
+        "section_diagnostics": payload.get("section_diagnostics") or {},
         "candidates": debug_rows,
         "fixtures": [fixture_to_debug_dict(fixture) for fixture in fixtures],
     }
@@ -1933,14 +2382,52 @@ def extract_decimal_legacy_developer_fixtures(
     return fixtures
 
 
+def extract_decimal_legacy_upcoming_fixtures(
+    driver: WebDriver,
+    reference_day: date,
+    verbose: bool,
+    debug_decimal: bool = False,
+) -> list[Fixture]:
+    """Extract all fixtures from Decimal's two forward-looking panels."""
+    payload = open_decimal_legacy_developer(
+        driver,
+        reference_day,
+        verbose,
+        target_section_override="upcoming",
+    )
+    upcoming_rows = payload.get("preferred_fixtures") or []
+    verbose_log(verbose, f"Decimal forward-scan This Month rows: {int(payload.get('thisMonthRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal forward-scan Next Month and Beyond rows: {int(payload.get('nextMonthRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal forward-scan separate Beyond rows: {int(payload.get('beyondRowsCount', 0))}")
+    verbose_log(verbose, f"Decimal forward-scan combined rows: {len(upcoming_rows)}")
+    debug_rows: list[dict[str, object]] = []
+    fixtures = build_decimal_legacy_upcoming_fixtures_from_rows(
+        upcoming_rows,
+        reference_day,
+        verbose,
+        debug_rows if debug_decimal else None,
+    )
+    if not fixtures:
+        write_decimal_debug_artifacts(driver, payload, debug_rows, [], debug_decimal)
+        raise RuntimeError(
+            "No valid Decimal fixtures were found in the forward-looking panels."
+        )
+    if debug_decimal:
+        write_decimal_debug_artifacts(driver, payload, debug_rows, fixtures, debug_decimal)
+    verbose_log(verbose, f"Decimal forward-scan final fixture count: {len(fixtures)}")
+    return fixtures
+
+
 def fixture_row_to_fixture(row: pd.Series, target_day: date, verbose: bool = False) -> Optional[Fixture]:
     """Convert a dataframe row to a normalized Decimal fixture."""
     columns = list(row.index)
     match_col = infer_column(columns, ("match", "event", "name", "teams", "fixture"))
     time_col = infer_column(columns, ("start", "time", "date"))
     competition_col = infer_column(columns, ("competition", "league", "tournament", "series"))
+    venue_col = infer_column(columns, ("venue", "ground", "location", "stadium"))
     match_name: Optional[str] = None
     competition = ""
+    venue = ""
     time_text: Optional[str] = None
 
     if match_col is not None and time_col is not None:
@@ -1951,6 +2438,8 @@ def fixture_row_to_fixture(row: pd.Series, target_day: date, verbose: bool = Fal
             time_text = candidate_time
             if competition_col:
                 competition = normalize_whitespace(str(row.get(competition_col, ""))).replace("nan", "")
+            if venue_col:
+                venue = normalize_whitespace(str(row.get(venue_col, ""))).replace("nan", "")
 
     if not match_name or not time_text:
         match_name, competition, time_text = pick_fixture_fields_from_generic_row(row)
@@ -1971,6 +2460,7 @@ def fixture_row_to_fixture(row: pd.Series, target_day: date, verbose: bool = Fal
         competition=competition,
         start_time=start_time,
         source="decimal",
+        venue=venue,
     )
 
 
@@ -2009,6 +2499,39 @@ def fetch_decimal_fixtures(target_day: date, verbose: bool, debug_decimal: bool 
         raise
     except Exception as exc:
         raise DecimalScrapeError(f"Decimal fixture scrape failed: {exc}") from exc
+    finally:
+        driver.quit()
+
+
+def fetch_decimal_upcoming_fixtures(verbose: bool, debug_decimal: bool = False) -> list[Fixture]:
+    """Log into Decimal and scrape all fixtures from its forward-looking panels."""
+    reference_day = datetime.now(UK_TZ).date()
+    verbose_log(verbose, f"Fetching all Decimal forward fixtures from {reference_day.isoformat()}")
+    login_start = perf_counter()
+    try:
+        driver = build_chrome_driver()
+    except Exception as exc:
+        raise DecimalScrapeError(f"Decimal browser startup failed: {exc}") from exc
+
+    try:
+        login_decimal(driver, verbose)
+        verbose_log(verbose, f"Decimal login time: {perf_counter() - login_start:.2f}s")
+        extraction_start = perf_counter()
+        fixtures = extract_decimal_legacy_upcoming_fixtures(
+            driver,
+            reference_day,
+            verbose,
+            debug_decimal,
+        )
+        verbose_log(
+            verbose,
+            f"Decimal forward fixture extraction time: {perf_counter() - extraction_start:.2f}s",
+        )
+        return fixtures
+    except DecimalScrapeError:
+        raise
+    except Exception as exc:
+        raise DecimalScrapeError(f"Decimal forward fixture scrape failed: {exc}") from exc
     finally:
         driver.quit()
 

@@ -98,6 +98,12 @@ BETFAIR_PASSWORD=
 BETFAIR_APP_KEY=
 DECIMAL_USERNAME=
 DECIMAL_PASSWORD=
+CRICKET_FIXTURE_API_KEY=
+CRICKET_FIXTURE_REFRESH_ENABLED=true
+CRICKET_FIXTURE_REFRESH_INTERVAL_MINUTES=180
+CRICKET_FIXTURE_REFRESH_INITIAL_DELAY_SECONDS=30
+CRICKET_FIXTURE_REFRESH_TIMEOUT_SECONDS=1200
+CRICKET_FIXTURE_API_MAX_AGE_MINUTES=240
 DG_API_KEY=
 GOLF_NR_SLACK_WEBHOOK_URL=
 GOLF_NR_SLACK_BOT_TOKEN=
@@ -109,6 +115,16 @@ DUPE_MATCH_SLACK_WEBHOOK_URL=
 SLACK_WEBHOOK_URL=
 Slack_Webhook_TIP=
 ```
+
+Generate a separate API key on the EC2 server and place the result in
+`CRICKET_FIXTURE_API_KEY`:
+
+```bash
+openssl rand -hex 32
+```
+
+Do not reuse `APP_PASSWORD` as the API key. The Hub browser uses a login cookie, while API
+clients authenticate with `Authorization: Bearer <key>`.
 
 Slack webhook routing:
 
@@ -144,6 +160,12 @@ Then test:
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://127.0.0.1:8000/api/v1/cricket-fixtures/status
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://127.0.0.1:8000/api/v1/cricket-fixtures/today
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+  http://127.0.0.1:8000/api/v1/cricket-fixtures/all
 ```
 
 From your browser, test `http://EC2_PUBLIC_IP:8000` only if the security group allows your IP.
@@ -180,6 +202,8 @@ The example service:
 - Loads environment from `/opt/betfair-scripts/.env`.
 - Runs Uvicorn on `127.0.0.1:8000`.
 - Restarts on failure.
+- Refreshes cached Decimal fixtures for today, tomorrow, and the combined This Month plus
+  Next Month and Beyond scan inside the running Hub process.
 
 Check logs:
 

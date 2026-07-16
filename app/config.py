@@ -58,6 +58,10 @@ def app_password() -> str:
     return get_setting("APP_PASSWORD")
 
 
+def cricket_fixture_api_key() -> str:
+    return get_setting("CRICKET_FIXTURE_API_KEY")
+
+
 def session_secret() -> str:
     return get_setting("SESSION_SECRET") or app_password() or "local-dev-session-secret"
 
