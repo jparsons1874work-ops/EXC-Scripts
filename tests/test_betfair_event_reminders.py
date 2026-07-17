@@ -45,6 +45,7 @@ def reminder(
     market_id: str = "",
     market_name: str = "Match Odds",
     market_type_code: str = "MATCH_ODDS",
+    country_code: str = "GB",
     event_name: str | None = None,
     emoji: str = ":test:",
 ) -> EventReminder:
@@ -60,6 +61,7 @@ def reminder(
         market_name=market_name,
         event_start_utc=start_utc,
         market_type_code=market_type_code,
+        country_code=country_code,
     )
 
 
@@ -352,10 +354,7 @@ class BetfairEventReminderTests(unittest.TestCase):
 
     def test_cycling_catalogue_has_no_api_side_market_type_filter(self) -> None:
         self.assertIsNone(reminders.api_market_type_filter_for_sport("Cycling", reminders.SPORT_RULE_WINNER_MARKETS))
-        self.assertEqual(
-            reminders.api_market_type_filter_for_sport("Golf", reminders.SPORT_RULE_WINNER_MARKETS),
-            ("WINNER",),
-        )
+        self.assertIsNone(reminders.api_market_type_filter_for_sport("Golf", reminders.SPORT_RULE_WINNER_MARKETS))
 
     def test_cycling_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
         item = select_market_reminders(
@@ -376,7 +375,115 @@ class BetfairEventReminderTests(unittest.TestCase):
             "Golf",
         )
         self.assertEqual([item.market_id for item in selected], ["1.golf-win"])
-        self.assertEqual(selected[0].selection_reason, "golf_winner_market")
+        self.assertEqual(selected[0].selection_reason, "golf_main_outright:market_type_code=WINNER")
+
+    def test_golf_outright_winner_market_is_selected(self) -> None:
+        item = reminder(
+            "Golf",
+            "golf-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            market_id="1.golf-outright",
+            market_name="Tournament Winner",
+            market_type_code="OUTRIGHT_WINNER",
+        )
+        selected = select_market_reminders([item], "Golf")
+        self.assertEqual([market.market_id for market in selected], ["1.golf-outright"])
+
+    def test_winner_regular_and_tournament_winner_are_main_outrights(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        regular = reminder(
+            "Golf",
+            "regular",
+            start,
+            market_name="Winner - Regular",
+            market_type_code="WINNER",
+        )
+        tournament = reminder(
+            "Basketball",
+            "tournament",
+            start,
+            market_name="Tournament Winner",
+            market_type_code="TOURNAMENT_WINNER",
+        )
+        self.assertTrue(reminders.outright_market_selection(regular)[0])
+        self.assertTrue(reminders.outright_market_selection(tournament)[0])
+
+    def test_all_sports_outright_side_markets_are_excluded(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        side_markets = [
+            reminder("Cycling", "stage", start, market_name="Stage 10 Winner", market_type_code="STAGE_WINNER"),
+            reminder("Cycling", "points", start, market_name="Points Winner", market_type_code="POINTS_WINNER"),
+            reminder("Esports", "map", start, market_name="Map 1 Winner", market_type_code="MAP_WINNER"),
+            reminder("Boxing", "round", start, market_name="Round 3 Winner", market_type_code="ROUND_WINNER"),
+            reminder("Cycling", "team", start, market_name="Team Winner", market_type_code="TEAM_WINNER"),
+            reminder("Golf", "without", start, market_name="Winner Without Favourite", market_type_code="WINNER"),
+        ]
+        self.assertTrue(all(not reminders.outright_market_selection(item)[0] for item in side_markets))
+
+    def test_au_market_is_excluded_from_event_and_market_selection(self) -> None:
+        item = reminder(
+            "Golf",
+            "au-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            market_name="Tournament Winner",
+            market_type_code="OUTRIGHT_WINNER",
+            country_code="AU",
+        )
+        self.assertEqual(select_market_reminders([item], "Golf"), [])
+        self.assertEqual(select_reminders([item], reminders.SPORT_RULE_ALL), [])
+        self.assertEqual(reminders.outright_market_selection(item), (False, "disallowed_country=AU"))
+
+    def test_catalogue_country_code_is_captured(self) -> None:
+        catalogue = {
+            "event": {"id": "event-1", "name": "Australian Event", "countryCode": "AU"},
+            "event_type": {"id": "3"},
+            "competition": {"id": "c1", "name": "Competition"},
+            "market_id": "1.au",
+            "market_name": "Tournament Winner",
+            "market_start_time": "2026-07-09T14:00:00Z",
+            "description": {"marketType": "OUTRIGHT_WINNER"},
+        }
+        item = reminders.catalogue_to_reminder(catalogue, "Golf", ":golf:", "3")
+        self.assertIsNotNone(item)
+        self.assertEqual(item.country_code, "AU")
+
+    def test_all_sports_discovery_selects_unknown_sport_and_excludes_au(self) -> None:
+        start = "2026-07-09T14:00:00Z"
+        catalogues = [
+            {
+                "event": {"id": "gb-event", "name": "World Championship", "countryCode": "GB"},
+                "event_type": {"id": "99"},
+                "competition": {},
+                "market_id": "1.gb",
+                "market_name": "Tournament Winner",
+                "market_start_time": start,
+                "description": {"marketType": "TOURNAMENT_WINNER"},
+            },
+            {
+                "event": {"id": "au-event", "name": "Australian Championship", "countryCode": "AU"},
+                "event_type": {"id": "99"},
+                "competition": {},
+                "market_id": "1.au",
+                "market_name": "Tournament Winner",
+                "market_start_time": start,
+                "description": {"marketType": "TOURNAMENT_WINNER"},
+            },
+        ]
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        with patch.object(reminders, "list_market_type_codes", return_value=("MATCH_ODDS", "TOURNAMENT_WINNER")), patch.object(
+            reminders,
+            "list_market_catalogues",
+            return_value=catalogues,
+        ):
+            selected, aus_excluded = reminders.discover_all_sports_outright_reminders(
+                object(),
+                {"New Sport": "99"},
+                window,
+            )
+        self.assertEqual([item.market_id for item in selected], ["1.gb"])
+        self.assertEqual(selected[0].sport, "New Sport")
+        self.assertEqual(selected[0].emoji, reminders.GENERIC_OUTRIGHT_EMOJI)
+        self.assertEqual(aus_excluded, {"1.au"})
 
     def test_golf_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
         item = select_market_reminders(
