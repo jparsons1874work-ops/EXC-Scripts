@@ -42,7 +42,7 @@ LOG_DIR = PROJECT_ROOT / "logs"
 
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
-SCAN_START_TIME_UK = time(7, 0)
+SCAN_TIMES_UK = (time(7, 0), time(15, 0), time(23, 0))
 REMINDER_LEAD_MINUTES = 5
 SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
@@ -423,12 +423,21 @@ def is_placeholder(value: str, *, allow_empty: bool = False) -> bool:
     return any(marker in stripped for marker in PLACEHOLDER_MARKERS)
 
 
+def latest_scheduled_scan_start(now_uk: datetime) -> datetime:
+    now = now_uk.astimezone(UK_TZ)
+    for scan_time in reversed(SCAN_TIMES_UK):
+        candidate = datetime.combine(now.date(), scan_time, tzinfo=UK_TZ)
+        if candidate <= now:
+            return candidate
+    return datetime.combine(now.date() - timedelta(days=1), SCAN_TIMES_UK[-1], tzinfo=UK_TZ)
+
+
 def build_scan_window(now_uk: datetime | None = None, lookahead_hours: float = 24, start_now: bool = False) -> ScanWindow:
     now = now_uk.astimezone(UK_TZ) if now_uk else datetime.now(UK_TZ)
     if start_now:
         start_uk = now
     else:
-        start_uk = datetime.combine(now.date(), SCAN_START_TIME_UK, tzinfo=UK_TZ)
+        start_uk = latest_scheduled_scan_start(now)
     end_uk = start_uk + timedelta(hours=lookahead_hours)
     return ScanWindow(start_uk, end_uk, start_uk.astimezone(UTC_TZ), end_uk.astimezone(UTC_TZ))
 
@@ -1473,7 +1482,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     parser.add_argument("--lookahead-hours", type=float, default=24)
-    parser.add_argument("--start-now", action="store_true", help="Use current UK time as scan start.")
+    parser.add_argument(
+        "--start-now",
+        action="store_true",
+        help="Use current UK time instead of the latest scheduled 07:00, 15:00, or 23:00 scan time.",
+    )
     parser.add_argument("--force", action="store_true", help="Ignore duplicate record checks.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")
     return parser.parse_args()

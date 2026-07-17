@@ -211,6 +211,30 @@ Check logs:
 journalctl -u betfair-scripts -f
 ```
 
+### Betfair event reminders timer
+
+The reminders scan runs from a separate systemd timer at 07:00, 15:00, and 23:00
+Europe/London time. Every launch scans the next 24 hours from that scheduled time. The
+shared reminder state file prevents an event found in overlapping scans from being
+scheduled in Slack more than once.
+
+Install and start the timer:
+
+```bash
+sudo cp deploy/betfair-event-reminders.service.example /etc/systemd/system/betfair-event-reminders.service
+sudo cp deploy/betfair-event-reminders.timer.example /etc/systemd/system/betfair-event-reminders.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now betfair-event-reminders.timer
+sudo systemctl list-timers betfair-event-reminders.timer
+```
+
+Check scan logs or trigger one scan immediately:
+
+```bash
+journalctl -u betfair-event-reminders.service -n 200 --no-pager
+sudo systemctl start betfair-event-reminders.service
+```
+
 ## 6. Nginx Reverse Proxy
 
 Install Nginx when the app works:

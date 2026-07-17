@@ -1,0 +1,17 @@
+[Unit]
+Description=Betfair Event Reminders scan
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/betfair-scripts
+EnvironmentFile=/opt/betfair-scripts/.env
+Environment=HOME=/home/ubuntu
+Environment=USER=ubuntu
+Environment=PATH=/opt/betfair-scripts/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/betfair-scripts/.venv/bin/python /opt/betfair-scripts/scripts/Betfair_Event_Reminders.py
+TimeoutStartSec=30min

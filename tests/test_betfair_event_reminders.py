@@ -28,6 +28,7 @@ from Betfair_Event_Reminders import (  # noqa: E402
     select_reminders,
     select_market_reminders,
     select_reminders_with_reasons,
+    scheduled_keys,
     slack_bucket_warnings,
     ConfigMissing,
     ConfigPlaceholderError,
@@ -77,6 +78,24 @@ class BetfairEventReminderTests(unittest.TestCase):
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_utc, datetime(2026, 7, 9, 6, 0, tzinfo=timezone.utc))
         self.assertEqual(window.end_utc, datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc))
+
+    def test_1500_uk_scan_window(self) -> None:
+        now = datetime(2026, 7, 9, 15, 2, tzinfo=UK_TZ)
+        window = build_scan_window(now_uk=now)
+        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 15:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 15:00 BST")
+
+    def test_2300_uk_scan_window(self) -> None:
+        now = datetime(2026, 7, 9, 23, 2, tzinfo=UK_TZ)
+        window = build_scan_window(now_uk=now)
+        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 23:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 23:00 BST")
+
+    def test_before_0700_uses_previous_2300_scan_window(self) -> None:
+        now = datetime(2026, 7, 10, 6, 59, tzinfo=UK_TZ)
+        window = build_scan_window(now_uk=now)
+        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 23:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 23:00 BST")
 
     def test_event_start_minus_five_minutes(self) -> None:
         event_start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
@@ -241,6 +260,18 @@ class BetfairEventReminderTests(unittest.TestCase):
     def test_duplicate_key_generation(self) -> None:
         item = reminder("Snooker", "123", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
         self.assertEqual(duplicate_key(item, 1783605300, "C123"), "Snooker|123|1783605300|C123")
+
+    def test_overlapping_scans_reuse_persisted_duplicate_key(self) -> None:
+        item = reminder("Golf", "event-1", datetime(2026, 7, 10, 5, 0, tzinfo=timezone.utc), market_id="1.golf")
+        morning_window = build_scan_window(datetime(2026, 7, 9, 7, 0, tzinfo=UK_TZ))
+        afternoon_window = build_scan_window(datetime(2026, 7, 9, 15, 0, tzinfo=UK_TZ))
+        self.assertTrue(morning_window.start_utc <= item.event_start_utc < morning_window.end_utc)
+        self.assertTrue(afternoon_window.start_utc <= item.event_start_utc < afternoon_window.end_utc)
+
+        post_epoch = int(reminder_time(item.event_start_utc).timestamp())
+        key = duplicate_key(item, post_epoch, "C123")
+        state = {"scheduled": [{"duplicate_key": key}]}
+        self.assertIn(duplicate_key(item, post_epoch, "C123"), scheduled_keys(state))
 
     def test_politics_market_inside_window_is_selected(self) -> None:
         window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))

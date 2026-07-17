@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Betfair Event Reminders at 07:00, 15:00, and 23:00 UK time
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 Europe/London
+OnCalendar=*-*-* 15:00:00 Europe/London
+OnCalendar=*-*-* 23:00:00 Europe/London
+Persistent=true
+AccuracySec=1min
+Unit=betfair-event-reminders.service
+
+[Install]
+WantedBy=timers.target
