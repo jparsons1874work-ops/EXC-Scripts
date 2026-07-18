@@ -52,6 +52,24 @@ WINNER = "WINNER"
 OUTRIGHT_WINNER = "OUTRIGHT_WINNER"
 STAGE_WINNER = "STAGE_WINNER"
 DISALLOWED_COUNTRY_CODES = frozenset({"AU"})
+AUSTRALIAN_WALLET_NAMES = frozenset({"australian wallet", "aus wallet", "au wallet"})
+AUSTRALIAN_REGULATOR_TERMS = (
+    "australia",
+    "australian",
+    "northern territory",
+    "tasmania",
+    "tasmanian",
+)
+AUSTRALIAN_RULE_MARKERS = (
+    "australian wallet",
+    "australian licence",
+    "australian license",
+    "australian market",
+    "ausflag",
+    "betfair pty",
+    "northern territory racing",
+    "tasmanian gaming",
+)
 GENERIC_OUTRIGHT_EMOJI = ":trophy:"
 FIRST_TRY_SCORER = "FIRST_TRY_SCORER"
 TO_WIN_THE_TOSS = "TO_WIN_THE_TOSS"
@@ -159,6 +177,9 @@ class EventReminder:
     event_start_utc: datetime
     market_type_code: str = ""
     country_code: str = ""
+    wallet: str = ""
+    regulator: str = ""
+    market_rules: str = ""
     lead_minutes: int = REMINDER_LEAD_MINUTES
     duplicate_by: str = DEDUP_EVENT
     selection_reason: str = ""
@@ -284,8 +305,30 @@ OUTRIGHT_SIDE_MARKET_TERMS: tuple[tuple[str, str], ...] = (
 )
 
 
-def is_disallowed_country(reminder: EventReminder) -> bool:
-    return reminder.country_code.strip().upper() in DISALLOWED_COUNTRY_CODES
+def australian_market_reason(reminder: EventReminder) -> str:
+    country_code = reminder.country_code.strip().upper()
+    if country_code in DISALLOWED_COUNTRY_CODES:
+        return f"country_code={country_code}"
+
+    wallet = normalize_text(reminder.wallet)
+    if wallet in AUSTRALIAN_WALLET_NAMES:
+        return f"wallet={reminder.wallet.strip()}"
+
+    regulator = normalize_text(reminder.regulator)
+    if any(term in regulator for term in AUSTRALIAN_REGULATOR_TERMS):
+        return f"regulator={reminder.regulator.strip()}"
+
+    rules = reminder.market_rules.casefold()
+    if marker := next((marker for marker in AUSTRALIAN_RULE_MARKERS if marker in rules), ""):
+        return f"market_rules_marker={marker}"
+
+    if reminder.market_id.strip().startswith("2."):
+        return f"australian_exchange_market_id={reminder.market_id.strip()}"
+    return ""
+
+
+def is_disallowed_market(reminder: EventReminder) -> bool:
+    return bool(australian_market_reason(reminder))
 
 
 def is_winner_like_market_type(market_type_code: str) -> bool:
@@ -298,8 +341,8 @@ def is_winner_like_market_type(market_type_code: str) -> bool:
 
 
 def outright_market_selection(reminder: EventReminder) -> tuple[bool, str]:
-    if is_disallowed_country(reminder):
-        return False, f"disallowed_country={reminder.country_code.upper()}"
+    if reason := australian_market_reason(reminder):
+        return False, f"disallowed_australian_market:{reason}"
 
     market_type = reminder.market_type_code.upper()
     market_type_text = normalize_text(market_type)
@@ -339,8 +382,8 @@ CYCLING_SIDE_MARKET_TERMS: tuple[tuple[str, str], ...] = (
 
 
 def cycling_market_selection(reminder: EventReminder) -> tuple[bool, str]:
-    if is_disallowed_country(reminder):
-        return False, f"disallowed_country={reminder.country_code.upper()}"
+    if reason := australian_market_reason(reminder):
+        return False, f"disallowed_australian_market:{reason}"
     market_type = reminder.market_type_code.upper()
     market_name = normalize_text(reminder.market_name)
     event_name = normalize_text(reminder.event_name)
@@ -475,6 +518,7 @@ def catalogue_to_reminder(catalogue: Any, sport: str, emoji: str, fallback_event
     start_utc = parse_datetime(object_get(catalogue, "market_start_time", None))
     event_id = str(object_get(event, "id", "") or "").strip()
     market_name = catalogue_market_name(catalogue)
+    description = catalogue_market_description(catalogue)
     event_name = str(object_get(event, "name", "") or market_name or "").strip()
     if not event_id or start_utc is None:
         return None
@@ -491,6 +535,9 @@ def catalogue_to_reminder(catalogue: Any, sport: str, emoji: str, fallback_event
         event_start_utc=start_utc,
         market_type_code=catalogue_market_type_code(catalogue),
         country_code=str(object_get_any(event, ("country_code", "countryCode"), "") or "").strip().upper(),
+        wallet=str(object_get_any(description, ("wallet",), "") or "").strip(),
+        regulator=str(object_get_any(description, ("regulator",), "") or "").strip(),
+        market_rules=str(object_get_any(description, ("rules",), "") or ""),
     )
 
 
@@ -575,7 +622,7 @@ def select_reminders_with_reasons(
     scan_start_uk: datetime | None = None,
 ) -> list[SelectedReminder]:
     sorted_events = sorted(
-        (event for event in events if not is_disallowed_country(event)),
+        (event for event in events if not is_disallowed_market(event)),
         key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.event_id),
     )
     if rule == SPORT_RULE_ALL:
@@ -611,7 +658,7 @@ def select_market_reminders(
 ) -> list[EventReminder]:
     selected: list[EventReminder] = []
     for market in sorted(markets, key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.market_id)):
-        if is_disallowed_country(market) or not in_scan_window(market, window):
+        if is_disallowed_market(market) or not in_scan_window(market, window):
             continue
         if sport == "Politics":
             selected.append(
@@ -921,10 +968,38 @@ def build_client(config: Config) -> APIClient:
     return client
 
 
-def discover_event_type_ids(client: APIClient, window: ScanWindow) -> dict[str, str]:
-    event_filter = market_filter(
+def list_market_country_codes(client: APIClient, window: ScanWindow) -> tuple[str, ...]:
+    fixture_filter = market_filter(
         market_start_time={"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)}
     )
+    results = client.betting.list_countries(filter=fixture_filter)
+    return tuple(
+        sorted(
+            {
+                str(object_get_any(result, ("country_code", "countryCode"), "") or "").strip().upper()
+                for result in results
+            }
+            - {""}
+        )
+    )
+
+
+def allowed_market_country_codes(country_codes: Iterable[str]) -> tuple[str, ...]:
+    normalized = {str(code or "").strip().upper() for code in country_codes}
+    return tuple(sorted(code for code in normalized if code and code not in DISALLOWED_COUNTRY_CODES))
+
+
+def discover_event_type_ids(
+    client: APIClient,
+    window: ScanWindow,
+    market_countries: Iterable[str] | None = None,
+) -> dict[str, str]:
+    filter_args: dict[str, Any] = {
+        "market_start_time": {"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)}
+    }
+    if market_countries is not None:
+        filter_args["market_countries"] = list(market_countries)
+    event_filter = market_filter(**filter_args)
     results = client.betting.list_event_types(filter=event_filter)
     discovered: dict[str, str] = {}
     for result in results:
@@ -940,11 +1015,12 @@ def list_event_type_ids(
     client: APIClient,
     window: ScanWindow,
     discovered_event_types: dict[str, str] | None = None,
+    market_countries: Iterable[str] | None = None,
 ) -> dict[str, str]:
     discovered = (
         discovered_event_types
         if discovered_event_types is not None
-        else discover_event_type_ids(client, window)
+        else discover_event_type_ids(client, window, market_countries)
     )
     discovered_by_name = {name.casefold(): event_type_id for name, event_type_id in discovered.items()}
     sport_ids: dict[str, str] = {}
@@ -960,6 +1036,7 @@ def list_market_catalogues(
     event_type_id: str,
     window: ScanWindow,
     market_type_codes: Iterable[str] | None = (MATCH_ODDS,),
+    market_countries: Iterable[str] | None = None,
 ) -> list[Any]:
     filter_args: dict[str, Any] = {
         "event_type_ids": [event_type_id],
@@ -967,6 +1044,11 @@ def list_market_catalogues(
     }
     if market_type_codes is not None:
         filter_args["market_type_codes"] = list(market_type_codes)
+    if market_countries is not None:
+        country_codes = list(market_countries)
+        if not country_codes:
+            return []
+        filter_args["market_countries"] = country_codes
     fixture_filter = market_filter(**filter_args)
     return client.betting.list_market_catalogue(
         filter=fixture_filter,
@@ -984,11 +1066,22 @@ def api_market_type_filter_for_sport(sport_name: str, rule: str) -> tuple[str, .
     return (MATCH_ODDS,)
 
 
-def list_market_type_codes(client: APIClient, event_type_id: str, window: ScanWindow) -> tuple[str, ...]:
-    fixture_filter = market_filter(
-        event_type_ids=[event_type_id],
-        market_start_time={"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)},
-    )
+def list_market_type_codes(
+    client: APIClient,
+    event_type_id: str,
+    window: ScanWindow,
+    market_countries: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    filter_args: dict[str, Any] = {
+        "event_type_ids": [event_type_id],
+        "market_start_time": {"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)},
+    }
+    if market_countries is not None:
+        country_codes = list(market_countries)
+        if not country_codes:
+            return ()
+        filter_args["market_countries"] = country_codes
+    fixture_filter = market_filter(**filter_args)
     results = client.betting.list_market_types(filter=fixture_filter)
     values = {
         str(object_get_any(result, ("market_type", "marketType"), "") or "").strip().upper()
@@ -1008,25 +1101,33 @@ def discover_all_sports_outright_reminders(
     client: APIClient,
     event_types: dict[str, str],
     window: ScanWindow,
+    market_countries: Iterable[str] | None = None,
 ) -> tuple[list[EventReminder], set[str]]:
     selected: list[EventReminder] = []
     aus_excluded: set[str] = set()
     for sport_name, event_type_id in sorted(event_types.items(), key=lambda item: item[0].casefold()):
-        observed_types = list_market_type_codes(client, event_type_id, window)
+        observed_types = list_market_type_codes(client, event_type_id, window, market_countries)
         candidate_types = tuple(code for code in observed_types if is_winner_like_market_type(code))
         if not candidate_types:
             continue
         log(f"All-sports outright scan: sport={sport_name} candidate_market_types={', '.join(candidate_types)}")
-        catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=candidate_types)
+        catalogues = list_market_catalogues(
+            client,
+            event_type_id,
+            window,
+            market_type_codes=candidate_types,
+            market_countries=market_countries,
+        )
         for catalogue in catalogues:
             reminder = catalogue_to_reminder(catalogue, sport_name, sport_emoji(sport_name), event_type_id)
             if reminder is None:
                 continue
-            if is_disallowed_country(reminder):
+            if is_disallowed_market(reminder):
                 aus_excluded.add(reminder.market_id or f"{sport_name}|{reminder.event_id}")
                 log(
                     f"Excluded AU outright market: sport={sport_name} event_id={reminder.event_id} "
-                    f"market_id={reminder.market_id} market_type_code={reminder.market_type_code}"
+                    f"market_id={reminder.market_id} market_type_code={reminder.market_type_code} "
+                    f"reason={australian_market_reason(reminder)}"
                 )
                 continue
             is_selected, reason = outright_market_selection(reminder)
@@ -1085,9 +1186,20 @@ def log_cycling_market_diagnostic(catalogue: Any, event_type_id: str) -> None:
     )
 
 
-def run_cycling_market_diagnostic(client: APIClient, window: ScanWindow, event_type_id: str) -> int:
+def run_cycling_market_diagnostic(
+    client: APIClient,
+    window: ScanWindow,
+    event_type_id: str,
+    market_countries: Iterable[str] | None = None,
+) -> int:
     log("Cycling diagnostic mode: broad catalogue query; Slack scheduling and reminder state writes are disabled.")
-    catalogues = list_market_catalogues(client, event_type_id, window, market_type_codes=None)
+    catalogues = list_market_catalogues(
+        client,
+        event_type_id,
+        window,
+        market_type_codes=None,
+        market_countries=market_countries,
+    )
     log(f"Cycling catalogue markets before filter: {len(catalogues)}")
     market_types = sorted({catalogue_market_type_code(item) or "<none>" for item in catalogues})
     log(f"Cycling market types observed: {', '.join(market_types) if market_types else 'none'}")
@@ -1193,6 +1305,8 @@ def state_record(reminder: EventReminder, key: str, post_epoch: int, scheduled_m
         "market_name": reminder.market_name,
         "market_type_code": reminder.market_type_code,
         "country_code": reminder.country_code,
+        "wallet": reminder.wallet,
+        "regulator": reminder.regulator,
         "event_start_uk": format_uk(reminder.event_start_uk),
         "scheduled_slack_post_uk": format_uk(datetime.fromtimestamp(post_epoch, UTC_TZ)),
         "scheduled_slack_post_epoch": post_epoch,
@@ -1229,10 +1343,28 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
     excluded_au_market_ids: set[str] = set()
     client = build_client(config)
     try:
-        all_event_types = discover_event_type_ids(client, window)
-        sport_ids = list_event_type_ids(client, window, all_event_types)
+        observed_country_codes = list_market_country_codes(client, window)
+        allowed_country_codes = allowed_market_country_codes(observed_country_codes)
+        excluded_country_codes = sorted(set(observed_country_codes) & DISALLOWED_COUNTRY_CODES)
+        log(
+            "Betfair market country filter: "
+            f"allowed={','.join(allowed_country_codes) or 'none'} "
+            f"excluded={','.join(excluded_country_codes) or 'none-observed'}"
+        )
+        all_event_types = discover_event_type_ids(client, window, allowed_country_codes)
+        sport_ids = list_event_type_ids(
+            client,
+            window,
+            all_event_types,
+            market_countries=allowed_country_codes,
+        )
         if args.debug_cycling_markets:
-            return run_cycling_market_diagnostic(client, window, sport_ids["Cycling"])
+            return run_cycling_market_diagnostic(
+                client,
+                window,
+                sport_ids["Cycling"],
+                allowed_country_codes,
+            )
         for sport in SPORTS:
             sport_name = sport["name"]
             stats.sports_scanned += 1
@@ -1244,6 +1376,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 event_type_id,
                 window,
                 market_type_codes=market_type_filter,
+                market_countries=allowed_country_codes,
             )
             stats.raw_markets_found += len(raw_catalogues)
             reminders = [
@@ -1251,14 +1384,15 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 for catalogue in raw_catalogues
                 if (reminder := catalogue_to_reminder(catalogue, sport_name, sport["emoji"], event_type_id)) is not None
             ]
-            aus_reminders = [reminder for reminder in reminders if is_disallowed_country(reminder)]
+            aus_reminders = [reminder for reminder in reminders if is_disallowed_market(reminder)]
             for market in aus_reminders:
                 excluded_au_market_ids.add(market.market_id or f"{sport_name}|{market.event_id}")
                 log(
                     f"Excluded AU market: sport={sport_name} event_id={market.event_id} "
-                    f"market_id={market.market_id} market_type_code={market.market_type_code}"
+                    f"market_id={market.market_id} market_type_code={market.market_type_code} "
+                    f"reason={australian_market_reason(market)}"
                 )
-            reminders = [reminder for reminder in reminders if not is_disallowed_country(reminder)]
+            reminders = [reminder for reminder in reminders if not is_disallowed_market(reminder)]
             if sport["rule"] in {SPORT_RULE_POLITICS_MARKETS, SPORT_RULE_WINNER_MARKETS, SPORT_RULE_CRICKET_TOSS}:
                 unique_events = dedupe_events(reminders)
                 selected = select_market_reminders(reminders, sport_name, window)
@@ -1355,6 +1489,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                     f"Selected {sport_name}: event_name={item.event_name!r} event_id={item.event_id} "
                     f"market_name={item.market_name!r} market_type_code={item.market_type_code} "
                     f"market_id={item.market_id} country_code={item.country_code or 'unknown'} "
+                    f"wallet={item.wallet or 'unknown'} regulator={item.regulator or 'unknown'} "
                     f"start={format_uk(item.event_start_uk)} "
                     f"reminder={format_uk(reminder_time(item.event_start_uk, item.lead_minutes))} "
                     f"offset_minutes={item.lead_minutes} reason={item.selection_reason or 'selected'}"
@@ -1368,6 +1503,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
             client,
             all_event_types,
             window,
+            allowed_country_codes,
         )
         excluded_au_market_ids.update(all_sports_aus_excluded)
         stats.aus_markets_excluded = len(excluded_au_market_ids)
@@ -1392,10 +1528,11 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
 
     now_uk = datetime.now(UK_TZ)
     for reminder in all_selected:
-        if is_disallowed_country(reminder):
+        if is_disallowed_market(reminder):
             log(
-                f"SAFETY SKIP disallowed country before Slack scheduling: sport={reminder.sport} "
-                f"event_id={reminder.event_id} market_id={reminder.market_id} country_code={reminder.country_code}"
+                f"SAFETY SKIP Australian market before Slack scheduling: sport={reminder.sport} "
+                f"event_id={reminder.event_id} market_id={reminder.market_id} "
+                f"reason={australian_market_reason(reminder)}"
             )
             continue
         post_time_uk = reminder_time(reminder.event_start_uk, reminder.lead_minutes)

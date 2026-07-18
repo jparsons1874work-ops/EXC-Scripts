@@ -47,6 +47,9 @@ def reminder(
     market_name: str = "Match Odds",
     market_type_code: str = "MATCH_ODDS",
     country_code: str = "GB",
+    wallet: str = "UK wallet",
+    regulator: str = "MALTA LOTTERIES AND GAMBLING AUTHORITY",
+    market_rules: str = "",
     event_name: str | None = None,
     emoji: str = ":test:",
 ) -> EventReminder:
@@ -63,6 +66,9 @@ def reminder(
         event_start_utc=start_utc,
         market_type_code=market_type_code,
         country_code=country_code,
+        wallet=wallet,
+        regulator=regulator,
+        market_rules=market_rules,
     )
 
 
@@ -462,7 +468,62 @@ class BetfairEventReminderTests(unittest.TestCase):
         )
         self.assertEqual(select_market_reminders([item], "Golf"), [])
         self.assertEqual(select_reminders([item], reminders.SPORT_RULE_ALL), [])
-        self.assertEqual(reminders.outright_market_selection(item), (False, "disallowed_country=AU"))
+        self.assertEqual(
+            reminders.outright_market_selection(item),
+            (False, "disallowed_australian_market:country_code=AU"),
+        )
+
+    def test_australian_wallet_market_is_excluded_when_country_is_wrong(self) -> None:
+        item = reminder(
+            "Golf",
+            "wallet-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            country_code="GB",
+            wallet="Australian wallet",
+        )
+        self.assertEqual(reminders.australian_market_reason(item), "wallet=Australian wallet")
+        self.assertEqual(select_market_reminders([item], "Golf"), [])
+
+    def test_australian_regulator_market_is_excluded_when_country_and_wallet_are_wrong(self) -> None:
+        item = reminder(
+            "Golf",
+            "regulator-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            country_code="GB",
+            wallet="UK wallet",
+            regulator="NORTHERN TERRITORY RACING AND WAGERING COMMISSION",
+        )
+        self.assertIn("regulator=", reminders.australian_market_reason(item))
+        self.assertEqual(select_market_reminders([item], "Golf"), [])
+
+    def test_australian_exchange_market_id_is_excluded_as_final_fallback(self) -> None:
+        item = reminder(
+            "Golf",
+            "exchange-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            market_id="2.123456789",
+            country_code="GB",
+            wallet="",
+            regulator="",
+        )
+        self.assertEqual(
+            reminders.australian_market_reason(item),
+            "australian_exchange_market_id=2.123456789",
+        )
+        self.assertEqual(select_market_reminders([item], "Golf"), [])
+
+    def test_australian_market_rules_are_used_when_other_metadata_is_wrong(self) -> None:
+        item = reminder(
+            "Golf",
+            "rules-event",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            country_code="GB",
+            wallet="UK wallet",
+            regulator="MALTA LOTTERIES AND GAMBLING AUTHORITY",
+            market_rules='<img src="ausflag.jpg"> This Australian market is offered by Betfair Pty Ltd.',
+        )
+        self.assertEqual(reminders.australian_market_reason(item), "market_rules_marker=australian market")
+        self.assertEqual(select_market_reminders([item], "Golf"), [])
 
     def test_catalogue_country_code_is_captured(self) -> None:
         catalogue = {
@@ -472,11 +533,57 @@ class BetfairEventReminderTests(unittest.TestCase):
             "market_id": "1.au",
             "market_name": "Tournament Winner",
             "market_start_time": "2026-07-09T14:00:00Z",
-            "description": {"marketType": "OUTRIGHT_WINNER"},
+            "description": {
+                "marketType": "OUTRIGHT_WINNER",
+                "wallet": "Australian wallet",
+                "regulator": "TASMANIAN GAMING COMMISSION",
+            },
         }
         item = reminders.catalogue_to_reminder(catalogue, "Golf", ":golf:", "3")
         self.assertIsNotNone(item)
         self.assertEqual(item.country_code, "AU")
+        self.assertEqual(item.wallet, "Australian wallet")
+        self.assertEqual(item.regulator, "TASMANIAN GAMING COMMISSION")
+
+    def test_market_country_allowlist_excludes_au(self) -> None:
+        self.assertEqual(
+            reminders.allowed_market_country_codes(["GB", "au", "IE", "AU", ""]),
+            ("GB", "IE"),
+        )
+
+    def test_market_country_codes_are_discovered_from_betfair_filter_results(self) -> None:
+        class FakeBetting:
+            def list_countries(self, **kwargs):
+                self.filter = kwargs["filter"]
+                return [
+                    {"countryCode": "AU", "marketCount": 4},
+                    {"countryCode": "GB", "marketCount": 12},
+                ]
+
+        betting = FakeBetting()
+        client = type("FakeClient", (), {"betting": betting})()
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        self.assertEqual(reminders.list_market_country_codes(client, window), ("AU", "GB"))
+        self.assertIn("marketStartTime", betting.filter)
+
+    def test_market_catalogue_query_applies_non_au_country_allowlist(self) -> None:
+        class FakeBetting:
+            def list_market_catalogue(self, **kwargs):
+                self.filter = kwargs["filter"]
+                return []
+
+        betting = FakeBetting()
+        client = type("FakeClient", (), {"betting": betting})()
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        reminders.list_market_catalogues(
+            client,
+            "3",
+            window,
+            market_type_codes=("WINNER",),
+            market_countries=("GB", "IE"),
+        )
+        self.assertEqual(betting.filter["marketCountries"], ["GB", "IE"])
+        self.assertNotIn("AU", betting.filter["marketCountries"])
 
     def test_all_sports_discovery_selects_unknown_sport_and_excludes_au(self) -> None:
         start = "2026-07-09T14:00:00Z"
