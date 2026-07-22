@@ -623,6 +623,22 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(selected[0].emoji, reminders.GENERIC_OUTRIGHT_EMOJI)
         self.assertEqual(aus_excluded, {"1.au"})
 
+    def test_all_sports_discovery_does_not_scan_special_bets(self) -> None:
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        with patch.object(reminders, "list_market_type_codes") as list_market_types, patch.object(
+            reminders,
+            "list_market_catalogues",
+        ) as list_catalogues:
+            selected, aus_excluded = reminders.discover_all_sports_outright_reminders(
+                object(),
+                {"Special Bets": "10"},
+                window,
+            )
+        self.assertEqual(selected, [])
+        self.assertEqual(aus_excluded, set())
+        list_market_types.assert_not_called()
+        list_catalogues.assert_not_called()
+
     def test_golf_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
         item = select_market_reminders(
             [reminder("Golf", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.golf", market_type_code="WINNER")],
@@ -690,11 +706,43 @@ class BetfairEventReminderTests(unittest.TestCase):
 
     def test_cricket_toss_reminder_is_forty_minutes_before_start(self) -> None:
         item = select_market_reminders(
-            [reminder("Cricket", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.toss", market_name="To Win the Toss")],
+            [
+                reminder(
+                    "Cricket",
+                    "event-1",
+                    datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+                    competition_id="other-competition",
+                    market_id="1.toss",
+                    market_name="To Win the Toss",
+                )
+            ],
             "Cricket",
         )[0]
         self.assertEqual(item.lead_minutes, 40)
         self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:20 BST")
+
+    def test_hundred_competitions_toss_reminders_are_fifty_five_minutes_before_start(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        for competition_id in ("12267948", "12351359"):
+            with self.subTest(competition_id=competition_id):
+                item = select_market_reminders(
+                    [
+                        reminder(
+                            "Cricket",
+                            f"event-{competition_id}",
+                            start,
+                            competition_id=competition_id,
+                            market_id=f"1.toss-{competition_id}",
+                            market_name="To Win the Toss",
+                        )
+                    ],
+                    "Cricket",
+                )[0]
+                self.assertEqual(item.lead_minutes, 55)
+                self.assertEqual(
+                    reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"),
+                    "14:05 BST",
+                )
 
     def test_cricket_slack_message_uses_vs_and_market_id_not_event_id(self) -> None:
         item = select_market_reminders(

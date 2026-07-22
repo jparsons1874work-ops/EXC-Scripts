@@ -74,6 +74,9 @@ GENERIC_OUTRIGHT_EMOJI = ":trophy:"
 FIRST_TRY_SCORER = "FIRST_TRY_SCORER"
 TO_WIN_THE_TOSS = "TO_WIN_THE_TOSS"
 CRICKET_TOSS_LEAD_MINUTES = 40
+CRICKET_HUNDRED_TOSS_LEAD_MINUTES = 55
+CRICKET_HUNDRED_COMPETITION_IDS = frozenset({"12267948", "12351359"})
+EXCLUDED_EVENT_TYPE_IDS = frozenset({"10"})  # Special Bets
 CERT_FILE_NAME = "client-2048.crt"
 KEY_FILE_NAME = "client-2048.key"
 WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -424,6 +427,12 @@ def is_cricket_toss_market(reminder: EventReminder) -> tuple[bool, str]:
     return False, ""
 
 
+def cricket_toss_lead_minutes(reminder: EventReminder) -> int:
+    if reminder.competition_id.strip() in CRICKET_HUNDRED_COMPETITION_IDS:
+        return CRICKET_HUNDRED_TOSS_LEAD_MINUTES
+    return CRICKET_TOSS_LEAD_MINUTES
+
+
 def cricket_event_display_name(event_name: str) -> str:
     name = re.sub(r"\s+", " ", event_name).strip()
     parts = re.split(r"\s+v(?:s\.?)?\s+", name, maxsplit=1, flags=re.IGNORECASE)
@@ -699,7 +708,7 @@ def select_market_reminders(
                     replace(
                         market,
                         duplicate_by=DEDUP_MARKET,
-                        lead_minutes=CRICKET_TOSS_LEAD_MINUTES,
+                        lead_minutes=cricket_toss_lead_minutes(market),
                         selection_reason="cricket_to_win_toss",
                         slack_message_override=(
                             f"{market.emoji} Suspend toss in {cricket_event_display_name(market.event_name)} "
@@ -1106,6 +1115,9 @@ def discover_all_sports_outright_reminders(
     selected: list[EventReminder] = []
     aus_excluded: set[str] = set()
     for sport_name, event_type_id in sorted(event_types.items(), key=lambda item: item[0].casefold()):
+        if event_type_id.strip() in EXCLUDED_EVENT_TYPE_IDS:
+            log(f"Skipping excluded event type: sport={sport_name} eventTypeId={event_type_id}")
+            continue
         observed_types = list_market_type_codes(client, event_type_id, window, market_countries)
         candidate_types = tuple(code for code in observed_types if is_winner_like_market_type(code))
         if not candidate_types:
