@@ -442,7 +442,7 @@ def run_scan_loop(args: argparse.Namespace) -> int:
                     update_state(last_detected_live_fight=live_display)
                     if live_key not in known_alerts and deliver_alert(
                         title="UFC Fight Started",
-                        message=f"🥊 FIGHT STARTED / LIVE NOW\n\n{live_display}",
+                        message=f":ufc: FIGHT STARTED / LIVE NOW\n\n{live_display}",
                         key=live_key,
                         alert_type="Fight started",
                         fight_name=live_display,
