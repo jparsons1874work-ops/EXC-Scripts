@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Scan UFC.com for LIVE NOW fight starts and alert the in-play Slack channel."""
+"""Monitor ESPN and UFC.com for UFC walkouts, live starts, and fight endings."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import signal
-import sys
 import threading
 import time
 import traceback
-import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
-from betfairlightweight import APIClient
-from betfairlightweight.filters import market_filter
+import urllib3
 from dotenv import load_dotenv
 
 
@@ -32,80 +26,32 @@ RUNTIME_DIR = PROJECT_ROOT / "runtime"
 CONFIG_DIR = RUNTIME_DIR / "config"
 STATE_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
 
-UTC_TZ = timezone.utc
-DEFAULT_UFC_URL = "https://www.ufc.com/event/ufc-329"
-UFC_CHECK_EVERY_SECONDS = 10
+ESPN_URL = (
+    "https://site.web.api.espn.com/apis/personalized/v2/scoreboard/header"
+    "?sport=mma&league=ufc"
+)
+CHECK_EVERY_SECONDS = 3
 SLACK_WEBHOOK_ENV_NAME = "Slack_Webhook_TIP"
 UFC_SLACK_WEBHOOK_ENV_NAME = "UFC_IS_IT_INPLAY_WEBHOOK_URL"
 PLACEHOLDER_PREFIXES = ("YOUR_", "PASTE_", "CHANGE_ME", "TODO")
-MMA_SPORT_MARKERS = ("mixed martial arts", "mma", "ufc")
-MAX_DEBUG_BLOCK_CHARS = 600
 STOP_EVENT = threading.Event()
+UTC_TZ = timezone.utc
 
 
 load_dotenv(PROJECT_ROOT / ".env")
-
-
-@dataclass(frozen=True)
-class Config:
-    betfair_username: str
-    betfair_password: str
-    betfair_app_key: str
-    betfair_certs_path: str
-    slack_webhook_url: str
-    slack_config_source: str
-
-
-@dataclass(frozen=True)
-class Fight:
-    fighter_a: str
-    fighter_b: str
-
-    @property
-    def display_name(self) -> str:
-        return f"{self.fighter_a} v {self.fighter_b}"
-
-
-@dataclass(frozen=True)
-class BetfairCandidate:
-    event_id: str
-    event_name: str
-    market_id: str
-    market_name: str
-    sport_name: str
-    competition_name: str
-    scheduled_start_utc: datetime | None
-
-
-@dataclass(frozen=True)
-class MatchResult:
-    event_id: str
-    market_id: str
-    event_name: str
-    confidence: str
-    score: float
-    reason: str
-
-    @property
-    def matched(self) -> bool:
-        return bool(self.event_id)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def log(message: str) -> None:
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {message}", flush=True)
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC_TZ)
+    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
 def iso_utc(value: datetime | None = None) -> str:
-    return (value or utc_now()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (value or datetime.now(UTC_TZ)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def ensure_config_dir() -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def normalize(text: str) -> str:
+    return " ".join((text or "").casefold().split())
 
 
 def read_json(path: Path = STATE_PATH) -> dict[str, Any]:
@@ -120,7 +66,7 @@ def read_json(path: Path = STATE_PATH) -> dict[str, Any]:
 
 
 def write_json(data: dict[str, Any], path: Path = STATE_PATH) -> None:
-    ensure_config_dir()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -131,19 +77,23 @@ def update_state(**updates: Any) -> None:
 
 
 def resolve_ufc_url(cli_url: str) -> str:
-    url = cli_url.strip()
-    if url:
-        return url
-    stored = str(read_json().get("ufc_event_url", "") or "").strip()
-    return stored
+    return cli_url.strip() or str(read_json().get("ufc_event_url", "") or "").strip()
+
+
+def validate_ufc_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("UFC event URL must be an absolute http(s) URL.")
+    if parsed.netloc.casefold() != "ufc.com" and not parsed.netloc.casefold().endswith(".ufc.com"):
+        raise ValueError("UFC event URL must be on ufc.com.")
 
 
 def save_ufc_url(url: str) -> None:
     data = read_json()
-    previous = str(data.get("ufc_event_url", "") or "")
+    previous_url = str(data.get("ufc_event_url", "") or "")
     data["ufc_event_url"] = url
     data["last_saved_at"] = iso_utc()
-    if previous and previous != url:
+    if previous_url and previous_url != url:
         data["alerted_fight_keys"] = []
         data["alerted_fights"] = []
         data["last_detected_live_fight"] = ""
@@ -156,197 +106,12 @@ def is_placeholder(value: str) -> bool:
     return not stripped or any(stripped.startswith(prefix) for prefix in PLACEHOLDER_PREFIXES)
 
 
-def resolve_path(value: str, base_dir: Path) -> str:
-    if not value:
-        return ""
-    path = Path(value)
-    if not path.is_absolute():
-        path = (base_dir / path).resolve()
-    return str(path)
-
-
-def load_config() -> Config:
-    cert_file = os.getenv("BETFAIR_CERT_FILE", "").strip()
-    key_file = os.getenv("BETFAIR_KEY_FILE", "").strip()
-    certs_dir = os.getenv("BETFAIR_CERTS_DIR", "").strip() or os.getenv("BF_CERTS_DIR", "").strip()
-    if cert_file and not certs_dir:
-        certs_dir = str(Path(resolve_path(cert_file, PROJECT_ROOT)).parent)
-    if key_file and not certs_dir:
-        certs_dir = str(Path(resolve_path(key_file, PROJECT_ROOT)).parent)
-    if not certs_dir:
-        certs_dir = str((SCRIPT_DIR / "Integrity-Scanner" / "certs").resolve())
-
-    slack_webhook_url = os.getenv(UFC_SLACK_WEBHOOK_ENV_NAME, "").strip()
-    slack_config_source = UFC_SLACK_WEBHOOK_ENV_NAME if slack_webhook_url else ""
-    if not slack_webhook_url:
-        slack_webhook_url = os.getenv(SLACK_WEBHOOK_ENV_NAME, "").strip()
-        slack_config_source = SLACK_WEBHOOK_ENV_NAME if slack_webhook_url else "not configured"
-
-    return Config(
-        betfair_username=os.getenv("BETFAIR_USERNAME", "").strip() or os.getenv("BF_USERNAME", "").strip(),
-        betfair_password=os.getenv("BETFAIR_PASSWORD", "").strip() or os.getenv("BF_PASSWORD", "").strip(),
-        betfair_app_key=os.getenv("BETFAIR_APP_KEY", "").strip() or os.getenv("BF_APP_KEY", "").strip(),
-        betfair_certs_path=resolve_path(certs_dir, PROJECT_ROOT),
-        slack_webhook_url=slack_webhook_url,
-        slack_config_source=slack_config_source,
-    )
-
-
-def require_betfair_config(config: Config) -> None:
-    missing = []
-    if is_placeholder(config.betfair_username):
-        missing.append("BETFAIR_USERNAME")
-    if is_placeholder(config.betfair_password):
-        missing.append("BETFAIR_PASSWORD")
-    if is_placeholder(config.betfair_app_key):
-        missing.append("BETFAIR_APP_KEY")
-    if missing:
-        raise RuntimeError(f"Missing Betfair config: {', '.join(missing)}")
-
-
-def build_client(config: Config) -> APIClient:
-    require_betfair_config(config)
-    certs_dir = Path(config.betfair_certs_path).resolve()
-    cert_file = Path(os.getenv("BETFAIR_CERT_FILE", str(certs_dir / "client-2048.crt")))
-    key_file = Path(os.getenv("BETFAIR_KEY_FILE", str(certs_dir / "client-2048.key")))
-    if not cert_file.is_absolute():
-        cert_file = (PROJECT_ROOT / cert_file).resolve()
-    if not key_file.is_absolute():
-        key_file = (PROJECT_ROOT / key_file).resolve()
-    log(f"Using Betfair certs directory: {certs_dir}")
-    if not cert_file.exists():
-        raise FileNotFoundError(f"Betfair cert file not found: {cert_file}")
-    if not key_file.exists():
-        raise FileNotFoundError(f"Betfair key file not found: {key_file}")
-    client = APIClient(
-        username=config.betfair_username,
-        password=config.betfair_password,
-        app_key=config.betfair_app_key,
-        certs=str(certs_dir),
-    )
-    client.login()
-    return client
-
-
-def object_get(obj: Any, name: str, default: Any = "") -> Any:
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    if hasattr(obj, name):
-        return getattr(obj, name)
-    camel = re.sub(r"_([a-z])", lambda match: match.group(1).upper(), name)
-    if hasattr(obj, camel):
-        return getattr(obj, camel)
-    return default
-
-
-def parse_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=UTC_TZ) if value.tzinfo is None else value.astimezone(UTC_TZ)
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed.replace(tzinfo=UTC_TZ) if parsed.tzinfo is None else parsed.astimezone(UTC_TZ)
-    return None
-
-
-def format_betfair_time(value: datetime) -> str:
-    return value.astimezone(UTC_TZ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def normalize_name(value: str) -> str:
-    without_accents = "".join(
-        char for char in unicodedata.normalize("NFKD", value or "") if not unicodedata.combining(char)
-    )
-    lowered = without_accents.casefold()
-    lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
-    return re.sub(r"\s+", " ", lowered).strip()
-
-
-def surname(name: str) -> str:
-    tokens = normalize_name(name).split()
-    return tokens[-1] if tokens else ""
-
-
-def clean_fighter_name(value: str) -> str:
-    value = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", value or "")
-    value = re.sub(r"\b(?:live now|fight card|main card|prelims?)\b", " ", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip(" -")
-    return value
-
-
-def split_match_sides(value: str) -> tuple[str, str] | None:
-    text = re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip()
-    if not text:
-        return None
-    parts = [
-        clean_fighter_name(part)
-        for part in re.split(r"\s+(?:v|vs|vs\.|@|-)\s+", text, maxsplit=1, flags=re.IGNORECASE)
-    ]
-    if len(parts) == 2 and parts[0] and parts[1]:
-        return parts[0], parts[1]
-    return None
-
-
-def parse_fight_from_block_text(text: str) -> Fight | None:
-    if "LIVE NOW" not in text.upper():
-        return None
-    lines = [clean_fighter_name(line) for line in re.split(r"[\r\n]+", text) if clean_fighter_name(line)]
-    lines = [line for line in lines if line.casefold() not in {"live", "live now"}]
-    for index, line in enumerate(lines):
-        if re.fullmatch(r"v|vs|vs\.", line, flags=re.IGNORECASE):
-            before = next((lines[pos] for pos in range(index - 1, -1, -1) if lines[pos]), "")
-            after = next((lines[pos] for pos in range(index + 1, len(lines)) if lines[pos]), "")
-            if before and after:
-                return Fight(before, after)
-    for line in lines:
-        sides = split_match_sides(line)
-        if sides:
-            return Fight(*sides)
-    return None
-
-
-def parse_live_fights_from_block_texts(block_texts: Iterable[str]) -> list[Fight]:
-    fights: list[Fight] = []
-    seen: set[str] = set()
-    for block_text in block_texts:
-        fight = parse_fight_from_block_text(block_text)
-        if not fight:
-            continue
-        key = fight_key(fight, "block")
-        if key not in seen:
-            fights.append(fight)
-            seen.add(key)
-    return fights
-
-
-def validate_ufc_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("UFC event URL must be an absolute http(s) URL.")
-    if "ufc.com" not in parsed.netloc.casefold():
-        raise ValueError("UFC event URL must be on ufc.com.")
-
-
-def fight_key(fight: Fight, ufc_url: str, date_value: str | None = None) -> str:
-    names = sorted([normalize_name(fight.fighter_a), normalize_name(fight.fighter_b)])
-    date_part = date_value or utc_now().date().isoformat()
-    return "|".join([date_part, normalize_name(ufc_url), *names])
-
-
-def format_slack_message(fight: Fight, match: MatchResult) -> str:
-    betfair_id = match.event_id if match.matched else "Not matched"
-    lines = [
-        f"UFC - {fight.display_name} has started",
-        f"Betfair ID: {betfair_id}",
-    ]
-    if not match.matched:
-        lines.append("Please manually locate the Betfair event.")
-    lines.append("Please ensure it is in play")
-    return "\n".join(lines)
+def slack_webhook_url() -> tuple[str, str]:
+    url = os.getenv(UFC_SLACK_WEBHOOK_ENV_NAME, "").strip()
+    if url:
+        return url, UFC_SLACK_WEBHOOK_ENV_NAME
+    url = os.getenv(SLACK_WEBHOOK_ENV_NAME, "").strip()
+    return url, SLACK_WEBHOOK_ENV_NAME if url else "not configured"
 
 
 def send_slack_message(
@@ -361,11 +126,12 @@ def send_slack_message(
     for attempt in range(1, 4):
         try:
             response = post_func(webhook_url, json={"text": text}, timeout=15)
-            status_code = int(getattr(response, "status_code", 0))
-            body = str(getattr(response, "text", ""))
-            if status_code < 400:
+            if int(getattr(response, "status_code", 0)) < 400:
                 return
-            raise RuntimeError(f"Slack webhook failed: status={status_code}, body={body[:300]}")
+            body = str(getattr(response, "text", ""))
+            raise RuntimeError(
+                f"Slack webhook failed: status={getattr(response, 'status_code', 0)}, body={body[:300]}"
+            )
         except Exception as exc:
             last_error = exc
             if attempt < 3:
@@ -373,264 +139,258 @@ def send_slack_message(
     raise RuntimeError(str(last_error))
 
 
-def list_mma_match_odds_candidates(
-    client: APIClient,
+def alerted_keys() -> set[str]:
+    return {str(key) for key in read_json().get("alerted_fight_keys", []) or []}
+
+
+def record_alert(
     *,
-    start_from: datetime,
-    start_to: datetime,
-    max_results: int = 200,
-) -> list[BetfairCandidate]:
-    event_filter = market_filter(
-        market_start_time={
-            "from": format_betfair_time(start_from),
-            "to": format_betfair_time(start_to),
-        }
-    )
-    event_types = client.betting.list_event_types(filter=event_filter)
-    mma_event_type_ids: list[str] = []
-    sport_names: dict[str, str] = {}
-    for result in event_types:
-        event_type = object_get(result, "event_type", {})
-        event_type_id = str(object_get(event_type, "id", "")).strip()
-        sport_name = str(object_get(event_type, "name", "")).strip()
-        if event_type_id and any(marker in sport_name.casefold() for marker in MMA_SPORT_MARKERS):
-            mma_event_type_ids.append(event_type_id)
-            sport_names[event_type_id] = sport_name
-    candidates: list[BetfairCandidate] = []
-    for event_type_id in mma_event_type_ids:
-        catalogue_filter = market_filter(
-            event_type_ids=[event_type_id],
-            market_type_codes=["MATCH_ODDS"],
-            market_start_time={
-                "from": format_betfair_time(start_from),
-                "to": format_betfair_time(start_to),
-            },
-        )
-        catalogues = client.betting.list_market_catalogue(
-            filter=catalogue_filter,
-            market_projection=["EVENT", "EVENT_TYPE", "COMPETITION", "MARKET_START_TIME", "MARKET_DESCRIPTION"],
-            sort="FIRST_TO_START",
-            max_results=max_results,
-        )
-        for catalogue in catalogues:
-            event = object_get(catalogue, "event", {})
-            event_type = object_get(catalogue, "event_type", {})
-            competition = object_get(catalogue, "competition", {})
-            candidates.append(
-                BetfairCandidate(
-                    event_id=str(object_get(event, "id", "")).strip(),
-                    event_name=str(object_get(event, "name", "")).strip(),
-                    market_id=str(object_get(catalogue, "market_id", "")).strip(),
-                    market_name=str(object_get(catalogue, "market_name", "")).strip(),
-                    sport_name=str(object_get(event_type, "name", sport_names.get(event_type_id, ""))).strip(),
-                    competition_name=str(object_get(competition, "name", "")).strip(),
-                    scheduled_start_utc=parse_datetime(object_get(catalogue, "market_start_time", None)),
-                )
-            )
-    return candidates
-
-
-def candidate_sides(candidate: BetfairCandidate) -> tuple[str, str] | None:
-    for value in (candidate.event_name, candidate.market_name):
-        sides = split_match_sides(value)
-        if sides:
-            return sides
-    return None
-
-
-def score_candidate(fight: Fight, candidate: BetfairCandidate) -> tuple[float, str]:
-    sides = candidate_sides(candidate)
-    if not sides:
-        return 0.0, "candidate has no parseable fighter sides"
-    fight_names = (fight.fighter_a, fight.fighter_b)
-    orders = ((fight_names[0], fight_names[1], sides[0], sides[1]), (fight_names[0], fight_names[1], sides[1], sides[0]))
-    best_score = 0.0
-    best_reason = "no strong participant match"
-    for left_fight, right_fight, left_betfair, right_betfair in orders:
-        left_norm = normalize_name(left_fight)
-        right_norm = normalize_name(right_fight)
-        left_bf_norm = normalize_name(left_betfair)
-        right_bf_norm = normalize_name(right_betfair)
-        left_ratio = SequenceMatcher(None, left_norm, left_bf_norm).ratio() if left_norm and left_bf_norm else 0.0
-        right_ratio = SequenceMatcher(None, right_norm, right_bf_norm).ratio() if right_norm and right_bf_norm else 0.0
-        score = (left_ratio + right_ratio) * 35
-        reasons = [f"name_similarity={round((left_ratio + right_ratio) / 2, 3)}"]
-        left_surname_match = surname(left_fight) and surname(left_fight) == surname(left_betfair)
-        right_surname_match = surname(right_fight) and surname(right_fight) == surname(right_betfair)
-        if left_surname_match:
-            score += 15
-            reasons.append(f"surname {surname(left_fight)} matched")
-        if right_surname_match:
-            score += 15
-            reasons.append(f"surname {surname(right_fight)} matched")
-        if "ufc" in normalize_name(candidate.competition_name + " " + candidate.event_name):
-            score += 5
-            reasons.append("UFC context")
-        if score > best_score:
-            best_score = score
-            best_reason = "; ".join(reasons)
-    return min(best_score, 100.0), best_reason
-
-
-def match_fight_to_candidates(fight: Fight, candidates: Iterable[BetfairCandidate]) -> MatchResult:
-    scored: list[tuple[float, str, BetfairCandidate]] = []
-    for candidate in candidates:
-        score, reason = score_candidate(fight, candidate)
-        if score >= 75:
-            scored.append((score, reason, candidate))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    if not scored:
-        return MatchResult("", "", "", "None", 0.0, "No high-confidence Betfair event found")
-    if len(scored) > 1 and scored[0][0] - scored[1][0] < 12:
-        top_names = ", ".join(f"{item[2].event_name} ({round(item[0], 1)})" for item in scored[:3])
-        return MatchResult("", "", "", "Ambiguous", scored[0][0], f"Multiple close Betfair matches: {top_names}")
-    score, reason, candidate = scored[0]
-    return MatchResult(candidate.event_id, candidate.market_id, candidate.event_name, "High", score, reason)
-
-
-def find_betfair_match(client: APIClient | None, fight: Fight) -> MatchResult:
-    if client is None:
-        return MatchResult("", "", "", "None", 0.0, "Betfair client unavailable")
-    start_from = utc_now() - timedelta(hours=12)
-    start_to = utc_now() + timedelta(days=2)
-    candidates = list_mma_match_odds_candidates(client, start_from=start_from, start_to=start_to)
-    log(f"betfair_candidates_scanned count={len(candidates)} fight_name={fight.display_name!r}")
-    match = match_fight_to_candidates(fight, candidates)
-    if match.matched:
-        log(
-            "matched_betfair_event_id=%s matched_betfair_market_id=%s fight_name=%r score=%.1f reason=%r"
-            % (match.event_id, match.market_id, fight.display_name, match.score, match.reason)
-        )
-    else:
-        log(f"betfair_match_not_found fight_name={fight.display_name!r} reason={match.reason!r}")
-    return match
-
-
-def fetch_ufc_block_texts(url: str, browser_holder: dict[str, Any]) -> list[str]:
-    if browser_holder.get("playwright") is None:
-        from playwright.sync_api import sync_playwright
-
-        playwright = sync_playwright().start()
-        chrome_binary = (
-            os.getenv("CHROME_BINARY", "").strip()
-            or os.getenv("GOOGLE_CHROME_BIN", "").strip()
-            or os.getenv("CHROME_BIN", "").strip()
-        )
-        launch_options: dict[str, Any] = {
-            "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-        }
-        if chrome_binary and Path(chrome_binary).exists():
-            launch_options["executable_path"] = chrome_binary
-        browser = playwright.chromium.launch(**launch_options)
-        browser_holder["playwright"] = playwright
-        browser_holder["browser"] = browser
-    browser = browser_holder["browser"]
-    page = browser.new_page()
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        try:
-            page.wait_for_selector(".c-listing-fight", timeout=15000)
-        except Exception:
-            log("ufc_parse_warning no .c-listing-fight blocks found before timeout")
-        texts = page.locator(".c-listing-fight").all_inner_texts()
-        if not texts:
-            body_text = page.locator("body").inner_text(timeout=5000)
-            log(f"ufc_parse_error no fight blocks found body_preview={body_text[:MAX_DEBUG_BLOCK_CHARS]!r}")
-        return [str(text) for text in texts]
-    finally:
-        page.close()
-
-
-def close_browser(browser_holder: dict[str, Any]) -> None:
-    browser = browser_holder.get("browser")
-    playwright = browser_holder.get("playwright")
-    if browser is not None:
-        try:
-            browser.close()
-        except Exception as exc:
-            log(f"Browser close failed: {exc}")
-    if playwright is not None:
-        try:
-            playwright.stop()
-        except Exception as exc:
-            log(f"Playwright stop failed: {exc}")
-    browser_holder.clear()
-
-
-def load_alerted_keys_for_url(ufc_url: str) -> set[str]:
-    data = read_json()
-    if str(data.get("ufc_event_url", "") or "") != ufc_url:
-        return set()
-    return {str(key) for key in data.get("alerted_fight_keys", []) or []}
-
-
-def mark_alerted(fight: Fight, match: MatchResult, ufc_url: str, key: str, *, dry_run: bool) -> None:
+    key: str,
+    alert_type: str,
+    fight_name: str,
+    ufc_url: str,
+    dry_run: bool,
+) -> None:
     data = read_json()
     keys = [str(existing) for existing in data.get("alerted_fight_keys", []) or []]
     if key not in keys:
         keys.append(key)
-    alerted_fights = list(data.get("alerted_fights", []) or [])
-    alerted_fights.append(
+    fights = list(data.get("alerted_fights", []) or [])
+    fights.append(
         {
-            "fight_name": fight.display_name,
-            "fighter_a": fight.fighter_a,
-            "fighter_b": fight.fighter_b,
+            "fight_name": fight_name,
+            "alert_type": alert_type,
             "ufc_event_url": ufc_url,
-            "betfair_event_id": match.event_id if match.matched else "Not matched",
-            "betfair_market_id": match.market_id,
-            "matched_betfair_event_name": match.event_name,
+            "betfair_event_id": "Not matched",
+            "betfair_market_id": "",
             "dry_run": bool(dry_run),
             "alerted_at": iso_utc(),
         }
     )
-    data.update(
-        {
-            "ufc_event_url": ufc_url,
-            "alerted_fight_keys": keys[-100:],
-            "alerted_fights": alerted_fights[-100:],
-            "last_detected_live_fight": fight.display_name,
-            "last_slack_alert_sent": "Dry-run: not sent" if dry_run else f"{fight.display_name} at {iso_utc()}",
-        }
-    )
+    updates: dict[str, Any] = {
+        "ufc_event_url": ufc_url,
+        "alerted_fight_keys": keys[-150:],
+        "alerted_fights": fights[-150:],
+        "last_slack_alert_sent": (
+            f"Dry-run: {alert_type} for {fight_name}"
+            if dry_run
+            else f"{alert_type} for {fight_name} at {iso_utc()}"
+        ),
+    }
+    if alert_type == "Fight started":
+        updates["last_detected_live_fight"] = fight_name
+    data.update(updates)
     write_json(data)
 
 
-def process_live_fights(
-    fights: Iterable[Fight],
+def deliver_alert(
+    *,
+    title: str,
+    message: str,
+    key: str,
+    alert_type: str,
+    fight_name: str,
+    ufc_url: str,
+    webhook_url: str,
+    dry_run: bool,
+) -> bool:
+    log(f"{title}: {fight_name}")
+    if dry_run:
+        log(f"DRY RUN Slack message: {message!r}")
+    else:
+        try:
+            send_slack_message(webhook_url, message)
+        except Exception as exc:
+            log(f"slack_failed alert_type={alert_type!r} fight_name={fight_name!r} error={exc}")
+            return False
+        log(f"slack_sent alert_type={alert_type!r} fight_name={fight_name!r}")
+    record_alert(
+        key=key,
+        alert_type=alert_type,
+        fight_name=fight_name,
+        ufc_url=ufc_url,
+        dry_run=dry_run,
+    )
+    return True
+
+
+def espn_fight_name(fight: dict[str, Any]) -> str:
+    names = [str(competitor.get("displayName", "TBD")) for competitor in fight.get("competitors", [])]
+    return " vs ".join(names)
+
+
+def espn_status_text(fight: dict[str, Any]) -> str:
+    full_status = fight.get("fullStatus", {}) or {}
+    parts = [
+        fight.get("status", ""),
+        fight.get("summary", ""),
+        fight.get("description", ""),
+        full_status.get("name", ""),
+        full_status.get("description", ""),
+        full_status.get("detail", ""),
+        full_status.get("shortDetail", ""),
+    ]
+    return " | ".join(str(part) for part in parts if part)
+
+
+def espn_fight_ended(fight: dict[str, Any]) -> bool:
+    full_status = fight.get("fullStatus", {}) or {}
+    state = str(full_status.get("state", "")).casefold()
+    text = espn_status_text(fight).casefold()
+    return bool(full_status.get("completed", False) or state == "post" or "final" in text)
+
+
+def espn_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        events = payload["sports"][0]["leagues"][0]["events"]
+    except (KeyError, IndexError, TypeError):
+        return []
+    return sorted(events, key=lambda item: item.get("matchNumber", 999), reverse=True)
+
+
+def check_espn(
     *,
     ufc_url: str,
-    config: Config,
-    betfair_client: APIClient | None,
+    webhook_url: str,
+    known_alerts: set[str],
+    ended_on_first_check: set[str],
+    first_check: bool,
     dry_run: bool,
 ) -> None:
-    alerted_keys = load_alerted_keys_for_url(ufc_url)
+    response = requests.get(ESPN_URL, verify=False, timeout=8)
+    response.raise_for_status()
+    fights = espn_events(response.json())
+    log(f"ESPN fights found: {len(fights)}")
+
     for fight in fights:
-        key = fight_key(fight, ufc_url)
-        update_state(last_detected_live_fight=fight.display_name)
-        if key in alerted_keys:
-            log(f"dedupe_skip fight_name={fight.display_name!r} ufc_event_url={ufc_url!r}")
-            continue
-        match = find_betfair_match(betfair_client, fight)
-        message = format_slack_message(fight, match)
-        log(
-            "fight_live_detected fight_name=%r ufc_event_url=%r betfair_event_id=%r betfair_market_id=%r"
-            % (fight.display_name, ufc_url, match.event_id or "Not matched", match.market_id)
-        )
-        if dry_run:
-            log("DRY RUN Slack message follows:")
-            print(message, flush=True)
-            mark_alerted(fight, match, ufc_url, key, dry_run=True)
-            alerted_keys.add(key)
-            continue
+        name = espn_fight_name(fight)
+        normalized_name = normalize(name)
+        status_text = espn_status_text(fight).casefold()
+        ended = espn_fight_ended(fight)
+
+        if first_check and ended:
+            ended_on_first_check.add(normalized_name)
+
+        walkout_key = f"walkout|{normalized_name}"
+        if "walkout" in status_text and walkout_key not in known_alerts:
+            if deliver_alert(
+                title="UFC Walkout Alert",
+                message=f"🚶 WALKOUTS\n\n{name}",
+                key=walkout_key,
+                alert_type="Walkouts",
+                fight_name=name,
+                ufc_url=ufc_url,
+                webhook_url=webhook_url,
+                dry_run=dry_run,
+            ):
+                known_alerts.add(walkout_key)
+
+        ended_key = f"ended|{normalized_name}"
+        if (
+            not first_check
+            and ended
+            and normalized_name not in ended_on_first_check
+            and ended_key not in known_alerts
+        ):
+            if deliver_alert(
+                title="UFC Fight Ended",
+                message=f"✅ FIGHT ENDED\n\n{name}",
+                key=ended_key,
+                alert_type="Fight ended",
+                fight_name=name,
+                ufc_url=ufc_url,
+                webhook_url=webhook_url,
+                dry_run=dry_run,
+            ):
+                known_alerts.add(ended_key)
+
+
+def extract_live_fight(lines: list[str]) -> str | None:
+    cleaned = [line.strip() for line in lines if line.strip()]
+    for index, line in enumerate(cleaned):
+        if line.upper() == "VS" and index > 0 and index + 1 < len(cleaned):
+            return f"{cleaned[index - 1]} vs {cleaned[index + 1]}"
+    return None
+
+
+def get_ufc_live_fight(page: Any) -> str | None:
+    try:
+        page.reload(wait_until="commit", timeout=8000)
+    except Exception as exc:
+        log(f"UFC reload warning: {exc}")
+    page.wait_for_timeout(3000)
+
+    fights = page.locator(".c-listing-fight")
+    fight_count = fights.count()
+    log(f"UFC fight blocks found: {fight_count}")
+    if fight_count == 0:
+        log("UFC parse warning: no .c-listing-fight blocks found")
+        return None
+
+    for index in range(fight_count):
+        fight = fights.nth(index)
         try:
-            send_slack_message(config.slack_webhook_url, message)
+            live_banner = fight.locator(".c-listing-fight__banner--live")
+            if live_banner.count() == 0 or not live_banner.first.is_visible():
+                continue
+            display = extract_live_fight(fight.inner_text(timeout=1500).splitlines())
+            if display:
+                return display
         except Exception as exc:
-            log(f"slack_failed fight_name={fight.display_name!r} error={exc}")
-            continue
-        log(f"slack_sent fight_name={fight.display_name!r}")
-        mark_alerted(fight, match, ufc_url, key, dry_run=False)
-        alerted_keys.add(key)
+            log(f"UFC fight block warning index={index} error={exc}")
+    return None
+
+
+def open_ufc_page(ufc_url: str, browser_holder: dict[str, Any]) -> Any:
+    from playwright.sync_api import sync_playwright
+
+    playwright = sync_playwright().start()
+    chrome_binary = (
+        os.getenv("CHROME_BINARY", "").strip()
+        or os.getenv("GOOGLE_CHROME_BIN", "").strip()
+        or os.getenv("CHROME_BIN", "").strip()
+    )
+    launch_options: dict[str, Any] = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+    }
+    if chrome_binary and Path(chrome_binary).exists():
+        launch_options["executable_path"] = chrome_binary
+    browser = playwright.chromium.launch(**launch_options)
+    context = browser.new_context(ignore_https_errors=True)
+    page = context.new_page()
+    browser_holder.update(
+        {
+            "playwright": playwright,
+            "browser": browser,
+            "context": context,
+            "page": page,
+        }
+    )
+    log("Opening UFC.com...")
+    try:
+        page.goto(ufc_url, wait_until="commit", timeout=8000)
+    except Exception as exc:
+        log(f"Initial UFC navigation warning: {exc}")
+    page.wait_for_timeout(1000)
+    return page
+
+
+def close_browser(browser_holder: dict[str, Any]) -> None:
+    for name in ("page", "context", "browser"):
+        resource = browser_holder.get(name)
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception as exc:
+                log(f"{name.capitalize()} close warning: {exc}")
+    playwright = browser_holder.get("playwright")
+    if playwright is not None:
+        try:
+            playwright.stop()
+        except Exception as exc:
+            log(f"Playwright close warning: {exc}")
+    browser_holder.clear()
 
 
 def run_scan_loop(args: argparse.Namespace) -> int:
@@ -641,36 +401,61 @@ def run_scan_loop(args: argparse.Namespace) -> int:
     validate_ufc_url(ufc_url)
     save_ufc_url(ufc_url)
 
-    config = load_config()
-    log(f"Slack webhook source: {config.slack_config_source}")
-    betfair_client: APIClient | None = None
-    try:
-        betfair_client = build_client(config)
-    except Exception as exc:
-        log(f"Betfair login unavailable; alerts will use Betfair ID: Not matched. error={exc}")
+    webhook_url, webhook_source = slack_webhook_url()
+    log(f"Slack webhook source: {webhook_source}")
+    if not args.dry_run and is_placeholder(webhook_url):
+        raise RuntimeError(f"{UFC_SLACK_WEBHOOK_ENV_NAME} or {SLACK_WEBHOOK_ENV_NAME} missing")
 
+    known_alerts = alerted_keys()
+    ended_on_first_check: set[str] = set()
+    first_espn_check = True
     browser_holder: dict[str, Any] = {}
+    page: Any | None = None
     check_every = max(float(args.check_every_seconds), 2.0)
-    log(f"Starting UFC live scanner url={ufc_url!r} cadence_seconds={check_every:g} dry_run={bool(args.dry_run)}")
+    log(
+        f"Starting UFC scanner url={ufc_url!r} "
+        f"cadence_seconds={check_every:g} dry_run={bool(args.dry_run)}"
+    )
+
     try:
         while not STOP_EVENT.is_set():
             update_state(last_check_time=iso_utc(), ufc_event_url=ufc_url)
             try:
-                block_texts = fetch_ufc_block_texts(ufc_url, browser_holder)
-                fights = parse_live_fights_from_block_texts(block_texts)
-                log(f"ufc_check_complete live_fights={len(fights)} blocks={len(block_texts)}")
-                process_live_fights(
-                    fights,
+                check_espn(
                     ufc_url=ufc_url,
-                    config=config,
-                    betfair_client=betfair_client,
+                    webhook_url=webhook_url,
+                    known_alerts=known_alerts,
+                    ended_on_first_check=ended_on_first_check,
+                    first_check=first_espn_check,
                     dry_run=bool(args.dry_run),
                 )
-            except KeyboardInterrupt:
-                raise
+                first_espn_check = False
             except Exception as exc:
-                log(f"ufc_check_failed error={exc}")
+                log(f"ESPN error: {exc}")
+
+            try:
+                if page is None:
+                    page = open_ufc_page(ufc_url, browser_holder)
+                live_display = get_ufc_live_fight(page)
+                if live_display:
+                    live_key = f"live|{normalize(ufc_url)}|{normalize(live_display)}"
+                    update_state(last_detected_live_fight=live_display)
+                    if live_key not in known_alerts and deliver_alert(
+                        title="UFC Fight Started",
+                        message=f"🥊 FIGHT STARTED / LIVE NOW\n\n{live_display}",
+                        key=live_key,
+                        alert_type="Fight started",
+                        fight_name=live_display,
+                        ufc_url=ufc_url,
+                        webhook_url=webhook_url,
+                        dry_run=bool(args.dry_run),
+                    ):
+                        known_alerts.add(live_key)
+            except Exception as exc:
+                log(f"UFC.com error: {exc}")
                 close_browser(browser_holder)
+                page = None
+
             if args.once:
                 return 0
             STOP_EVENT.wait(check_every)
@@ -679,65 +464,25 @@ def run_scan_loop(args: argparse.Namespace) -> int:
         return 130
     finally:
         close_browser(browser_holder)
-        try:
-            if betfair_client is not None:
-                betfair_client.logout()
-        except Exception:
-            pass
-    log("UFC live scanner stopped.")
+    log("UFC scanner stopped.")
     return 0
 
 
 def run_self_test() -> int:
-    assert normalize_name("  Jose Aldo Jr. ") == "jose aldo jr"
-    block = """
-    Early Prelims
-    Fighter A
-    VS
-    Fighter B
-    LIVE NOW
-    """
-    fights = parse_live_fights_from_block_texts([block])
-    assert fights == [Fight("Fighter A", "Fighter B")]
-    not_live = parse_live_fights_from_block_texts(["Fighter A\nVS\nFighter B\nUpcoming"])
-    assert not_live == []
+    assert normalize("  Zhang   WEILI ") == "zhang weili"
+    assert extract_live_fight(["Main card", "Fighter A", "VS", "Fighter B", "LIVE NOW"]) == (
+        "Fighter A vs Fighter B"
+    )
+    assert extract_live_fight(["Fighter A", "Fighter B"]) is None
+    validate_ufc_url("https://www.ufc.com/event/example")
 
-    fight = Fight("Jane Doe", "Mary Smith")
-    key = fight_key(fight, DEFAULT_UFC_URL, "2026-07-08")
-    assert "jane" in key and "smith" in key
-    unmatched = MatchResult("", "", "", "None", 0.0, "")
-    assert format_slack_message(fight, unmatched).splitlines() == [
-        "UFC - Jane Doe v Mary Smith has started",
-        "Betfair ID: Not matched",
-        "Please manually locate the Betfair event.",
-        "Please ensure it is in play",
-    ]
-
-    candidates = [
-        BetfairCandidate("111", "Jane Doe v Mary Smith", "1.111", "Match Odds", "Mixed Martial Arts", "UFC 329", None),
-        BetfairCandidate("222", "Other Fighter v Spare Name", "1.222", "Match Odds", "Mixed Martial Arts", "UFC 329", None),
-    ]
-    matched = match_fight_to_candidates(fight, candidates)
-    assert matched.event_id == "111"
-    reversed_match = match_fight_to_candidates(Fight("Mary Smith", "Jane Doe"), candidates)
-    assert reversed_match.event_id == "111"
-
-    test_config_dir = RUNTIME_DIR / "output"
-    test_config_dir.mkdir(parents=True, exist_ok=True)
-    path = test_config_dir / f"ufc_live_start_scanner_self_test_{os.getpid()}.json"
-    try:
-        write_json({"ufc_event_url": DEFAULT_UFC_URL}, path)
-        assert read_json(path)["ufc_event_url"] == DEFAULT_UFC_URL
-    finally:
-        try:
-            path.unlink()
-        except (FileNotFoundError, PermissionError):
-            pass
-
-    source = Path(__file__).read_text(encoding="utf-8")
-    for name in ("win" + "sound", "tkin" + "ter"):
-        assert f"import {name}" not in source
-        assert f"from {name}" not in source
+    event = {
+        "competitors": [{"displayName": "Fighter A"}, {"displayName": "Fighter B"}],
+        "fullStatus": {"state": "post", "completed": True, "shortDetail": "Final"},
+    }
+    assert espn_fight_name(event) == "Fighter A vs Fighter B"
+    assert espn_fight_ended(event)
+    assert espn_events({"sports": [{"leagues": [{"events": [event]}]}]}) == [event]
 
     sent: list[str] = []
 
@@ -757,18 +502,19 @@ def run_self_test() -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scan UFC.com for LIVE NOW starts and alert Slack.")
+    parser = argparse.ArgumentParser(
+        description="Scan ESPN and UFC.com for walkouts, live starts, and fight endings."
+    )
     parser.add_argument("--self-test", action="store_true", help="Run fixture-based checks and exit.")
-    parser.add_argument("--dry-run", action="store_true", help="Do not send Slack; print what would be sent.")
-    parser.add_argument("--ufc-url", default="", help="Current UFC event URL, for example https://www.ufc.com/event/ufc-329.")
-    parser.add_argument("--check-every-seconds", type=float, default=UFC_CHECK_EVERY_SECONDS)
+    parser.add_argument("--dry-run", action="store_true", help="Print Slack alerts without sending them.")
+    parser.add_argument("--ufc-url", default="", help="Current UFC event URL.")
+    parser.add_argument("--check-every-seconds", type=float, default=CHECK_EVERY_SECONDS)
     parser.add_argument("--once", action="store_true", help="Run one check cycle and exit.")
     return parser.parse_args()
 
 
 def handle_stop_signal(signum: int, frame: Any) -> None:
     STOP_EVENT.set()
-    raise KeyboardInterrupt
 
 
 def main() -> int:
