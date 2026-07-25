@@ -393,6 +393,12 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertIsNone(reminders.api_market_type_filter_for_sport("Cycling", reminders.SPORT_RULE_WINNER_MARKETS))
         self.assertIsNone(reminders.api_market_type_filter_for_sport("Golf", reminders.SPORT_RULE_WINNER_MARKETS))
 
+    def test_cricket_catalogue_uses_api_side_toss_market_filter(self) -> None:
+        self.assertEqual(
+            reminders.api_market_type_filter_for_sport("Cricket", reminders.SPORT_RULE_CRICKET_TOSS),
+            (reminders.TO_WIN_THE_TOSS,),
+        )
+
     def test_cycling_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:
         item = select_market_reminders(
             [reminder("Cycling", "event-1", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc), market_id="1.cyc", market_type_code="WINNER")],
@@ -584,6 +590,78 @@ class BetfairEventReminderTests(unittest.TestCase):
         )
         self.assertEqual(betting.filter["marketCountries"], ["GB", "IE"])
         self.assertNotIn("AU", betting.filter["marketCountries"])
+
+    def test_market_catalogue_too_much_data_retries_smaller_windows_and_dedupes(self) -> None:
+        class FakeBetting:
+            def __init__(self):
+                self.filters = []
+
+            def list_market_catalogue(self, **kwargs):
+                self.filters.append(kwargs["filter"])
+                if len(self.filters) == 1:
+                    raise RuntimeError("TOO_MUCH_DATA")
+                if len(self.filters) == 2:
+                    return [{"market_id": "1.shared"}]
+                return [{"market_id": "1.shared"}, {"market_id": "1.right"}]
+
+        betting = FakeBetting()
+        client = type("FakeClient", (), {"betting": betting})()
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        catalogues = reminders.list_market_catalogues(
+            client,
+            "4",
+            window,
+            market_type_codes=(reminders.TO_WIN_THE_TOSS,),
+            market_countries=("GB",),
+            sport_name="Cricket",
+        )
+
+        self.assertEqual([item["market_id"] for item in catalogues], ["1.shared", "1.right"])
+        self.assertEqual(len(betting.filters), 3)
+        self.assertNotEqual(
+            betting.filters[1]["marketStartTime"]["to"],
+            betting.filters[2]["marketStartTime"]["to"],
+        )
+
+    def test_market_catalogue_too_much_data_retry_is_bounded(self) -> None:
+        class FakeBetting:
+            def __init__(self):
+                self.calls = 0
+
+            def list_market_catalogue(self, **kwargs):
+                self.calls += 1
+                raise RuntimeError("TOO_MUCH_DATA")
+
+        betting = FakeBetting()
+        client = type("FakeClient", (), {"betting": betting})()
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        with self.assertRaisesRegex(RuntimeError, "TOO_MUCH_DATA"):
+            reminders.list_market_catalogues(
+                client,
+                "4",
+                window,
+                market_type_codes=None,
+                market_countries=("GB",),
+                sport_name="Cricket",
+                max_split_depth=1,
+            )
+        self.assertEqual(betting.calls, 2)
+
+    def test_sport_catalogue_failure_is_recorded_and_skipped(self) -> None:
+        stats = reminders.RunStats()
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        with patch.object(reminders, "list_market_catalogues", side_effect=RuntimeError("API unavailable")):
+            catalogues = reminders.list_sport_market_catalogues(
+                object(),
+                "Cricket",
+                reminders.SPORT_RULE_CRICKET_TOSS,
+                "4",
+                window,
+                ("GB",),
+                stats,
+            )
+        self.assertIsNone(catalogues)
+        self.assertEqual(stats.failures, 1)
 
     def test_all_sports_discovery_selects_unknown_sport_and_excludes_au(self) -> None:
         start = "2026-07-09T14:00:00Z"

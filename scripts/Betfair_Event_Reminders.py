@@ -77,6 +77,7 @@ CRICKET_TOSS_LEAD_MINUTES = 40
 CRICKET_HUNDRED_TOSS_LEAD_MINUTES = 55
 CRICKET_HUNDRED_COMPETITION_IDS = frozenset({"12267948", "12351359"})
 EXCLUDED_EVENT_TYPE_IDS = frozenset({"10"})  # Special Bets
+MAX_MARKET_CATALOGUE_SPLIT_DEPTH = 8
 CERT_FILE_NAME = "client-2048.crt"
 KEY_FILE_NAME = "client-2048.key"
 WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -1040,16 +1041,37 @@ def list_event_type_ids(
     return sport_ids
 
 
-def list_market_catalogues(
+def is_too_much_data_error(exc: Exception) -> bool:
+    text = str(exc)
+    if "TOO_MUCH_DATA" in text or "too much data" in text.casefold():
+        return True
+    response = object_get(exc, "response", None)
+    return bool(response and "too_much_data" in str(response).casefold())
+
+
+def dedupe_catalogues(catalogues: Iterable[Any]) -> list[Any]:
+    by_market_id: dict[str, Any] = {}
+    without_market_id: list[Any] = []
+    for catalogue in catalogues:
+        market_id = str(object_get_any(catalogue, ("market_id", "marketId"), "") or "").strip()
+        if market_id:
+            by_market_id[market_id] = catalogue
+        else:
+            without_market_id.append(catalogue)
+    return [*by_market_id.values(), *without_market_id]
+
+
+def list_market_catalogues_once(
     client: APIClient,
     event_type_id: str,
-    window: ScanWindow,
+    start_utc: datetime,
+    end_utc: datetime,
     market_type_codes: Iterable[str] | None = (MATCH_ODDS,),
     market_countries: Iterable[str] | None = None,
 ) -> list[Any]:
     filter_args: dict[str, Any] = {
         "event_type_ids": [event_type_id],
-        "market_start_time": {"from": betfair_time(window.start_utc), "to": betfair_time(window.end_utc)},
+        "market_start_time": {"from": betfair_time(start_utc), "to": betfair_time(end_utc)},
     }
     if market_type_codes is not None:
         filter_args["market_type_codes"] = list(market_type_codes)
@@ -1067,12 +1089,122 @@ def list_market_catalogues(
     )
 
 
+def list_market_catalogues_adaptive(
+    client: APIClient,
+    event_type_id: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    market_type_codes: tuple[str, ...] | None,
+    market_countries: tuple[str, ...] | None,
+    sport_name: str,
+    depth: int,
+    max_split_depth: int,
+) -> list[Any]:
+    try:
+        return list_market_catalogues_once(
+            client,
+            event_type_id,
+            start_utc,
+            end_utc,
+            market_type_codes=market_type_codes,
+            market_countries=market_countries,
+        )
+    except Exception as exc:
+        if not is_too_much_data_error(exc) or depth >= max_split_depth:
+            raise
+
+    midpoint = start_utc + (end_utc - start_utc) / 2
+    label = sport_name or f"eventTypeId={event_type_id}"
+    log(
+        f"{label}: TOO_MUCH_DATA for {format_utc(start_utc)} -> {format_utc(end_utc)}; "
+        "retrying as two smaller catalogue windows."
+    )
+    left = list_market_catalogues_adaptive(
+        client,
+        event_type_id,
+        start_utc,
+        midpoint,
+        market_type_codes=market_type_codes,
+        market_countries=market_countries,
+        sport_name=sport_name,
+        depth=depth + 1,
+        max_split_depth=max_split_depth,
+    )
+    right = list_market_catalogues_adaptive(
+        client,
+        event_type_id,
+        midpoint,
+        end_utc,
+        market_type_codes=market_type_codes,
+        market_countries=market_countries,
+        sport_name=sport_name,
+        depth=depth + 1,
+        max_split_depth=max_split_depth,
+    )
+    return dedupe_catalogues([*left, *right])
+
+
+def list_market_catalogues(
+    client: APIClient,
+    event_type_id: str,
+    window: ScanWindow,
+    market_type_codes: Iterable[str] | None = (MATCH_ODDS,),
+    market_countries: Iterable[str] | None = None,
+    *,
+    sport_name: str = "",
+    max_split_depth: int = MAX_MARKET_CATALOGUE_SPLIT_DEPTH,
+) -> list[Any]:
+    type_codes = tuple(market_type_codes) if market_type_codes is not None else None
+    country_codes = tuple(market_countries) if market_countries is not None else None
+    if country_codes is not None and not country_codes:
+        return []
+    return list_market_catalogues_adaptive(
+        client,
+        event_type_id,
+        window.start_utc,
+        window.end_utc,
+        market_type_codes=type_codes,
+        market_countries=country_codes,
+        sport_name=sport_name,
+        depth=0,
+        max_split_depth=max(0, max_split_depth),
+    )
+
+
 def api_market_type_filter_for_sport(sport_name: str, rule: str) -> tuple[str, ...] | None:
-    if sport_name in {"Politics", "Cricket", "Cycling", "Golf"}:
+    if sport_name == "Cricket":
+        return (TO_WIN_THE_TOSS,)
+    if sport_name in {"Politics", "Cycling", "Golf"}:
         return None
     if rule == SPORT_RULE_WINNER_MARKETS:
         return (WINNER,)
     return (MATCH_ODDS,)
+
+
+def list_sport_market_catalogues(
+    client: APIClient,
+    sport_name: str,
+    rule: str,
+    event_type_id: str,
+    window: ScanWindow,
+    market_countries: Iterable[str],
+    stats: RunStats,
+) -> list[Any] | None:
+    try:
+        return list_market_catalogues(
+            client,
+            event_type_id,
+            window,
+            market_type_codes=api_market_type_filter_for_sport(sport_name, rule),
+            market_countries=market_countries,
+            sport_name=sport_name,
+        )
+    except Exception as exc:
+        stats.failures += 1
+        log(f"ERROR: {sport_name} catalogue scan failed after bounded retries: {exc}")
+        log(f"Continuing with the remaining sports; no {sport_name} reminders will be scheduled in this run.")
+        return None
 
 
 def list_market_type_codes(
@@ -1129,6 +1261,7 @@ def discover_all_sports_outright_reminders(
             window,
             market_type_codes=candidate_types,
             market_countries=market_countries,
+            sport_name=sport_name,
         )
         for catalogue in catalogues:
             reminder = catalogue_to_reminder(catalogue, sport_name, sport_emoji(sport_name), event_type_id)
@@ -1211,6 +1344,7 @@ def run_cycling_market_diagnostic(
         window,
         market_type_codes=None,
         market_countries=market_countries,
+        sport_name="Cycling diagnostic",
     )
     log(f"Cycling catalogue markets before filter: {len(catalogues)}")
     market_types = sorted({catalogue_market_type_code(item) or "<none>" for item in catalogues})
@@ -1382,14 +1516,17 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
             stats.sports_scanned += 1
             event_type_id = sport_ids[sport_name]
             log(f"Scanning {sport_name} eventTypeId={event_type_id}")
-            market_type_filter = api_market_type_filter_for_sport(sport_name, sport["rule"])
-            raw_catalogues = list_market_catalogues(
+            raw_catalogues = list_sport_market_catalogues(
                 client,
+                sport_name,
+                sport["rule"],
                 event_type_id,
                 window,
-                market_type_codes=market_type_filter,
-                market_countries=allowed_country_codes,
+                allowed_country_codes,
+                stats,
             )
+            if raw_catalogues is None:
+                continue
             stats.raw_markets_found += len(raw_catalogues)
             reminders = [
                 reminder
@@ -1456,7 +1593,15 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 selected_with_reasons = select_reminders_with_reasons(unique_events, sport["rule"], window.start_uk)
                 if sport_name in {"Rugby League", "Rugby Union"}:
                     rugby_event_ids = [item.reminder.event_id for item in selected_with_reasons]
-                    first_try_catalogues = list_market_catalogues_for_events(client, rugby_event_ids)
+                    try:
+                        first_try_catalogues = list_market_catalogues_for_events(client, rugby_event_ids)
+                    except Exception as exc:
+                        stats.failures += 1
+                        first_try_catalogues = []
+                        log(
+                            f"ERROR: {sport_name} First Try Scorer lookup failed: {exc}. "
+                            "Continuing with the main rugby reminders."
+                        )
                     first_try_reminders = [
                         reminder
                         for catalogue in first_try_catalogues
@@ -1511,12 +1656,17 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 f"unique events={len(unique_events)}, selected reminders={len(selected)}"
             )
 
-        all_sports_outrights, all_sports_aus_excluded = discover_all_sports_outright_reminders(
-            client,
-            all_event_types,
-            window,
-            allowed_country_codes,
-        )
+        try:
+            all_sports_outrights, all_sports_aus_excluded = discover_all_sports_outright_reminders(
+                client,
+                all_event_types,
+                window,
+                allowed_country_codes,
+            )
+        except Exception as exc:
+            stats.failures += 1
+            all_sports_outrights, all_sports_aus_excluded = [], set()
+            log(f"ERROR: All-sports outright scan failed: {exc}. Continuing with the selected sport reminders.")
         excluded_au_market_ids.update(all_sports_aus_excluded)
         stats.aus_markets_excluded = len(excluded_au_market_ids)
         stats.all_sports_outright_reminders_selected = len(all_sports_outrights)
