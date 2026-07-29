@@ -121,6 +121,9 @@ ACTIONABLE_FINAL_RESULTS = ("failed", "suppressed_unknown", "suppressed_ambiguou
 SQLITE_BUSY_TIMEOUT_SECONDS = 30
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_BUSY_TIMEOUT_SECONDS * 1000
 DB_WRITE_RETRY_DELAYS = (0.2, 0.5, 1.0, 2.0)
+DATABASE_HISTORY_RETENTION = timedelta(days=1)
+DATABASE_CLEANUP_INTERVAL = timedelta(days=1)
+DATABASE_CLEANUP_KEY = "history_cleanup_completed_at"
 FLASHSCORE_TIMING_SCHEMA_COLUMNS = {
     "flashscore_first_seen_at",
     "flashscore_first_seen_live_at",
@@ -945,6 +948,16 @@ def configure_sqlite_connection(connection: sqlite3.Connection, *, readonly: boo
     connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     if not readonly:
         try:
+            connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        except sqlite3.OperationalError as exc:
+            fallback_db_log(
+                "WARNING",
+                "sqlite_pragmas",
+                "Could not enable incremental auto-vacuum",
+                error=str(exc),
+                operation="configure_sqlite_connection",
+            )
+        try:
             connection.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError as exc:
             fallback_db_log("WARNING", "sqlite_pragmas", "Could not enable WAL mode", error=str(exc), operation="configure_sqlite_connection")
@@ -1200,6 +1213,14 @@ def init_db(connection: sqlite3.Connection) -> None:
     ensure_column(connection, "inplay_scan_runs", "flashscore_live_matches_found", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(connection, "inplay_scan_runs", "run_id", "TEXT")
     ensure_column(connection, "inplay_scan_runs", "current_run_started_at", "TEXT")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS database_maintenance (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     safe_commit(connection)
 
 
@@ -1208,6 +1229,89 @@ def ensure_column(connection: sqlite3.Connection, table: str, column: str, colum
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
         log(f"SQLite migration: added {column} to {table}")
+
+
+def cleanup_database_history(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+    force: bool = False,
+) -> tuple[int, int, bool]:
+    """Delete old scan history at most once daily while preserving alert state."""
+    cleanup_now = (now or utc_now()).astimezone(UTC_TZ)
+    try:
+        row = connection.execute(
+            "SELECT value FROM database_maintenance WHERE key = ?",
+            (DATABASE_CLEANUP_KEY,),
+        ).fetchone()
+        last_cleanup = parse_datetime(row["value"]) if row else None
+        if (
+            not force
+            and last_cleanup is not None
+            and cleanup_now - last_cleanup < DATABASE_CLEANUP_INTERVAL
+        ):
+            return 0, 0, False
+
+        cutoff = iso_utc(cleanup_now - DATABASE_HISTORY_RETENTION)
+        logs_cursor = connection.execute(
+            "DELETE FROM inplay_scan_logs WHERE timestamp < ?",
+            (cutoff,),
+        )
+        runs_cursor = connection.execute(
+            """
+            DELETE FROM inplay_scan_runs
+            WHERE scan_completed_at IS NOT NULL
+              AND scan_completed_at < ?
+            """,
+            (cutoff,),
+        )
+        connection.execute(
+            """
+            INSERT INTO database_maintenance (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (DATABASE_CLEANUP_KEY, iso_utc(cleanup_now)),
+        )
+        if not safe_commit(connection, "cleanup_database_history"):
+            return 0, 0, False
+        deleted_logs = max(logs_cursor.rowcount, 0)
+        deleted_runs = max(runs_cursor.rowcount, 0)
+    except sqlite3.Error as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        fallback_db_log(
+            "ERROR",
+            "database_history_cleanup_failed",
+            "Daily database history cleanup failed",
+            error=str(exc),
+            operation="cleanup_database_history",
+        )
+        return 0, 0, False
+
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        auto_vacuum_row = connection.execute("PRAGMA auto_vacuum").fetchone()
+        if auto_vacuum_row and int(auto_vacuum_row[0]) == 2:
+            connection.execute("PRAGMA incremental_vacuum")
+        connection.execute("PRAGMA optimize")
+    except sqlite3.Error as exc:
+        fallback_db_log(
+            "WARNING",
+            "database_history_compaction_failed",
+            "History was deleted but SQLite could not compact all free pages",
+            error=str(exc),
+            operation="cleanup_database_history",
+        )
+
+    log(
+        "Daily database history cleanup completed: "
+        f"logs_deleted={deleted_logs}, completed_runs_deleted={deleted_runs}, "
+        f"retention_hours={int(DATABASE_HISTORY_RETENTION.total_seconds() // 3600)}."
+    )
+    return deleted_logs, deleted_runs, True
 
 
 def db_log(
@@ -6505,6 +6609,53 @@ def run_self_test() -> int:
     assert "  (none)" in debug_text
     old_schema_connection.close()
 
+    history_cleanup_db = sqlite3.connect(":memory:")
+    history_cleanup_db.row_factory = sqlite3.Row
+    init_db(history_cleanup_db)
+    old_history_time = iso_utc(now - timedelta(days=2))
+    recent_history_time = iso_utc(now - timedelta(hours=2))
+    for timestamp, suffix in (
+        (old_history_time, "old"),
+        (recent_history_time, "recent"),
+    ):
+        history_cleanup_db.execute(
+            """
+            INSERT INTO inplay_scan_logs
+                (timestamp, level, event_type, message, details_json)
+            VALUES (?, 'INFO', ?, ?, '{}')
+            """,
+            (timestamp, f"{suffix}_log", f"{suffix} log"),
+        )
+        history_cleanup_db.execute(
+            """
+            INSERT INTO inplay_scan_runs
+                (scan_started_at, scan_completed_at, status, dry_run)
+            VALUES (?, ?, 'complete', 0)
+            """,
+            (timestamp, timestamp),
+        )
+    history_cleanup_db.commit()
+    deleted_logs, deleted_runs, cleanup_ran = cleanup_database_history(
+        history_cleanup_db,
+        now=now,
+        force=True,
+    )
+    assert cleanup_ran
+    assert deleted_logs == 1
+    assert deleted_runs == 1
+    assert history_cleanup_db.execute(
+        "SELECT COUNT(*) FROM inplay_scan_logs WHERE event_type = 'recent_log'"
+    ).fetchone()[0] == 1
+    assert history_cleanup_db.execute(
+        "SELECT COUNT(*) FROM inplay_scan_runs WHERE scan_completed_at = ?",
+        (recent_history_time,),
+    ).fetchone()[0] == 1
+    assert cleanup_database_history(
+        history_cleanup_db,
+        now=now + timedelta(hours=1),
+    ) == (0, 0, False)
+    history_cleanup_db.close()
+
     smith_match = participant_confidence(("Smith M.", "Jones D."), ("Michael Smith", "Dave Jones"), "", "")
     assert smith_match.level == "High"
     assert smith_match.flashscore_surname_1 == "smith"
@@ -8252,6 +8403,7 @@ def main() -> int:
         while True:
             if repeat_minutes:
                 log(f"Starting in-play start scan cycle {cycle}.")
+            cleanup_database_history(connection)
             exit_code = run_scan(args, config, connection)
             if not repeat_minutes:
                 return exit_code
