@@ -44,6 +44,7 @@ UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
 REMINDER_LEAD_MINUTES = 5
 MANUAL_MANAGEMENT_LEAD_MINUTES = 30
+BOXING_REMINDER_LEAD_MINUTES = (60, 30)
 SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
@@ -112,7 +113,7 @@ DEDUP_MARKET = "market"
 
 SPORTS: tuple[dict[str, str], ...] = (
     {"name": "American Football", "rule": SPORT_RULE_ALL, "emoji": ":football:"},
-    {"name": "Boxing", "rule": SPORT_RULE_BOXING_BATCHES, "emoji": ":boxing_glove:"},
+    {"name": "Boxing", "rule": SPORT_RULE_BOXING_BATCHES, "emoji": ":boxing:"},
     {"name": "Cricket", "rule": SPORT_RULE_CRICKET_TOSS, "emoji": ":cricket:"},
     {"name": "Cycling", "rule": SPORT_RULE_WINNER_MARKETS, "emoji": ":bicyclist:"},
     {"name": "Darts", "rule": SPORT_RULE_DARTS_GROUPS, "emoji": ":dart:"},
@@ -1317,6 +1318,16 @@ def dedupe_market_candidates(reminders: Iterable[EventReminder]) -> list[EventRe
     return selected
 
 
+def expand_boxing_reminder_times(reminders: Iterable[EventReminder]) -> list[EventReminder]:
+    expanded: list[EventReminder] = []
+    for reminder in reminders:
+        if reminder.sport == "Boxing" and reminder.duplicate_by == DEDUP_EVENT:
+            expanded.extend(replace(reminder, lead_minutes=lead) for lead in BOXING_REMINDER_LEAD_MINUTES)
+        else:
+            expanded.append(reminder)
+    return expanded
+
+
 def catalogue_total_matched(catalogue: Any) -> str:
     value = object_get_any(catalogue, ("total_matched", "totalMatched"), "")
     return str(value) if value != "" else "unavailable"
@@ -1432,9 +1443,10 @@ def format_slack_text(reminder: EventReminder) -> str:
     if reminder.sport in {"Rugby League", "Rugby Union", "American Football"}:
         text = f"{reminder.emoji} Ensure {reminder.event_name} goes in play (Event ID: {reminder.event_id})"
     elif reminder.sport == "Boxing":
+        lead_label = "1 hour" if reminder.lead_minutes == 60 else "30 mins"
         text = (
-            f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}) - "
-            "starting in 30 mins Prep for manual management"
+            f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}) "
+            f"starting in {lead_label} - Prep for manual management"
         )
     elif reminder.sport == "Mixed Martial Arts":
         text = (
@@ -1503,11 +1515,18 @@ def superseded_scheduled_records(
         if not record_channel:
             record_channel = str(record.get("duplicate_key", "")).rsplit("|", 1)[-1]
         record_epoch = int(record.get("scheduled_slack_post_epoch", 0) or 0)
+        record_lead_minutes = int(record.get("reminder_offset_minutes", REMINDER_LEAD_MINUTES) or 0)
+        boxing_text_changed = (
+            reminder.sport == "Boxing"
+            and bool(record.get("slack_text"))
+            and str(record.get("slack_text")) != format_slack_text(reminder)
+        )
         if (
             record_channel == slack_channel_id
             and str(record.get("sport", "")) == reminder.sport
             and str(record.get(identity_field, "")) == identity_value
-            and record_epoch != post_epoch
+            and record_lead_minutes == reminder.lead_minutes
+            and (record_epoch != post_epoch or boxing_text_changed)
             and record_epoch > now_epoch
             and record.get("slack_scheduled_message_id")
         ):
@@ -1750,6 +1769,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
         stats.all_sports_outright_reminders_selected = len(all_sports_outrights)
         all_selected.extend(all_sports_outrights)
         all_selected = dedupe_market_candidates(all_selected)
+        all_selected = expand_boxing_reminder_times(all_selected)
         stats.reminders_selected = len(all_selected)
     finally:
         try:
@@ -1794,7 +1814,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
         if superseded:
             if args.dry_run:
                 log(
-                    f"DRY RUN would replace {len(superseded)} scheduled reminder(s) after a time change: "
+                    f"DRY RUN would replace {len(superseded)} outdated scheduled reminder(s): "
                     f"sport={reminder.sport} event_id={reminder.event_id}"
                 )
             else:
@@ -1813,7 +1833,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                     existing_keys.discard(str(record.get("duplicate_key", "")))
                     save_state(state)
                     log(
-                        f"Removed outdated scheduled reminder after a time change: "
+                        f"Removed outdated scheduled reminder: "
                         f"event={reminder.event_id} old_post_at={record.get('scheduled_slack_post_uk')}"
                     )
                 if replacement_failed:

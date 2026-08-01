@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -202,6 +203,35 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(selected[0].reasons, ("first_boxing_fight",))
         self.assertEqual(selected[0].reminder.lead_minutes, 30)
 
+    def test_boxing_selected_fight_expands_to_one_hour_and_thirty_minute_reminders(self) -> None:
+        selected = reminder(
+            "Boxing",
+            "35867681",
+            datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc),
+            event_name="Fighter A v Fighter B",
+            emoji=":boxing:",
+        )
+        expanded = reminders.expand_boxing_reminder_times([selected])
+        self.assertEqual([item.lead_minutes for item in expanded], [60, 30])
+        self.assertEqual(
+            [reminders.reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z") for item in expanded],
+            ["18:00 BST", "18:30 BST"],
+        )
+        self.assertEqual(
+            [reminders.format_slack_text(item) for item in expanded],
+            [
+                ":boxing: Fighter A v Fighter B (Event ID: 35867681) starting in 1 hour - Prep for manual management",
+                ":boxing: Fighter A v Fighter B (Event ID: 35867681) starting in 30 mins - Prep for manual management",
+            ],
+        )
+
+    def test_boxing_outright_market_is_not_expanded(self) -> None:
+        outright = replace(
+            reminder("Boxing", "event-1", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
+            duplicate_by=reminders.DEDUP_MARKET,
+        )
+        self.assertEqual(reminders.expand_boxing_reminder_times([outright]), [outright])
+
     def test_boxing_fight_within_two_hours_is_not_selected(self) -> None:
         fights = [
             reminder("Boxing", "first", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)),
@@ -274,8 +304,8 @@ class BetfairEventReminderTests(unittest.TestCase):
                 ":rugby_football: Ensure Leeds Rhinos v Bradford Bulls goes in play (Event ID: 35844821)",
             ),
             (
-                reminder("Boxing", "35785447", start, event_name="Otto Wallin v Vladyslav Sirenko", emoji=":boxing_glove:"),
-                ":boxing_glove: Otto Wallin v Vladyslav Sirenko (Event ID: 35785447) - starting in 30 mins Prep for manual management",
+                reminder("Boxing", "35785447", start, event_name="Otto Wallin v Vladyslav Sirenko", emoji=":boxing:"),
+                ":boxing: Otto Wallin v Vladyslav Sirenko (Event ID: 35785447) starting in 30 mins - Prep for manual management",
             ),
             (
                 reminder("American Football", "35844693", start, event_name="Hamilton Tiger-Cats @ Montreal Alouettes", emoji=":football:"),
@@ -352,6 +382,34 @@ class BetfairEventReminderTests(unittest.TestCase):
             old_post_epoch - 1,
         )
         self.assertEqual([record["slack_scheduled_message_id"] for record in matches], ["Q123"])
+
+    def test_boxing_dual_reminder_slots_do_not_supersede_each_other(self) -> None:
+        one_hour = replace(
+            reminder("Boxing", "event-1", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc), emoji=":boxing:"),
+            lead_minutes=60,
+        )
+        thirty_minute_epoch = int(reminder_time(one_hour.event_start_utc, 30).timestamp())
+        state = {
+            "scheduled": [
+                {
+                    "duplicate_key": f"Boxing|event-1|{thirty_minute_epoch}|C07FXG95GQ6",
+                    "sport": "Boxing",
+                    "event_id": "event-1",
+                    "scheduled_slack_post_epoch": thirty_minute_epoch,
+                    "reminder_offset_minutes": 30,
+                    "slack_text": ":boxing: Fighter A v Fighter B starting in 30 mins",
+                    "slack_scheduled_message_id": "Q30",
+                }
+            ]
+        }
+        matches = reminders.superseded_scheduled_records(
+            state,
+            one_hour,
+            int(reminder_time(one_hour.event_start_utc, 60).timestamp()),
+            "C07FXG95GQ6",
+            thirty_minute_epoch - 3600,
+        )
+        self.assertEqual(matches, [])
 
     def test_politics_market_inside_window_is_selected(self) -> None:
         window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
