@@ -241,6 +241,8 @@ input, select {
 table { width: 100%; border-collapse: collapse; background: #081525; }
 th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; }
 th { color: var(--accent); font-size: 0.82rem; text-transform: uppercase; }
+.reminders-panel { margin-bottom: 18px; }
+.reminder-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }

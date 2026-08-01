@@ -14,7 +14,7 @@ import tempfile
 import traceback
 from collections import Counter
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -42,11 +42,14 @@ LOG_DIR = PROJECT_ROOT / "logs"
 
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
-SCAN_TIMES_UK = (time(7, 0), time(15, 0), time(23, 0))
 REMINDER_LEAD_MINUTES = 5
+MANUAL_MANAGEMENT_LEAD_MINUTES = 30
 SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
+SLACK_DELETE_SCHEDULED_URL = "https://slack.com/api/chat.deleteScheduledMessage"
+DEFAULT_SLACK_CHANNEL_ID = "C07FXG95GQ6"
+DEFAULT_SLACK_CHANNEL_NAME = "#exc_sports_ops"
 MATCH_ODDS = "MATCH_ODDS"
 WINNER = "WINNER"
 OUTRIGHT_WINNER = "OUTRIGHT_WINNER"
@@ -84,8 +87,8 @@ WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 PLACEHOLDER_CONFIG: dict[str, str] = {
     "slack_bot_token": "xoxb-NEW-CHANNEL-BOT-TOKEN-PLACEHOLDER",
-    "slack_channel_id": "C_NEW_CHANNEL_ID_PLACEHOLDER",
-    "slack_channel_name": "#exc_sports_ops",
+    "slack_channel_id": DEFAULT_SLACK_CHANNEL_ID,
+    "slack_channel_name": DEFAULT_SLACK_CHANNEL_NAME,
     "fallback_webhook_url": "https://hooks.slack.com/services/NEW/CHANNEL/WEBHOOK_PLACEHOLDER",
     "betfair_app_key": "BETFAIR_APP_KEY_PLACEHOLDER",
     "betfair_username": "BETFAIR_USERNAME_PLACEHOLDER",
@@ -478,11 +481,7 @@ def is_placeholder(value: str, *, allow_empty: bool = False) -> bool:
 
 def latest_scheduled_scan_start(now_uk: datetime) -> datetime:
     now = now_uk.astimezone(UK_TZ)
-    for scan_time in reversed(SCAN_TIMES_UK):
-        candidate = datetime.combine(now.date(), scan_time, tzinfo=UK_TZ)
-        if candidate <= now:
-            return candidate
-    return datetime.combine(now.date() - timedelta(days=1), SCAN_TIMES_UK[-1], tzinfo=UK_TZ)
+    return now.replace(minute=0, second=0, microsecond=0)
 
 
 def build_scan_window(now_uk: datetime | None = None, lookahead_hours: float = 24, start_now: bool = False) -> ScanWindow:
@@ -632,7 +631,13 @@ def select_reminders_with_reasons(
     scan_start_uk: datetime | None = None,
 ) -> list[SelectedReminder]:
     sorted_events = sorted(
-        (event for event in events if not is_disallowed_market(event)),
+        (
+            replace(event, lead_minutes=MANUAL_MANAGEMENT_LEAD_MINUTES)
+            if event.sport in {"Boxing", "Mixed Martial Arts"}
+            else event
+            for event in events
+            if not is_disallowed_market(event)
+        ),
         key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.event_id),
     )
     if rule == SPORT_RULE_ALL:
@@ -800,13 +805,16 @@ def env_to_config(values: dict[str, str]) -> Config:
     cert_values = env_cert_values(values)
     return Config(
         slack_bot_token=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_BOT_TOKEN", "SLACK_BOT_TOKEN"),
-        slack_channel_id=first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID", "SLACK_CHANNEL_ID"),
+        slack_channel_id=(
+            first_env_value(values, "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID", "SLACK_CHANNEL_ID")
+            or DEFAULT_SLACK_CHANNEL_ID
+        ),
         slack_channel_name=first_env_value(
             values,
             "BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_NAME",
             "SLACK_CHANNEL_NAME",
         )
-        or PLACEHOLDER_CONFIG["slack_channel_name"],
+        or DEFAULT_SLACK_CHANNEL_NAME,
         fallback_webhook_url=first_env_value(
             values,
             "BETFAIR_EVENT_REMINDERS_FALLBACK_WEBHOOK_URL",
@@ -1409,7 +1417,11 @@ def save_state(state: dict[str, Any], path: Path = STATE_PATH) -> None:
 def scheduled_keys(state: dict[str, Any]) -> set[str]:
     keys: set[str] = set()
     for record in state.get("scheduled", []):
-        if isinstance(record, dict) and record.get("duplicate_key"):
+        if (
+            isinstance(record, dict)
+            and record.get("duplicate_key")
+            and str(record.get("status", "scheduled")) == "scheduled"
+        ):
             keys.add(str(record["duplicate_key"]))
     return keys
 
@@ -1417,7 +1429,27 @@ def scheduled_keys(state: dict[str, Any]) -> set[str]:
 def format_slack_text(reminder: EventReminder) -> str:
     if reminder.slack_message_override:
         return reminder.slack_message_override
-    return f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}){reminder.slack_message_suffix}"
+    if reminder.sport in {"Rugby League", "Rugby Union", "American Football"}:
+        text = f"{reminder.emoji} Ensure {reminder.event_name} goes in play (Event ID: {reminder.event_id})"
+    elif reminder.sport == "Boxing":
+        text = (
+            f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}) - "
+            "starting in 30 mins Prep for manual management"
+        )
+    elif reminder.sport == "Mixed Martial Arts":
+        text = (
+            f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id}) "
+            "starting in 30 mins Prep for manual management"
+        )
+    elif reminder.sport == "Snooker":
+        competition_name = reminder.competition_name or reminder.event_name
+        text = f'{reminder.emoji} Ensure "{competition_name}" is grabbed by the bot'
+    elif reminder.sport == "Darts":
+        competition_name = reminder.competition_name or reminder.event_name
+        text = f'{reminder.emoji} Ensure "{competition_name}" is grabbed by bot'
+    else:
+        text = f"{reminder.emoji} {reminder.event_name} (Event ID: {reminder.event_id})"
+    return f"{text}{reminder.slack_message_suffix}"
 
 
 def schedule_slack_message(config: Config, reminder: EventReminder, post_epoch: int) -> str:
@@ -1437,6 +1469,50 @@ def schedule_slack_message(config: Config, reminder: EventReminder, post_epoch: 
             raise RuntimeError("Slack chat.scheduleMessage failed: restricted_too_many")
         raise RuntimeError(f"Slack chat.scheduleMessage failed: {error}")
     return str(payload.get("scheduled_message_id") or "")
+
+
+def delete_scheduled_slack_message(config: Config, scheduled_message_id: str) -> None:
+    response = requests.post(
+        SLACK_DELETE_SCHEDULED_URL,
+        headers={"Authorization": f"Bearer {config.slack_bot_token}", "Content-Type": "application/json"},
+        json={"channel": config.slack_channel_id, "scheduled_message_id": scheduled_message_id},
+        timeout=20,
+    )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Slack returned non-JSON response: status={response.status_code} body={response.text}") from exc
+    if response.status_code >= 400 or not payload.get("ok"):
+        raise RuntimeError(f"Slack chat.deleteScheduledMessage failed: {payload.get('error', 'unknown_error')}")
+
+
+def superseded_scheduled_records(
+    state: dict[str, Any],
+    reminder: EventReminder,
+    post_epoch: int,
+    slack_channel_id: str,
+    now_epoch: int,
+) -> list[dict[str, Any]]:
+    identity_field = "market_id" if reminder.duplicate_by == DEDUP_MARKET and reminder.market_id else "event_id"
+    identity_value = getattr(reminder, identity_field)
+    matches: list[dict[str, Any]] = []
+    for record in state.get("scheduled", []):
+        if not isinstance(record, dict) or str(record.get("status", "scheduled")) != "scheduled":
+            continue
+        record_channel = str(record.get("slack_channel_id", "") or "")
+        if not record_channel:
+            record_channel = str(record.get("duplicate_key", "")).rsplit("|", 1)[-1]
+        record_epoch = int(record.get("scheduled_slack_post_epoch", 0) or 0)
+        if (
+            record_channel == slack_channel_id
+            and str(record.get("sport", "")) == reminder.sport
+            and str(record.get(identity_field, "")) == identity_value
+            and record_epoch != post_epoch
+            and record_epoch > now_epoch
+            and record.get("slack_scheduled_message_id")
+        ):
+            matches.append(record)
+    return matches
 
 
 def state_record(reminder: EventReminder, key: str, post_epoch: int, scheduled_message_id: str) -> dict[str, Any]:
@@ -1459,6 +1535,8 @@ def state_record(reminder: EventReminder, key: str, post_epoch: int, scheduled_m
         "reminder_offset_minutes": reminder.lead_minutes,
         "selection_reason": reminder.selection_reason,
         "slack_text": format_slack_text(reminder),
+        "slack_channel_id": key.rsplit("|", 1)[-1],
+        "status": "scheduled",
         "has_first_try_scorer": reminder.has_first_try_scorer,
         "first_try_scorer_market_id": reminder.first_try_scorer_market_id,
         "first_try_scorer_detection_reason": reminder.first_try_scorer_detection_reason,
@@ -1689,6 +1767,7 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
         log("Force mode enabled: duplicate record checks will be ignored.")
 
     now_uk = datetime.now(UK_TZ)
+    now_epoch = int(now_uk.timestamp())
     for reminder in all_selected:
         if is_disallowed_market(reminder):
             log(
@@ -1704,14 +1783,48 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
             f"Reminder candidate: channel={config.slack_channel_name} post_at={format_uk(post_time_uk)} "
             f"text={format_slack_text(reminder)!r}{reason_suffix}"
         )
-        if post_time_uk <= now_uk:
-            stats.skipped_past_times += 1
-            log(f"SKIP time in past: {reminder.sport} {reminder.event_name} post_at={format_uk(post_time_uk)}")
-            continue
         key = duplicate_key(reminder, post_epoch, config.slack_channel_id)
+        superseded = superseded_scheduled_records(
+            state,
+            reminder,
+            post_epoch,
+            config.slack_channel_id,
+            now_epoch,
+        )
+        if superseded:
+            if args.dry_run:
+                log(
+                    f"DRY RUN would replace {len(superseded)} scheduled reminder(s) after a time change: "
+                    f"sport={reminder.sport} event_id={reminder.event_id}"
+                )
+            else:
+                replacement_failed = False
+                for record in superseded:
+                    try:
+                        delete_scheduled_slack_message(config, str(record["slack_scheduled_message_id"]))
+                    except Exception as exc:
+                        stats.failures += 1
+                        replacement_failed = True
+                        log(f"Slack scheduled-message replacement failure for event {reminder.event_id}: {exc}")
+                        break
+                    record["status"] = "superseded"
+                    record["superseded_at_uk"] = format_uk(datetime.now(UK_TZ))
+                    record["replacement_post_epoch"] = post_epoch
+                    existing_keys.discard(str(record.get("duplicate_key", "")))
+                    save_state(state)
+                    log(
+                        f"Removed outdated scheduled reminder after a time change: "
+                        f"event={reminder.event_id} old_post_at={record.get('scheduled_slack_post_uk')}"
+                    )
+                if replacement_failed:
+                    continue
         if not args.force and key in existing_keys:
             stats.skipped_duplicates += 1
             log(f"SKIP duplicate already scheduled: {key}")
+            continue
+        if post_time_uk <= now_uk:
+            stats.skipped_past_times += 1
+            log(f"SKIP time in past: {reminder.sport} {reminder.event_name} post_at={format_uk(post_time_uk)}")
             continue
         if args.dry_run:
             log(
@@ -1784,7 +1897,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-now",
         action="store_true",
-        help="Use current UK time instead of the latest scheduled 07:00, 15:00, or 23:00 scan time.",
+        help="Use current UK time instead of the start of the current hourly scan window.",
     )
     parser.add_argument("--force", action="store_true", help="Ignore duplicate record checks.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging.")

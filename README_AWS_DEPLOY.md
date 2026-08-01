@@ -133,6 +133,7 @@ Slack webhook routing:
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair In-Play Start Checker uses `Slack_Webhook_TIP` exactly from `/opt/betfair-scripts/.env`. Do not rename it to `SLACK_WEBHOOK_TIP` or `SLACK_WEBHOOK_URL`, and do not commit it, hardcode it, or print it in logs.
+- Betfair Event Reminders uses `SLACK_BOT_TOKEN` and sends scheduled messages to `#exc_sports_ops` (`C07FXG95GQ6`). The channel can be made explicit with `BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_ID` and `BETFAIR_EVENT_REMINDERS_SLACK_CHANNEL_NAME`.
 - Keep the Golf NR, Tennis Integrity, Duplicate Matches, and In-Play Checker webhook values intentionally routed so alerts do not cross channels.
 
 Betfair certificate options:
@@ -213,10 +214,11 @@ journalctl -u betfair-scripts -f
 
 ### Betfair event reminders timer
 
-The reminders scan runs from a separate systemd timer at 07:00, 15:00, and 23:00
-Europe/London time. Every launch scans the next 24 hours from that scheduled time. The
+The reminders scan runs hourly from a separate systemd timer in Europe/London time.
+Every launch scans the next 24 hours from the start of that hour. The
 shared reminder state file prevents an event found in overlapping scans from being
-scheduled in Slack more than once.
+scheduled in Slack more than once. If Betfair moves an event time, the scan removes the
+outdated scheduled Slack message before scheduling its replacement.
 
 Install and start the timer:
 

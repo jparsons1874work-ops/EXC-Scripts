@@ -13,6 +13,39 @@
   </div>
 </header>
 
+{% if spec.id == "betfair-event-reminders" %}
+<section class="panel reminders-panel">
+  <div class="panel-header">
+    <h2>Today's Scheduled Reminders</h2>
+    <span class="meta">{{ reminders.date_label }} · UK time</span>
+  </div>
+  {% if reminders.rows %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Sport</th>
+          <th>Reminder message</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for reminder in reminders.rows %}
+        <tr>
+          <td class="reminder-time">{{ reminder.time }}</td>
+          <td>{{ reminder.sport }}</td>
+          <td>{{ reminder.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="message">No reminders are currently scheduled for today.</div>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="detail-layout">
   <div class="panel">
     <div class="panel-header">

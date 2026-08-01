@@ -73,17 +73,17 @@ def reminder(
 
 
 class BetfairEventReminderTests(unittest.TestCase):
-    def test_0700_uk_scan_window(self) -> None:
-        now = datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ)
+    def test_hourly_uk_scan_window(self) -> None:
+        now = datetime(2026, 7, 9, 12, 37, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
-        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 07:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 07:00 BST")
+        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 12:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 12:00 BST")
 
     def test_uk_scan_window_converts_to_utc(self) -> None:
         now = datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
-        self.assertEqual(window.start_utc, datetime(2026, 7, 9, 6, 0, tzinfo=timezone.utc))
-        self.assertEqual(window.end_utc, datetime(2026, 7, 10, 6, 0, tzinfo=timezone.utc))
+        self.assertEqual(window.start_utc, datetime(2026, 7, 9, 11, 0, tzinfo=timezone.utc))
+        self.assertEqual(window.end_utc, datetime(2026, 7, 10, 11, 0, tzinfo=timezone.utc))
 
     def test_1500_uk_scan_window(self) -> None:
         now = datetime(2026, 7, 9, 15, 2, tzinfo=UK_TZ)
@@ -97,11 +97,11 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 23:00 BST")
         self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 23:00 BST")
 
-    def test_before_0700_uses_previous_2300_scan_window(self) -> None:
+    def test_early_morning_uses_current_hour_scan_window(self) -> None:
         now = datetime(2026, 7, 10, 6, 59, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
-        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 23:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 23:00 BST")
+        self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 06:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-11 06:00 BST")
 
     def test_event_start_minus_five_minutes(self) -> None:
         event_start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
@@ -200,6 +200,7 @@ class BetfairEventReminderTests(unittest.TestCase):
         selected = select_reminders_with_reasons(fights, "boxing_first_and_gap_batches")
         self.assertEqual([item.reminder.event_id for item in selected], ["first"])
         self.assertEqual(selected[0].reasons, ("first_boxing_fight",))
+        self.assertEqual(selected[0].reminder.lead_minutes, 30)
 
     def test_boxing_fight_within_two_hours_is_not_selected(self) -> None:
         fights = [
@@ -262,6 +263,40 @@ class BetfairEventReminderTests(unittest.TestCase):
             ]
             selected = select_reminders(events, "first")
             self.assertEqual([item.event_id for item in selected], [f"{sport}-early"])
+            expected_lead = 30 if sport == "Mixed Martial Arts" else 5
+            self.assertEqual(selected[0].lead_minutes, expected_lead)
+
+    def test_requested_sport_message_formats(self) -> None:
+        start = datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)
+        cases = (
+            (
+                reminder("Rugby League", "35844821", start, event_name="Leeds Rhinos v Bradford Bulls", emoji=":rugby_football:"),
+                ":rugby_football: Ensure Leeds Rhinos v Bradford Bulls goes in play (Event ID: 35844821)",
+            ),
+            (
+                reminder("Boxing", "35785447", start, event_name="Otto Wallin v Vladyslav Sirenko", emoji=":boxing_glove:"),
+                ":boxing_glove: Otto Wallin v Vladyslav Sirenko (Event ID: 35785447) - starting in 30 mins Prep for manual management",
+            ),
+            (
+                reminder("American Football", "35844693", start, event_name="Hamilton Tiger-Cats @ Montreal Alouettes", emoji=":football:"),
+                ":football: Ensure Hamilton Tiger-Cats @ Montreal Alouettes goes in play (Event ID: 35844693)",
+            ),
+            (
+                reminder("Snooker", "35880456", start, competition_name="World Championship", emoji=":8ball:"),
+                ':8ball: Ensure "World Championship" is grabbed by the bot',
+            ),
+            (
+                reminder("Darts", "35880865", start, competition_name="World Seniors Matchplay", emoji=":dart:"),
+                ':dart: Ensure "World Seniors Matchplay" is grabbed by bot',
+            ),
+            (
+                reminder("Mixed Martial Arts", "35879407", start, event_name="Amru Magomedov v Angel Alvarez", emoji=":martial_arts_uniform:"),
+                ":martial_arts_uniform: Amru Magomedov v Angel Alvarez (Event ID: 35879407) starting in 30 mins Prep for manual management",
+            ),
+        )
+        for item, expected in cases:
+            with self.subTest(sport=item.sport):
+                self.assertEqual(reminders.format_slack_text(item), expected)
 
     def test_duplicate_key_generation(self) -> None:
         item = reminder("Snooker", "123", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
@@ -278,6 +313,45 @@ class BetfairEventReminderTests(unittest.TestCase):
         key = duplicate_key(item, post_epoch, "C123")
         state = {"scheduled": [{"duplicate_key": key}]}
         self.assertIn(duplicate_key(item, post_epoch, "C123"), scheduled_keys(state))
+
+    def test_time_change_finds_only_active_pending_reminder_in_same_channel(self) -> None:
+        item = reminder("Boxing", "event-1", datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc))
+        new_post_epoch = int(datetime(2026, 7, 9, 18, 30, tzinfo=UK_TZ).timestamp())
+        old_post_epoch = new_post_epoch - 3600
+        state = {
+            "scheduled": [
+                {
+                    "duplicate_key": f"Boxing|event-1|{old_post_epoch}|C07FXG95GQ6",
+                    "sport": "Boxing",
+                    "event_id": "event-1",
+                    "scheduled_slack_post_epoch": old_post_epoch,
+                    "slack_scheduled_message_id": "Q123",
+                },
+                {
+                    "duplicate_key": f"Boxing|event-1|{old_post_epoch - 60}|C07FXG95GQ6",
+                    "sport": "Boxing",
+                    "event_id": "event-1",
+                    "scheduled_slack_post_epoch": old_post_epoch - 60,
+                    "slack_scheduled_message_id": "Q122",
+                    "status": "superseded",
+                },
+                {
+                    "duplicate_key": f"Boxing|event-1|{old_post_epoch}|C_OLD_CHANNEL",
+                    "sport": "Boxing",
+                    "event_id": "event-1",
+                    "scheduled_slack_post_epoch": old_post_epoch,
+                    "slack_scheduled_message_id": "Q121",
+                },
+            ]
+        }
+        matches = reminders.superseded_scheduled_records(
+            state,
+            item,
+            new_post_epoch,
+            "C07FXG95GQ6",
+            old_post_epoch - 1,
+        )
+        self.assertEqual([record["slack_scheduled_message_id"] for record in matches], ["Q123"])
 
     def test_politics_market_inside_window_is_selected(self) -> None:
         window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
@@ -304,7 +378,7 @@ class BetfairEventReminderTests(unittest.TestCase):
 
     def test_politics_market_outside_window_is_excluded(self) -> None:
         window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
-        item = reminder("Politics", "event-1", datetime(2026, 7, 10, 7, 1, tzinfo=UK_TZ))
+        item = reminder("Politics", "event-1", datetime(2026, 7, 10, 12, 1, tzinfo=UK_TZ))
         self.assertEqual(select_market_reminders([item], "Politics", window), [])
 
     def test_politics_reminder_is_five_minutes_before_market_start_and_dedupes_by_market_id(self) -> None:
@@ -915,7 +989,8 @@ class BetfairEventReminderTests(unittest.TestCase):
         with self.assertRaises(ConfigPlaceholderError) as context:
             validate_config(config, ConfigSource("env", Path("/opt/betfair-scripts/.env")))
         message = str(context.exception)
-        self.assertIn("slack_channel_id", message)
+        self.assertEqual(config.slack_channel_id, "C07FXG95GQ6")
+        self.assertNotIn("slack_channel_id", message)
         self.assertIn("betfair_app_key", message)
         self.assertIn("betfair_username", message)
         self.assertIn("betfair_password", message)

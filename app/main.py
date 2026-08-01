@@ -20,6 +20,7 @@ from app.config import APP_DIR, CONFIG_DIR, PROJECT_ROOT, app_password, branding
 from app.cricket_fixture_api import fixture_refresh_service, router as cricket_fixture_api_router
 from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
+from app.reminders import daily_reminders_context
 from app.runner import RUNNING, STOPPING, default_args_for, runner
 from app.scheduler import window_status
 
@@ -38,6 +39,7 @@ UFC_SCRIPT_ID = "ufc-live-start-scanner"
 UFC_CONFIG_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
 PFL_SCRIPT_ID = "pfl-live-start-scanner"
 PFL_CONFIG_PATH = CONFIG_DIR / "pfl_live_start_scanner.json"
+REMINDERS_SCRIPT_ID = "betfair-event-reminders"
 
 
 class ParserBusyError(RuntimeError):
@@ -280,6 +282,7 @@ async def script_detail(request: Request, script_id: str):
                 parsed_output_message=parsed_output_message,
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
                 pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
+                reminders=daily_reminders_context() if spec.id == REMINDERS_SCRIPT_ID else None,
             ),
         )
     finally:
