@@ -14,6 +14,14 @@
   <strong>Last Slack alert:</strong> {{ ufc.last_slack_alert_sent or "None sent" }}
 </div>
 {% endif %}
+{% if pfl %}
+<div class="message">
+  <strong>Last check:</strong> {{ pfl.last_check_time or "Not checked yet" }} |
+  <strong>Last live fight:</strong> {{ pfl.last_detected_live_fight or "None detected" }} |
+  <strong>Last Slack alert:</strong> {{ pfl.last_slack_alert_sent or "None sent" }} |
+  <strong>Betfair fights cached:</strong> {{ pfl.betfair_events_cached }}
+</div>
+{% endif %}
 {% if state.duplicate_attempts %}
 <div class="message">Script is already running; {{ state.duplicate_attempts }} duplicate start ignored.</div>
 {% endif %}

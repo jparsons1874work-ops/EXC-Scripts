@@ -130,6 +130,15 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         long_running=True,
         timeout_seconds=6 * 60 * 60,
     ),
+    ScriptSpec(
+        id="pfl-live-start-scanner",
+        name="PFL - Live Start Scanner",
+        category="PFL",
+        description="Scans the current PFL card for live fights and alerts the UFC in-play Slack channel.",
+        relative_path="scripts/PFL_Live_Start_Scanner.py",
+        long_running=True,
+        timeout_seconds=6 * 60 * 60,
+    ),
     script(
         "Tennis - Integrity Check",
         "Tennis",

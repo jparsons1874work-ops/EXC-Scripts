@@ -37,6 +37,19 @@
       <input type="hidden" name="ufc_event_url" value="{{ ufc.ufc_event_url }}">
       <button class="button button-primary" type="submit" {% if not ufc.ufc_event_url or state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
     </form>
+    {% elif spec.id == "pfl-live-start-scanner" %}
+    {% if request.query_params.get("error") == "missing-pfl-url" %}
+    <div class="error">Save a PFL event URL before starting the scanner.</div>
+    {% endif %}
+    <form method="post" action="/scripts/{{ spec.id }}/config" class="form-stack controls">
+      <label for="pfl_event_url">PFL event URL</label>
+      <input id="pfl_event_url" name="pfl_event_url" type="url" value="{{ pfl.pfl_event_url }}" placeholder="https://pflmma.com/event/pfl-example">
+      <button class="button button-ghost" type="submit">Save URL</button>
+    </form>
+    <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
+      <input type="hidden" name="pfl_event_url" value="{{ pfl.pfl_event_url }}">
+      <button class="button button-primary" type="submit" {% if not pfl.pfl_event_url or state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
+    </form>
     {% else %}
     <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
       {% if spec.needs_parameters %}
@@ -75,6 +88,34 @@
       {% for fight in ufc.alerted_fights %}
       <strong>{{ fight.fight_name }}</strong><br>
       {{ fight.alerted_at }} | Betfair ID: {{ fight.betfair_event_id or "Not matched" }}{% if not loop.last %}<br><br>{% endif %}
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="message">No alerted fights recorded for this card.</div>
+    {% endif %}
+    {% endif %}
+    {% if spec.id == "pfl-live-start-scanner" %}
+    <div class="panel-header">
+      <h2>Scanner State</h2>
+      {% if pfl.last_saved_at %}<span class="meta">Saved {{ pfl.last_saved_at }}</span>{% endif %}
+    </div>
+    <div class="message">
+      <strong>Last check:</strong> {{ pfl.last_check_time or "Not checked yet" }}<br>
+      <strong>Last live fight:</strong> {{ pfl.last_detected_live_fight or "None detected" }}<br>
+      <strong>Last Slack alert:</strong> {{ pfl.last_slack_alert_sent or "None sent" }}<br>
+      <strong>Betfair fights cached:</strong> {{ pfl.betfair_events_cached }}{% if pfl.betfair_cache_loaded_at %} at {{ pfl.betfair_cache_loaded_at }}{% endif %}
+    </div>
+    <div class="panel-header">
+      <h2>Alerted Fights</h2>
+      <form method="post" action="/scripts/{{ spec.id }}/clear-alerted">
+        <button class="button button-ghost" type="submit">Clear</button>
+      </form>
+    </div>
+    {% if pfl.alerted_fights %}
+    <div class="message">
+      {% for fight in pfl.alerted_fights %}
+      <strong>{{ fight.fight_name }}</strong><br>
+      {{ fight.alerted_at }} | Betfair Event ID: {{ fight.betfair_event_id }}{% if not loop.last %}<br><br>{% endif %}
       {% endfor %}
     </div>
     {% else %}

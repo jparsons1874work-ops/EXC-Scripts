@@ -36,6 +36,8 @@ PARSER_TIMEOUT_SECONDS = 2.0
 _parser_locks = {script_id: threading.Lock() for script_id in SCRIPTS_BY_ID}
 UFC_SCRIPT_ID = "ufc-live-start-scanner"
 UFC_CONFIG_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
+PFL_SCRIPT_ID = "pfl-live-start-scanner"
+PFL_CONFIG_PATH = CONFIG_DIR / "pfl_live_start_scanner.json"
 
 
 class ParserBusyError(RuntimeError):
@@ -87,12 +89,46 @@ def _ufc_context() -> dict[str, Any]:
     }
 
 
+def _read_pfl_config() -> dict[str, Any]:
+    try:
+        if not PFL_CONFIG_PATH.exists():
+            return {}
+        data = json.loads(PFL_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("pfl_config_read_failed path=%s error=%r", PFL_CONFIG_PATH, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pfl_config(data: dict[str, Any]) -> None:
+    ensure_runtime_dirs()
+    PFL_CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _pfl_context() -> dict[str, Any]:
+    data = _read_pfl_config()
+    return {
+        "pfl_event_url": str(data.get("pfl_event_url", "") or ""),
+        "last_saved_at": str(data.get("last_saved_at", "") or ""),
+        "last_check_time": str(data.get("last_check_time", "") or ""),
+        "last_detected_live_fight": str(data.get("last_detected_live_fight", "") or ""),
+        "last_slack_alert_sent": str(data.get("last_slack_alert_sent", "") or ""),
+        "betfair_events_cached": int(data.get("betfair_events_cached", 0) or 0),
+        "betfair_cache_loaded_at": str(data.get("betfair_cache_loaded_at", "") or ""),
+        "alerted_fights": list(data.get("alerted_fights", []) or [])[-25:],
+    }
+
+
 def _default_args_for_start(spec, form: dict[str, str]) -> list[str]:
-    if spec.id != UFC_SCRIPT_ID:
-        return default_args_for(spec, form)
-    data = _read_ufc_config()
-    ufc_url = str(form.get("ufc_event_url", "") or data.get("ufc_event_url", "") or "").strip()
-    return ["--ufc-url", ufc_url] if ufc_url else []
+    if spec.id == UFC_SCRIPT_ID:
+        data = _read_ufc_config()
+        ufc_url = str(form.get("ufc_event_url", "") or data.get("ufc_event_url", "") or "").strip()
+        return ["--ufc-url", ufc_url] if ufc_url else []
+    if spec.id == PFL_SCRIPT_ID:
+        data = _read_pfl_config()
+        pfl_url = str(form.get("pfl_event_url", "") or data.get("pfl_event_url", "") or "").strip()
+        return ["--pfl-url", pfl_url] if pfl_url else []
+    return default_args_for(spec, form)
 
 
 def _run_parser(script_id: str, parser: Callable[..., Any], *args: Any) -> Any:
@@ -243,6 +279,7 @@ async def script_detail(request: Request, script_id: str):
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
+                pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
             ),
         )
     finally:
@@ -264,6 +301,8 @@ async def start_script(request: Request, script_id: str):
         return RedirectResponse(f"/scripts/{script_id}?error=missing-identifier", status_code=303)
     if script_id == UFC_SCRIPT_ID and not str(form.get("ufc_event_url", "") or _read_ufc_config().get("ufc_event_url", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-ufc-url", status_code=303)
+    if script_id == PFL_SCRIPT_ID and not str(form.get("pfl_event_url", "") or _read_pfl_config().get("pfl_event_url", "")).strip():
+        return RedirectResponse(f"/scripts/{script_id}?error=missing-pfl-url", status_code=303)
     await asyncio.to_thread(runner.start, script_id, _default_args_for_start(spec, form))
     return RedirectResponse(f"/scripts/{script_id}", status_code=303)
 
@@ -300,6 +339,42 @@ async def clear_ufc_alerted(request: Request):
     data["alerted_cleared_at"] = _utc_timestamp()
     await asyncio.to_thread(_write_ufc_config, data)
     return RedirectResponse("/scripts/ufc-live-start-scanner", status_code=303)
+
+
+@app.post("/scripts/pfl-live-start-scanner/config")
+async def save_pfl_config(request: Request, pfl_event_url: str = Form("")):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    data = _read_pfl_config()
+    url = pfl_event_url.strip()
+    previous_url = str(data.get("pfl_event_url", "") or "")
+    data["pfl_event_url"] = url
+    data["last_saved_at"] = _utc_timestamp()
+    if previous_url and previous_url != url:
+        data["alerted_fight_keys"] = []
+        data["alerted_fights"] = []
+        data["last_detected_live_fight"] = ""
+        data["last_slack_alert_sent"] = ""
+        data["betfair_events_cached"] = 0
+        data["betfair_cache_loaded_at"] = ""
+    await asyncio.to_thread(_write_pfl_config, data)
+    return RedirectResponse("/scripts/pfl-live-start-scanner", status_code=303)
+
+
+@app.post("/scripts/pfl-live-start-scanner/clear-alerted")
+async def clear_pfl_alerted(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    data = _read_pfl_config()
+    data["alerted_fight_keys"] = []
+    data["alerted_fights"] = []
+    data["last_detected_live_fight"] = ""
+    data["last_slack_alert_sent"] = ""
+    data["alerted_cleared_at"] = _utc_timestamp()
+    await asyncio.to_thread(_write_pfl_config, data)
+    return RedirectResponse("/scripts/pfl-live-start-scanner", status_code=303)
 
 
 @app.post("/scripts/{script_id}/stop")
@@ -346,6 +421,7 @@ async def script_output(request: Request, script_id: str):
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
+                pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
             ),
         )
     finally:
