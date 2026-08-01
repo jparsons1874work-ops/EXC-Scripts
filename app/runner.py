@@ -17,7 +17,7 @@ from typing import Any
 
 from app.config import LOG_DIR, OUTPUT_DIR, PROJECT_ROOT, SCRIPTS_ROOT, child_environment, ensure_runtime_dirs
 from app.registry import SCRIPTS_BY_ID, ScriptSpec
-from app.scheduler import window_status
+from app.scheduler import local_schedule_time, window_status
 
 
 IDLE = "idle"
@@ -102,6 +102,8 @@ class ScriptRunner:
         self._log_bytes: dict[tuple[str, str], int] = {}
         self._log_truncated: set[tuple[str, str]] = set()
         self._meta_lock = threading.RLock()
+        self._automation_lock = threading.RLock()
+        self._handled_automation_triggers: set[str] = set()
         self._last_startup_cleanup: list[str] = []
         for script_id in SCRIPTS_BY_ID:
             threading.Thread(target=self._write_log_loop, args=(script_id,), daemon=True).start()
@@ -147,7 +149,7 @@ class ScriptRunner:
         threading.Thread(target=self._launch_job, args=(script_id, job_id, spec, list(args)), daemon=True).start()
         return snapshot
 
-    def stop(self, script_id: str) -> ScriptRunState:
+    def stop(self, script_id: str, message: str = "Script was stopped by user.") -> ScriptRunState:
         self._event("script_stop_requested", script_id)
         with self._state_locks[script_id]:
             state = self._states[script_id]
@@ -159,7 +161,7 @@ class ScriptRunner:
             state.status = STOPPING
             state.cancel_requested = True
             state.termination_status = KILLED
-            state.termination_message = "Script was stopped by user."
+            state.termination_message = message
             state.message = "Stopping script..."
             self._append_locked(script_id, "Stop requested. Terminating process group.", job_id=job_id)
             snapshot = self._copy_state_locked(script_id)
@@ -167,26 +169,71 @@ class ScriptRunner:
         if process is not None:
             threading.Thread(
                 target=self._terminate_job,
-                args=(script_id, job_id, process, KILLED, "Script was stopped by user."),
+                args=(script_id, job_id, process, KILLED, message),
                 daemon=True,
             ).start()
         return snapshot
 
-    def stop_expired_windows(self) -> None:
+    def stop_expired_windows(self, at=None) -> None:
         for script_id, spec in SCRIPTS_BY_ID.items():
             if not spec.long_running:
                 continue
             state = self.get_state(script_id)
             if state.status != RUNNING:
                 continue
-            allowed, window_label = window_status(spec)
+            allowed, window_label = window_status(spec, at)
             if not allowed:
                 self._append(
                     script_id,
                     f"Allowed window ended ({window_label}). Attempting clean stop.",
                     job_id=state.job_id,
                 )
-                self.stop(script_id)
+                self.stop(script_id, f"Stopped because the allowed window ended ({window_label}).")
+
+    def run_automations(self, *, catch_up: bool = False, at=None) -> None:
+        scheduled_stops: list[str] = []
+        scheduled_starts: list[str] = []
+
+        with self._automation_lock:
+            for script_id, spec in SCRIPTS_BY_ID.items():
+                local_now = local_schedule_time(spec, at)
+                current_minute = local_now.strftime("%H:%M")
+                date_key = local_now.date().isoformat()
+
+                for stop_time in spec.auto_stop_times:
+                    if current_minute != stop_time:
+                        continue
+                    trigger = f"{date_key}:{script_id}:stop:{stop_time}"
+                    if trigger not in self._handled_automation_triggers:
+                        self._handled_automation_triggers.add(trigger)
+                        scheduled_stops.append(script_id)
+
+                for start_time in spec.auto_start_times:
+                    if current_minute != start_time:
+                        continue
+                    trigger = f"{date_key}:{script_id}:start:{start_time}"
+                    if trigger not in self._handled_automation_triggers:
+                        self._handled_automation_triggers.add(trigger)
+                        scheduled_starts.append(script_id)
+
+                if catch_up and spec.auto_start_on_hub_start:
+                    allowed, _ = window_status(spec, at)
+                    if allowed:
+                        scheduled_starts.append(script_id)
+
+        for script_id in dict.fromkeys(scheduled_stops):
+            self.stop(script_id, "Stopped by the automatic daily schedule.")
+
+        self.stop_expired_windows(at)
+
+        stopped_ids = set(scheduled_stops)
+        for script_id in dict.fromkeys(scheduled_starts):
+            if script_id in stopped_ids:
+                continue
+            if self.get_state(script_id).status in {RUNNING, STOPPING}:
+                continue
+            spec = SCRIPTS_BY_ID[script_id]
+            self.start(script_id, list(spec.default_args))
 
     def startup_cleanup(self) -> None:
         for script_id in SCRIPTS_BY_ID:

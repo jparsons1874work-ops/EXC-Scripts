@@ -173,16 +173,17 @@ async def _parsed_output(spec, state):
 async def _window_monitor() -> None:
     while True:
         try:
-            await asyncio.to_thread(runner.stop_expired_windows)
+            await asyncio.to_thread(runner.run_automations)
         except Exception:
-            logger.exception("script_window_monitor_failed")
-        await asyncio.sleep(30)
+            logger.exception("script_automation_monitor_failed")
+        await asyncio.sleep(15)
 
 
 @app.on_event("startup")
 async def startup() -> None:
     ensure_runtime_dirs()
     await asyncio.to_thread(runner.startup_cleanup)
+    await asyncio.to_thread(runner.run_automations, catch_up=True)
     app.state.window_monitor_task = asyncio.create_task(_window_monitor())
     app.state.cricket_fixture_refresh_task = fixture_refresh_service.start()
 

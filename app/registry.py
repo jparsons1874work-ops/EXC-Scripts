@@ -25,6 +25,10 @@ class ScriptSpec:
     allowed_window: RunWindow | None = None
     timeout_seconds: int = 600
     allow_concurrent: bool = False
+    auto_start_times: tuple[str, ...] = ()
+    auto_stop_times: tuple[str, ...] = ()
+    auto_start_on_hub_start: bool = False
+    automation_timezone: str = "Europe/London"
 
 
 def slugify(value: str) -> str:
@@ -43,6 +47,10 @@ def script(
     allowed_window: RunWindow | None = None,
     timeout_seconds: int = 600,
     allow_concurrent: bool = False,
+    auto_start_times: tuple[str, ...] = (),
+    auto_stop_times: tuple[str, ...] = (),
+    auto_start_on_hub_start: bool = False,
+    automation_timezone: str = "Europe/London",
 ) -> ScriptSpec:
     return ScriptSpec(
         id=slugify(name),
@@ -57,6 +65,10 @@ def script(
         allowed_window=allowed_window,
         timeout_seconds=timeout_seconds,
         allow_concurrent=allow_concurrent,
+        auto_start_times=auto_start_times,
+        auto_stop_times=auto_stop_times,
+        auto_start_on_hub_start=auto_start_on_hub_start,
+        automation_timezone=automation_timezone,
     )
 
 
@@ -92,16 +104,18 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         ("--repeat-minutes", "30", "--send-startup-message", "--send-shutdown-message"),
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
-        timeout_seconds=16 * 60 * 60,
+        timeout_seconds=17 * 60 * 60,
+        auto_start_times=("07:00",),
+        auto_stop_times=("23:00",),
+        auto_start_on_hub_start=True,
     ),
     script(
         "Betfair - Duplicate Market Check",
         "Betfair",
         "Checks Betfair Exchange football events for duplicate market names.",
         "scripts/Betfair_Duplicate_Market_Check.py",
-        long_running=True,
-        allowed_window=RunWindow("07:00", "23:00"),
         timeout_seconds=16 * 60 * 60,
+        auto_start_times=("07:00", "15:00", "23:00"),
     ),
     script(
         "Betfair In-Play Start Checker",
@@ -111,7 +125,11 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         ("--repeat-minutes", "2", "--send-startup-message", "--send-shutdown-message"),
         long_running=True,
         parsed_output=True,
-        timeout_seconds=16 * 60 * 60,
+        allowed_window=RunWindow("23:05", "23:00"),
+        timeout_seconds=25 * 60 * 60,
+        auto_start_times=("07:00", "23:05"),
+        auto_stop_times=("23:00",),
+        auto_start_on_hub_start=True,
     ),
     script(
         "Betfair Event Reminders",
@@ -146,7 +164,10 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Integrity-Scanner/start_scanner.py",
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
-        timeout_seconds=16 * 60 * 60,
+        timeout_seconds=17 * 60 * 60,
+        auto_start_times=("07:00",),
+        auto_stop_times=("23:00",),
+        auto_start_on_hub_start=True,
     ),
     script(
         "Cricket - Time Check Today",
