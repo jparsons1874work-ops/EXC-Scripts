@@ -595,6 +595,58 @@ class BetfairEventReminderTests(unittest.TestCase):
         ]
         self.assertTrue(all(not reminders.outright_market_selection(item)[0] for item in side_markets))
 
+    def test_all_listed_rugby_competitions_are_blacklisted(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        competitions = {
+            "Rugby League": (
+                "NRL",
+                "Womens NRL",
+                "State of Origin",
+                "Womens State of Origin",
+                "All-Stars match",
+                "Women's All-Stars",
+                "NRL 9s",
+                "Womens NRL 9s",
+            ),
+            "Rugby Union": ("Super Rugby - Pacific", "NZ NPC", "Bledisloe Cup"),
+        }
+        for sport, names in competitions.items():
+            for competition_name in names:
+                with self.subTest(sport=sport, competition=competition_name):
+                    item = reminder(sport, competition_name, start, competition_name=competition_name)
+                    self.assertTrue(reminders.is_disallowed_market(item))
+                    self.assertEqual(select_reminders([item], reminders.SPORT_RULE_ALL), [])
+
+    def test_other_rugby_competitions_are_not_blacklisted(self) -> None:
+        item = reminder(
+            "Rugby Union",
+            "six-nations",
+            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+            competition_name="Six Nations",
+        )
+        self.assertFalse(reminders.is_disallowed_market(item))
+
+    def test_football_outrights_are_blacklisted_for_soccer_and_football_names(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        for sport in ("Soccer", "Football"):
+            with self.subTest(sport=sport):
+                item = reminder(
+                    sport,
+                    f"{sport}-outright",
+                    start,
+                    market_name="Tournament Winner",
+                    market_type_code="OUTRIGHT_WINNER",
+                )
+                self.assertTrue(reminders.is_disallowed_market(item))
+                self.assertEqual(
+                    reminders.outright_market_selection(item),
+                    (False, "disallowed_football_outright"),
+                )
+
+    def test_football_match_odds_are_not_blacklisted(self) -> None:
+        item = reminder("Soccer", "match", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
+        self.assertFalse(reminders.is_disallowed_market(item))
+
     def test_au_market_is_excluded_from_event_and_market_selection(self) -> None:
         item = reminder(
             "Golf",
@@ -846,6 +898,22 @@ class BetfairEventReminderTests(unittest.TestCase):
             )
         self.assertEqual(selected, [])
         self.assertEqual(aus_excluded, set())
+        list_market_types.assert_not_called()
+        list_catalogues.assert_not_called()
+
+    def test_all_sports_discovery_does_not_scan_football_outrights(self) -> None:
+        window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
+        with patch.object(reminders, "list_market_type_codes") as list_market_types, patch.object(
+            reminders,
+            "list_market_catalogues",
+        ) as list_catalogues:
+            selected, blacklist_excluded = reminders.discover_all_sports_outright_reminders(
+                object(),
+                {"Soccer": "1"},
+                window,
+            )
+        self.assertEqual(selected, [])
+        self.assertEqual(blacklist_excluded, set())
         list_market_types.assert_not_called()
         list_catalogues.assert_not_called()
 
