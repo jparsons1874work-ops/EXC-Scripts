@@ -49,6 +49,10 @@ SLACK_SCHEDULE_LIMIT_PER_BUCKET = 30
 SLACK_BUCKET_SECONDS = 5 * 60
 SLACK_SCHEDULE_URL = "https://slack.com/api/chat.scheduleMessage"
 SLACK_DELETE_SCHEDULED_URL = "https://slack.com/api/chat.deleteScheduledMessage"
+BETFAIR_EXCHANGE_READONLY_BY_MARKET_URL = (
+    "https://ero.betfair.com/www/sports/exchange/readonly/v1/bymarket"
+)
+BETFAIR_EXCHANGE_READONLY_MARKET_BATCH_SIZE = 100
 DEFAULT_SLACK_CHANNEL_ID = "C07FXG95GQ6"
 DEFAULT_SLACK_CHANNEL_NAME = "#exc_sports_ops"
 MATCH_ODDS = "MATCH_ODDS"
@@ -731,7 +735,12 @@ def select_market_reminders(
 ) -> list[EventReminder]:
     selected: list[EventReminder] = []
     for market in sorted(markets, key=lambda item: (item.event_start_utc, item.event_name.casefold(), item.market_id)):
-        if is_disallowed_market(market) or not in_scan_window(market, window):
+        if is_disallowed_market(market):
+            continue
+        # Athletics catalogue timestamps can point at an earlier championship
+        # session. The authoritative per-market time may therefore sit outside
+        # the catalogue scan window and must not be rejected here.
+        if sport != "Athletics" and not in_scan_window(market, window):
             continue
         if sport == "Politics":
             selected.append(
@@ -1312,6 +1321,74 @@ def list_market_type_codes(
     return tuple(sorted(value for value in values if value))
 
 
+def athletics_authoritative_start_times(
+    market_ids: Iterable[str],
+    app_key: str,
+) -> dict[str, datetime]:
+    unique_market_ids = sorted(
+        {
+            str(market_id or "").strip()
+            for market_id in market_ids
+            if str(market_id or "").strip()
+        }
+    )
+    start_times: dict[str, datetime] = {}
+    for batch_start in range(0, len(unique_market_ids), BETFAIR_EXCHANGE_READONLY_MARKET_BATCH_SIZE):
+        batch = unique_market_ids[batch_start : batch_start + BETFAIR_EXCHANGE_READONLY_MARKET_BATCH_SIZE]
+        response = requests.get(
+            BETFAIR_EXCHANGE_READONLY_BY_MARKET_URL,
+            headers={"X-Application": app_key, "Accept": "application/json"},
+            params={
+                "marketIds": ",".join(batch),
+                "types": "MARKET_DESCRIPTION",
+                "locale": "en_GB",
+                "currencyCode": "GBP",
+                "rollupModel": "STAKE",
+                "rollupLimit": 10,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Betfair Exchange read-only endpoint returned non-JSON data") from exc
+        for event_type in object_get(payload, "eventTypes", []) or []:
+            for event_node in object_get(event_type, "eventNodes", []) or []:
+                for market_node in object_get(event_node, "marketNodes", []) or []:
+                    market_id = str(object_get(market_node, "marketId", "") or "").strip()
+                    description = object_get(market_node, "description", {})
+                    market_time = parse_datetime(object_get(description, "marketTime", None))
+                    if market_id and market_time is not None:
+                        start_times[market_id] = market_time
+    return start_times
+
+
+def apply_athletics_authoritative_start_times(
+    markets: Iterable[EventReminder],
+    app_key: str,
+) -> tuple[list[EventReminder], list[EventReminder]]:
+    market_list = list(markets)
+    candidates = [
+        market
+        for market in market_list
+        if market.market_type_code.strip().upper() in ATHLETICS_OUTRIGHT_MARKET_TYPES
+        and outright_market_selection(market)[0]
+    ]
+    start_times = athletics_authoritative_start_times((market.market_id for market in candidates), app_key)
+    candidate_ids = {market.market_id for market in candidates}
+    enriched: list[EventReminder] = []
+    missing: list[EventReminder] = []
+    for market in market_list:
+        if market.market_id not in candidate_ids:
+            enriched.append(market)
+        elif market.market_id in start_times:
+            enriched.append(replace(market, event_start_utc=start_times[market.market_id]))
+        else:
+            missing.append(market)
+    return enriched, missing
+
+
 def sport_emoji(sport_name: str) -> str:
     for sport in SPORTS:
         if sport["name"].casefold() == sport_name.casefold():
@@ -1333,6 +1410,12 @@ def discover_all_sports_outright_reminders(
             continue
         if normalize_text(sport_name) in FOOTBALL_SPORT_NAMES:
             log(f"Skipping blacklisted football outright scan: sport={sport_name} eventTypeId={event_type_id}")
+            continue
+        if normalize_text(sport_name) == "athletics":
+            log(
+                "Skipping all-sports Athletics outright scan; "
+                f"using authoritative dedicated scan: eventTypeId={event_type_id}"
+            )
             continue
         observed_types = list_market_type_codes(client, event_type_id, window, market_countries)
         candidate_types = tuple(code for code in observed_types if is_winner_like_market_type(code))
@@ -1705,6 +1788,30 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 for catalogue in raw_catalogues
                 if (reminder := catalogue_to_reminder(catalogue, sport_name, sport["emoji"], event_type_id)) is not None
             ]
+            if sport_name == "Athletics":
+                try:
+                    reminders, missing_authoritative_times = apply_athletics_authoritative_start_times(
+                        reminders,
+                        config.betfair_app_key,
+                    )
+                except Exception as exc:
+                    stats.failures += 1
+                    missing_authoritative_times = [
+                        market
+                        for market in reminders
+                        if market.market_type_code.strip().upper() in ATHLETICS_OUTRIGHT_MARKET_TYPES
+                    ]
+                    reminders = [market for market in reminders if market not in missing_authoritative_times]
+                    log(
+                        f"ERROR: Athletics authoritative market-time lookup failed: {exc}. "
+                        "No Athletics outright reminders will be scheduled from catalogue-only timestamps."
+                    )
+                for market in missing_authoritative_times:
+                    log(
+                        f"Excluded Athletics market without authoritative start time: event_id={market.event_id} "
+                        f"market_id={market.market_id} market_type_code={market.market_type_code} "
+                        f"catalogue_start={format_uk(market.event_start_uk)}"
+                    )
             blacklisted_reminders = [reminder for reminder in reminders if is_disallowed_market(reminder)]
             for market in blacklisted_reminders:
                 excluded_market_ids.add(market.market_id or f"{sport_name}|{market.event_id}")

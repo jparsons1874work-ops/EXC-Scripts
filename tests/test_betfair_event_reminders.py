@@ -522,6 +522,124 @@ class BetfairEventReminderTests(unittest.TestCase):
             "(Market ID: 1.athletics)",
         )
 
+    def test_athletics_uses_authoritative_market_day_and_replaces_early_catalogue_time(self) -> None:
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return {
+                    "eventTypes": [
+                        {
+                            "eventNodes": [
+                                {
+                                    "marketNodes": [
+                                        {
+                                            "marketId": "1.260973277",
+                                            "description": {"marketTime": "2026-08-11T20:30:00.000Z"},
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+        catalogue_market = reminder(
+            "Athletics",
+            "31664995",
+            datetime(2026, 8, 10, 19, 35, tzinfo=timezone.utc),
+            market_id="1.260973277",
+            market_name="Womens 100m Hurdles Gold Medal Winner",
+            market_type_code="WINNER",
+            event_name="Women's European Championships 2026",
+            emoji=":athletics:",
+        )
+        window = build_scan_window(datetime(2026, 8, 10, 18, 0, tzinfo=UK_TZ))
+
+        with patch.object(reminders.requests, "get", return_value=FakeResponse()) as request_get:
+            enriched, missing = reminders.apply_athletics_authoritative_start_times(
+                [catalogue_market],
+                "test-app-key",
+            )
+
+        self.assertEqual(missing, [])
+        self.assertEqual(enriched[0].event_start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-08-11 21:30 BST")
+        selected = select_market_reminders(enriched, "Athletics", window)
+        self.assertEqual([item.market_id for item in selected], ["1.260973277"])
+        self.assertEqual(
+            reminder_time(selected[0].event_start_utc, selected[0].lead_minutes).strftime("%Y-%m-%d %H:%M %Z"),
+            "2026-08-11 21:25 BST",
+        )
+        request_get.assert_called_once()
+        self.assertEqual(request_get.call_args.kwargs["headers"]["X-Application"], "test-app-key")
+        self.assertEqual(request_get.call_args.kwargs["params"]["marketIds"], "1.260973277")
+
+    def test_athletics_market_without_authoritative_time_is_not_enriched(self) -> None:
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self):
+                return {"eventTypes": []}
+
+        catalogue_market = reminder(
+            "Athletics",
+            "event-1",
+            datetime(2026, 8, 10, 19, 35, tzinfo=timezone.utc),
+            market_id="1.missing",
+            market_name="Gold Medal Winner",
+            market_type_code="GOLD_MEDAL_WINNER",
+        )
+        with patch.object(reminders.requests, "get", return_value=FakeResponse()):
+            enriched, missing = reminders.apply_athletics_authoritative_start_times(
+                [catalogue_market],
+                "test-app-key",
+            )
+
+        self.assertEqual(enriched, [])
+        self.assertEqual(missing, [catalogue_market])
+
+    def test_corrected_athletics_time_supersedes_existing_early_slack_reminder(self) -> None:
+        corrected = replace(
+            reminder(
+                "Athletics",
+                "31664995",
+                datetime(2026, 8, 11, 20, 30, tzinfo=timezone.utc),
+                market_id="1.260973277",
+                market_name="Womens 100m Hurdles Gold Medal Winner",
+                market_type_code="WINNER",
+            ),
+            duplicate_by=reminders.DEDUP_MARKET,
+        )
+        old_post_epoch = int(datetime(2026, 8, 10, 20, 30, tzinfo=UK_TZ).timestamp())
+        corrected_post_epoch = int(reminder_time(corrected.event_start_utc).timestamp())
+        state = {
+            "scheduled": [
+                {
+                    "duplicate_key": f"Athletics|1.260973277|{old_post_epoch}|C123",
+                    "sport": "Athletics",
+                    "event_id": "31664995",
+                    "market_id": "1.260973277",
+                    "scheduled_slack_post_epoch": old_post_epoch,
+                    "reminder_offset_minutes": 5,
+                    "slack_channel_id": "C123",
+                    "slack_scheduled_message_id": "Q-old",
+                    "status": "scheduled",
+                }
+            ]
+        }
+
+        superseded = reminders.superseded_scheduled_records(
+            state,
+            corrected,
+            corrected_post_epoch,
+            "C123",
+            int(datetime(2026, 8, 10, 18, 0, tzinfo=UK_TZ).timestamp()),
+        )
+
+        self.assertEqual([record["slack_scheduled_message_id"] for record in superseded], ["Q-old"])
+
     def test_cycling_winner_market_is_selected_and_side_market_excluded(self) -> None:
         start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
         selected = select_market_reminders(
@@ -978,6 +1096,23 @@ class BetfairEventReminderTests(unittest.TestCase):
                 {"Soccer": "1"},
                 window,
             )
+        self.assertEqual(selected, [])
+        self.assertEqual(blacklist_excluded, set())
+        list_market_types.assert_not_called()
+        list_catalogues.assert_not_called()
+
+    def test_all_sports_discovery_leaves_athletics_to_authoritative_scan(self) -> None:
+        window = build_scan_window(datetime(2026, 8, 10, 18, 0, tzinfo=UK_TZ))
+        with patch.object(reminders, "list_market_type_codes") as list_market_types, patch.object(
+            reminders,
+            "list_market_catalogues",
+        ) as list_catalogues:
+            selected, blacklist_excluded = reminders.discover_all_sports_outright_reminders(
+                object(),
+                {"Athletics": "3988"},
+                window,
+            )
+
         self.assertEqual(selected, [])
         self.assertEqual(blacklist_excluded, set())
         list_market_types.assert_not_called()
