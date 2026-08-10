@@ -456,6 +456,72 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:55 BST")
         self.assertEqual(duplicate_key(item, post_epoch, "C123"), "Politics|1.pol|1783605300|C123")
 
+    def test_athletics_is_configured_with_fallback_id_and_emoji(self) -> None:
+        athletics = next(sport for sport in reminders.SPORTS if sport["name"] == "Athletics")
+        self.assertEqual(athletics["rule"], reminders.SPORT_RULE_WINNER_MARKETS)
+        self.assertEqual(athletics["emoji"], ":athletics:")
+        self.assertEqual(reminders.FALLBACK_EVENT_TYPE_IDS["Athletics"], "3988")
+
+    def test_athletics_scans_all_market_types(self) -> None:
+        self.assertIsNone(
+            reminders.api_market_type_filter_for_sport("Athletics", reminders.SPORT_RULE_WINNER_MARKETS)
+        )
+
+    def test_athletics_selects_requested_outright_market_types(self) -> None:
+        start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
+        markets = [
+            reminder(
+                "Athletics",
+                f"event-{market_type}",
+                start,
+                market_id=f"1.{index}",
+                market_name=market_type.replace("_", " ").title(),
+                market_type_code=market_type,
+                emoji=":athletics:",
+            )
+            for index, market_type in enumerate(("WINNER", "OUTRIGHT_WINNER", "GOLD_MEDAL_WINNER"), start=1)
+        ]
+        markets.append(
+            reminder(
+                "Athletics",
+                "event-heat",
+                start,
+                market_id="1.heat",
+                market_name="Heat Winner",
+                market_type_code="HEAT_WINNER",
+                emoji=":athletics:",
+            )
+        )
+
+        selected = select_market_reminders(markets, "Athletics")
+
+        self.assertEqual({item.market_id for item in selected}, {"1.1", "1.2", "1.3"})
+        self.assertTrue(all(item.duplicate_by == reminders.DEDUP_MARKET for item in selected))
+
+    def test_athletics_outright_uses_five_minute_timing_and_outright_message(self) -> None:
+        item = select_market_reminders(
+            [
+                reminder(
+                    "Athletics",
+                    "athletics-event",
+                    datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+                    market_id="1.athletics",
+                    market_name="Men's 100m Gold Medal Winner",
+                    market_type_code="GOLD_MEDAL_WINNER",
+                    event_name="World Athletics Championships",
+                    emoji=":athletics:",
+                )
+            ],
+            "Athletics",
+        )[0]
+
+        self.assertEqual(reminder_time(item.event_start_utc, item.lead_minutes).strftime("%H:%M %Z"), "14:55 BST")
+        self.assertEqual(
+            reminders.format_slack_text(item),
+            ":athletics: Athletics: World Athletics Championships - Men's 100m Gold Medal Winner "
+            "(Market ID: 1.athletics)",
+        )
+
     def test_cycling_winner_market_is_selected_and_side_market_excluded(self) -> None:
         start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
         selected = select_market_reminders(

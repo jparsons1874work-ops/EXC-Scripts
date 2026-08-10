@@ -55,6 +55,7 @@ MATCH_ODDS = "MATCH_ODDS"
 WINNER = "WINNER"
 OUTRIGHT_WINNER = "OUTRIGHT_WINNER"
 STAGE_WINNER = "STAGE_WINNER"
+ATHLETICS_OUTRIGHT_MARKET_TYPES = frozenset({WINNER, OUTRIGHT_WINNER, "GOLD_MEDAL_WINNER"})
 DISALLOWED_COUNTRY_CODES = frozenset({"AU"})
 AUSTRALIAN_WALLET_NAMES = frozenset({"australian wallet", "aus wallet", "au wallet"})
 AUSTRALIAN_REGULATOR_TERMS = (
@@ -135,6 +136,7 @@ DEDUP_MARKET = "market"
 
 SPORTS: tuple[dict[str, str], ...] = (
     {"name": "American Football", "rule": SPORT_RULE_ALL, "emoji": ":football:"},
+    {"name": "Athletics", "rule": SPORT_RULE_WINNER_MARKETS, "emoji": ":athletics:"},
     {"name": "Boxing", "rule": SPORT_RULE_BOXING_BATCHES, "emoji": ":boxing:"},
     {"name": "Cricket", "rule": SPORT_RULE_CRICKET_TOSS, "emoji": ":cricket:"},
     {"name": "Cycling", "rule": SPORT_RULE_WINNER_MARKETS, "emoji": ":bicyclist:"},
@@ -152,6 +154,7 @@ SPORTS: tuple[dict[str, str], ...] = (
 # event types in the scan window and only falls back to this mapping when needed.
 FALLBACK_EVENT_TYPE_IDS: dict[str, str] = {
     "American Football": "6423",
+    "Athletics": "3988",
     "Boxing": "6",
     "Cricket": "4",
     "Cycling": "11",
@@ -237,6 +240,7 @@ class RunStats:
     unique_events_found: int = 0
     reminders_selected: int = 0
     politics_markets_selected: int = 0
+    athletics_outright_reminders_selected: int = 0
     cycling_winner_reminders_selected: int = 0
     golf_winner_reminders_selected: int = 0
     rugby_tip_stream_reminders: int = 0
@@ -741,6 +745,21 @@ def select_market_reminders(
                     ),
                 )
             )
+        elif sport == "Athletics":
+            market_type = market.market_type_code.strip().upper()
+            is_selected, reason = outright_market_selection(market)
+            if market_type in ATHLETICS_OUTRIGHT_MARKET_TYPES and is_selected:
+                selected.append(
+                    replace(
+                        market,
+                        duplicate_by=DEDUP_MARKET,
+                        selection_reason=f"athletics_main_outright:{reason}",
+                        slack_message_override=(
+                            f"{market.emoji} {sport}: {market.event_name} - {market.market_name} "
+                            f"(Market ID: {market.market_id})"
+                        ),
+                    )
+                )
         elif sport == "Cycling":
             is_selected, reason = cycling_market_selection(market)
             if is_selected:
@@ -1237,7 +1256,7 @@ def list_market_catalogues(
 def api_market_type_filter_for_sport(sport_name: str, rule: str) -> tuple[str, ...] | None:
     if sport_name == "Cricket":
         return (TO_WIN_THE_TOSS,)
-    if sport_name in {"Politics", "Cycling", "Golf"}:
+    if sport_name in {"Athletics", "Politics", "Cycling", "Golf"}:
         return None
     if rule == SPORT_RULE_WINNER_MARKETS:
         return (WINNER,)
@@ -1700,6 +1719,19 @@ def run_scan(args: argparse.Namespace, config: Config, source: ConfigSource) -> 
                 selected = select_market_reminders(reminders, sport_name, window)
                 if sport_name == "Politics":
                     stats.politics_markets_selected += len(selected)
+                elif sport_name == "Athletics":
+                    stats.athletics_outright_reminders_selected += len(selected)
+                    for market in reminders:
+                        market_type = market.market_type_code.strip().upper()
+                        is_selected, reason = outright_market_selection(market)
+                        if market_type not in ATHLETICS_OUTRIGHT_MARKET_TYPES:
+                            reason = f"market_type_not_requested:{market_type or 'missing'}"
+                        if not (market_type in ATHLETICS_OUTRIGHT_MARKET_TYPES and is_selected):
+                            log(
+                                f"Excluded Athletics market: event_id={market.event_id} market_id={market.market_id} "
+                                f"market_type_code={market.market_type_code} market_name={market.market_name!r} "
+                                f"reason={reason}"
+                            )
                 elif sport_name == "Cycling":
                     stats.cycling_winner_reminders_selected += len(selected)
                     log(f"Cycling catalogue markets before filter: {len(reminders)}")
@@ -1935,6 +1967,7 @@ def print_summary(window: ScanWindow, stats: RunStats) -> None:
         f"Unique events found: {stats.unique_events_found}",
         f"Reminders selected: {stats.reminders_selected}",
         f"Politics markets selected: {stats.politics_markets_selected}",
+        f"Athletics outright reminders selected: {stats.athletics_outright_reminders_selected}",
         f"Cycling winner reminders selected: {stats.cycling_winner_reminders_selected}",
         f"Golf winner reminders selected: {stats.golf_winner_reminders_selected}",
         f"Rugby reminders with TIP with stream: {stats.rugby_tip_stream_reminders}",
