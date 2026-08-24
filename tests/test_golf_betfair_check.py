@@ -40,6 +40,14 @@ class GolfBetfairCheckTests(unittest.TestCase):
         event, _ = checker.best_event_match("bmw championship", events, set())
         self.assertEqual(event.event_id, "2")
 
+    def test_event_match_allows_different_dp_world_title_sponsors(self) -> None:
+        score = checker.event_match_score(
+            "husqvarna british masters hosted by sir nick faldo 2026",
+            "Betfred British Masters 2026",
+        )
+
+        self.assertGreaterEqual(score, checker.EVENT_MATCH_THRESHOLD)
+
     def test_ambiguous_event_match_is_rejected(self) -> None:
         events = [
             checker.BetfairEvent("1", "Example Open North", "1.1", "Winner", []),

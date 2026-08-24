@@ -112,8 +112,18 @@ def event_match_score(hint: str, event_name: str) -> float:
     sequence_score = difflib.SequenceMatcher(None, normalized_hint, normalized_event).ratio()
     hint_tokens = set(normalized_hint.split()) - GENERIC_EVENT_WORDS
     event_tokens = set(normalized_event.split()) - GENERIC_EVENT_WORDS
-    if hint_tokens:
-        token_score = len(hint_tokens & event_tokens) / len(hint_tokens)
+    shared_tokens = hint_tokens & event_tokens
+    if hint_tokens and event_tokens:
+        # Official URLs often include a current title sponsor and a long
+        # "hosted by" suffix while Betfair keeps an older sponsor name. Score
+        # against whichever side is shorter so the stable competition words
+        # (for example "British Masters") carry the match.
+        token_score = max(
+            len(shared_tokens) / len(hint_tokens),
+            len(shared_tokens) / len(event_tokens),
+        )
+    elif hint_tokens:
+        token_score = len(shared_tokens) / len(hint_tokens)
     else:
         token_score = len(set(normalized_hint.split()) & set(normalized_event.split())) / max(
             1, len(set(normalized_hint.split()))
