@@ -29,11 +29,16 @@ def automation_runner() -> ScriptRunner:
 
 class ScriptAutomationTests(unittest.TestCase):
     def test_registry_has_requested_uk_schedules(self) -> None:
+        golf = SCRIPTS_BY_ID["golf-non-runner-check"]
         duplicate_match = SCRIPTS_BY_ID["betfair-duplicate-match-check"]
         duplicate_market = SCRIPTS_BY_ID["betfair-duplicate-market-check"]
         tennis = SCRIPTS_BY_ID["tennis-integrity-check"]
         inplay = SCRIPTS_BY_ID["betfair-in-play-start-checker"]
 
+        self.assertEqual(golf.default_args, ("--repeat-minutes", "5"))
+        self.assertEqual(golf.auto_start_times, ("07:00",))
+        self.assertEqual(golf.auto_stop_times, ("23:00",))
+        self.assertTrue(golf.auto_start_on_hub_start)
         self.assertEqual(duplicate_match.auto_start_times, ("07:00",))
         self.assertEqual(duplicate_match.auto_stop_times, ("23:00",))
         self.assertEqual(tennis.auto_start_times, ("07:00",))

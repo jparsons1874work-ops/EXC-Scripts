@@ -57,7 +57,31 @@
     {% if spec.long_running and not allowed %}
     <div class="warning">This long-running script cannot be started outside its configured run window.</div>
     {% endif %}
-    {% if spec.id == "ufc-live-start-scanner" %}
+    {% if spec.id == "golf-non-runner-check" %}
+    {% if request.query_params.get("error") == "missing-golf-urls" %}
+    <div class="error">Enable and save at least one official tournament URL before starting the checker.</div>
+    {% elif request.query_params.get("error") == "invalid-golf-url" %}
+    <div class="error">The enabled {{ request.query_params.get("site") }} URL must be an HTTPS link on that tour's official website.</div>
+    {% endif %}
+    <form method="post" action="/scripts/{{ spec.id }}/config" class="form-stack controls">
+      <div class="panel-header">
+        <h2>Weekly Tournament URLs</h2>
+        {% if golf.last_saved_at %}<span class="meta">Saved {{ golf.last_saved_at }}</span>{% endif %}
+      </div>
+      <div class="message">Update these official field or entry-list links each week. Disable a tour when it has no tournament.</div>
+      {% for site in golf.sites %}
+      <label>
+        <input name="{{ site.id }}_enabled" type="checkbox" value="1" style="width: auto; padding: 0;" {% if site.enabled %}checked{% endif %}>
+        Enable {{ site.label }}
+      </label>
+      <input name="{{ site.id }}_url" type="url" value="{{ site.url }}" placeholder="Official {{ site.label }} field URL">
+      {% endfor %}
+      <button class="button button-ghost" type="submit">Save weekly URLs</button>
+    </form>
+    <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
+      <button class="button button-primary" type="submit" {% if not golf.configured or state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
+    </form>
+    {% elif spec.id == "ufc-live-start-scanner" %}
     {% if request.query_params.get("error") == "missing-ufc-url" %}
     <div class="error">Save a UFC event URL before starting the scanner.</div>
     {% endif %}

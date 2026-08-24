@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -35,6 +36,14 @@ templates.env.cache = None
 logger = logging.getLogger("uvicorn.error")
 PARSER_TIMEOUT_SECONDS = 2.0
 _parser_locks = {script_id: threading.Lock() for script_id in SCRIPTS_BY_ID}
+GOLF_SCRIPT_ID = "golf-non-runner-check"
+GOLF_CONFIG_PATH = CONFIG_DIR / "golf_field_checker.json"
+GOLF_SITES = (
+    ("pgatour", "PGA Tour", ("pgatour.com", "www.pgatour.com")),
+    ("pgachampions", "PGA Tour Champions", ("pgatour.com", "www.pgatour.com")),
+    ("dpworld", "DP World Tour", ("europeantour.com", "www.europeantour.com")),
+    ("lpga", "LPGA", ("lpga.com", "www.lpga.com")),
+)
 UFC_SCRIPT_ID = "ufc-live-start-scanner"
 UFC_CONFIG_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
 PFL_SCRIPT_ID = "pfl-live-start-scanner"
@@ -61,6 +70,57 @@ def _event(event: str, script_id: str, level: int = logging.INFO, **details: Any
 
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _read_golf_config() -> dict[str, Any]:
+    try:
+        if not GOLF_CONFIG_PATH.exists():
+            return {}
+        data = json.loads(GOLF_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("golf_config_read_failed path=%s error=%r", GOLF_CONFIG_PATH, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_golf_config(data: dict[str, Any]) -> None:
+    ensure_runtime_dirs()
+    temporary = GOLF_CONFIG_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(GOLF_CONFIG_PATH)
+
+
+def _golf_context() -> dict[str, Any]:
+    data = _read_golf_config()
+    configured = {
+        str(item.get("id", "")): item
+        for item in data.get("sites", [])
+        if isinstance(item, dict)
+    }
+    sites = []
+    for site_id, label, _ in GOLF_SITES:
+        item = configured.get(site_id, {})
+        sites.append(
+            {
+                "id": site_id,
+                "label": label,
+                "url": str(item.get("url", "") or ""),
+                "enabled": bool(item.get("enabled")),
+            }
+        )
+    return {
+        "sites": sites,
+        "configured": any(item["enabled"] and item["url"] for item in sites),
+        "last_saved_at": str(data.get("last_saved_at", "") or ""),
+    }
+
+
+def _valid_golf_url(site_id: str, value: str) -> bool:
+    site = next((item for item in GOLF_SITES if item[0] == site_id), None)
+    if site is None:
+        return False
+    parsed = urlparse(value.strip())
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in site[2]
 
 
 def _read_ufc_config() -> dict[str, Any]:
@@ -281,6 +341,7 @@ async def script_detail(request: Request, script_id: str):
                 cricket=cricket,
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
+                golf=_golf_context() if spec.id == GOLF_SCRIPT_ID else None,
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
                 pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
                 reminders=daily_reminders_context() if spec.id == REMINDERS_SCRIPT_ID else None,
@@ -303,12 +364,37 @@ async def start_script(request: Request, script_id: str):
     form = dict(await request.form())
     if spec.needs_parameters and not str(form.get("identifier", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-identifier", status_code=303)
+    if script_id == GOLF_SCRIPT_ID and not _golf_context()["configured"]:
+        return RedirectResponse(f"/scripts/{script_id}?error=missing-golf-urls", status_code=303)
     if script_id == UFC_SCRIPT_ID and not str(form.get("ufc_event_url", "") or _read_ufc_config().get("ufc_event_url", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-ufc-url", status_code=303)
     if script_id == PFL_SCRIPT_ID and not str(form.get("pfl_event_url", "") or _read_pfl_config().get("pfl_event_url", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-pfl-url", status_code=303)
     await asyncio.to_thread(runner.start, script_id, _default_args_for_start(spec, form))
     return RedirectResponse(f"/scripts/{script_id}", status_code=303)
+
+
+@app.post("/scripts/golf-non-runner-check/config")
+async def save_golf_config(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    form = dict(await request.form())
+    sites: list[dict[str, Any]] = []
+    for site_id, _, _ in GOLF_SITES:
+        url = str(form.get(f"{site_id}_url", "") or "").strip()
+        enabled = f"{site_id}_enabled" in form
+        if enabled and (not url or not _valid_golf_url(site_id, url)):
+            return RedirectResponse(
+                f"/scripts/{GOLF_SCRIPT_ID}?error=invalid-golf-url&site={site_id}",
+                status_code=303,
+            )
+        sites.append({"id": site_id, "enabled": enabled, "url": url})
+    await asyncio.to_thread(
+        _write_golf_config,
+        {"sites": sites, "last_saved_at": _utc_timestamp()},
+    )
+    return RedirectResponse(f"/scripts/{GOLF_SCRIPT_ID}", status_code=303)
 
 
 @app.post("/scripts/ufc-live-start-scanner/config")

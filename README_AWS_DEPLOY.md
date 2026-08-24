@@ -75,6 +75,8 @@ cd /opt/betfair-scripts
 python3 -m venv .venv
 /opt/betfair-scripts/.venv/bin/python -m pip install --upgrade pip
 /opt/betfair-scripts/.venv/bin/python -m pip install -r requirements.txt
+sudo /opt/betfair-scripts/.venv/bin/python -m playwright install-deps chromium
+/opt/betfair-scripts/.venv/bin/python -m playwright install chromium
 ```
 
 Create the server-only environment config used by the service:
@@ -104,7 +106,6 @@ CRICKET_FIXTURE_REFRESH_INTERVAL_MINUTES=180
 CRICKET_FIXTURE_REFRESH_INITIAL_DELAY_SECONDS=30
 CRICKET_FIXTURE_REFRESH_TIMEOUT_SECONDS=1200
 CRICKET_FIXTURE_API_MAX_AGE_MINUTES=240
-DG_API_KEY=
 GOLF_NR_SLACK_WEBHOOK_URL=
 GOLF_NR_SLACK_BOT_TOKEN=
 GOLF_NR_SLACK_CHANNEL=
@@ -128,7 +129,7 @@ clients authenticate with `Authorization: Bearer <key>`.
 
 Slack webhook routing:
 
-- Golf - Non-Runner Check requires `DG_API_KEY` and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`.
+- Golf - Non-Runner Check reads official tour field pages and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. Save the four weekly tournament URLs on the Golf page in the Hub.
 - Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
@@ -285,6 +286,8 @@ sudo systemctl stop betfair-scripts
 git status --short
 git pull origin main
 /opt/betfair-scripts/.venv/bin/python -m pip install -r requirements.txt
+sudo /opt/betfair-scripts/.venv/bin/python -m playwright install-deps chromium
+/opt/betfair-scripts/.venv/bin/python -m playwright install chromium
 /opt/betfair-scripts/.venv/bin/python -m py_compile app/main.py
 sudo systemctl start betfair-scripts
 sudo systemctl status betfair-scripts

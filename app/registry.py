@@ -76,11 +76,15 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
     script(
         "Golf - Non-Runner Check",
         "Golf",
-        "Checks Betfair Exchange golf markets for potential non-runner issues.",
+        "Monitors official tour field pages and alerts confirmed additions or withdrawals.",
         "scripts/Golf_Exchange_NR_Checks.py",
+        ("--repeat-minutes", "5"),
         long_running=True,
         allowed_window=RunWindow("07:00", "23:00"),
-        timeout_seconds=16 * 60 * 60,
+        timeout_seconds=17 * 60 * 60,
+        auto_start_times=("07:00",),
+        auto_stop_times=("23:00",),
+        auto_start_on_hub_start=True,
     ),
     script(
         "Cricket - Decimal Fixture Scrape",

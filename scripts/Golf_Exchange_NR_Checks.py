@@ -1,703 +1,616 @@
+#!/usr/bin/env python3
+"""Monitor official golf field pages and report confirmed changes to Slack."""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
+import re
 import sys
 import time
-import re
-import csv
-import json
-import hashlib
 import unicodedata
-import difflib
+from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple, Optional, List, Set
-
-import truststore
-truststore.inject_into_ssl()
+from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import urlparse
 
 import requests
-import betfairlightweight
-from betfairlightweight.filters import market_filter as bf_market_filter
 
-# -*- coding: utf-8 -*-
-import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, Page
 
-# ==============================
-# CONFIG
-# ==============================
-# NOTE: For safety, prefer setting these as environment variables rather than hardcoding.
-BF_USERNAME = os.getenv("BETFAIR_USERNAME") or os.getenv("BF_USERNAME", "")
-BF_PASSWORD = os.getenv("BETFAIR_PASSWORD") or os.getenv("BF_PASSWORD", "")
-BF_APP_KEY = os.getenv("BETFAIR_APP_KEY") or os.getenv("BF_APP_KEY", "")
-BF_CERTS_DIR = (
-    os.getenv("BETFAIR_CERTS_DIR")
-    or os.getenv("BF_CERTS_DIR")
-    or str(Path(os.getenv("BETFAIR_CERT_FILE", "")).parent if os.getenv("BETFAIR_CERT_FILE") else "")
-)
 
-# Betfair Golf = eventTypeId "3"
-EVENT_TYPE_ID_GOLF = "3"
-# Market type codes that represent golf outrights
-MARKET_TYPE_CODES = ["OUTRIGHT", "WIN", "WINNER", "TOURNAMENT_WINNER", "OUTRIGHT_WINNER"]
+try:
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+except AttributeError:
+    pass
 
-# DataGolf
-DG_API_KEY = os.getenv("DG_API_KEY", "")
-DG_TOURS = ["pga", "euro", "alt"]  # add "euro", liv = "alt", "lpga", "kft", etc., as needed
-DG_BASE = "https://feeds.datagolf.com"
-
-# Naming convention file (CSV/TSV)
-# This resolves regardless of where you run the script from.
-def find_file_upwards(filename: str, start_dir: Path) -> Path:
-    cur = start_dir.resolve()
-    while True:
-        candidate = cur / filename
-        if candidate.exists():
-            return candidate
-        if cur.parent == cur:
-            return start_dir / filename
-        cur = cur.parent
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_OVERRIDES_PATH = find_file_upwards("name_overrides.csv", SCRIPT_DIR)
-NAME_OVERRIDES_CSV = os.getenv("NAME_OVERRIDES_CSV", str(DEFAULT_OVERRIDES_PATH))
+PROJECT_ROOT = SCRIPT_DIR.parent
+CONFIG_PATH = Path(
+    os.getenv(
+        "GOLF_FIELD_CONFIG_PATH",
+        str(PROJECT_ROOT / "runtime" / "config" / "golf_field_checker.json"),
+    )
+)
+STATE_DIR = Path(
+    os.getenv(
+        "GOLF_FIELD_STATE_DIR",
+        str(PROJECT_ROOT / "runtime" / "output" / "golf_field_checker"),
+    )
+)
 
-# Alert de-duplication state (persistent)
-ALERT_STATE_FILE = os.getenv("ALERT_STATE_FILE", str(SCRIPT_DIR.parent / "runtime" / "output" / "alert_state.json"))
+DEFAULT_REPEAT_MINUTES = 5.0
+SUSPICIOUS_SHORT_READ_THRESHOLD = 0.6
+PLACEHOLDER_MARKERS = ("example", "replace", "with/yours")
 
-# Matching & filtering
-DG_DATE_PADDING_DAYS = 7
-EVENT_MATCH_THRESHOLD = float(os.getenv("EVENT_MATCH_THRESHOLD", "0.62"))  # ↑ stricter: 0.65–0.7
-ONLY_INCLUDE_EVENTS_ON_DG = True  # only show Betfair events we can match to DG
+GOLF_NR_SLACK_WEBHOOK_URL = os.getenv("GOLF_NR_SLACK_WEBHOOK_URL", "").strip()
+GOLF_NR_SLACK_BOT_TOKEN = os.getenv("GOLF_NR_SLACK_BOT_TOKEN", "").strip()
+GOLF_NR_SLACK_CHANNEL = os.getenv("GOLF_NR_SLACK_CHANNEL", "").strip()
+LEGACY_SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+LEGACY_SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
+LEGACY_SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "").strip()
 
-# Poll interval
-POLL_SECONDS = 60
 
-# Alerts (optional)
-SLACK_BOT_TOKEN   = os.getenv("SLACK_BOT_TOKEN", "").strip()
-SLACK_CHANNEL     = os.getenv("SLACK_CHANNEL", "C09U1JJRWL9").strip()
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-
-EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST", "").strip()
-EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))
-EMAIL_SMTP_USER = os.getenv("EMAIL_SMTP_USER", "").strip()
-EMAIL_SMTP_PASS = os.getenv("EMAIL_SMTP_PASS", "").strip()
-EMAIL_TO        = os.getenv("EMAIL_TO", "").strip()
-EMAIL_FROM      = os.getenv("EMAIL_FROM", EMAIL_SMTP_USER).strip()
-
-# ==============================
-# LOG
-# ==============================
-def log(msg: str):
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] {msg}")
-
-# ==============================
-# ALERT STATE (DEDUP)
-# ==============================
-def _safe_key(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def load_alert_state(path: str) -> Dict[str, str]:
-    p = Path(path)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        log(f"⚠️ Could not read alert state file '{path}': {e}")
-        return {}
-
-def save_alert_state(path: str, state: Dict[str, str]) -> None:
-    try:
-        Path(path).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception as e:
-        log(f"⚠️ Could not write alert state file '{path}': {e}")
-
-def mismatch_fingerprint(out_players: List[str], in_players: List[str]) -> str:
-    payload = {"out": sorted(out_players), "in": sorted(in_players)}
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-# ==============================
-# NAME NORMALIZATION + OVERRIDES
-# ==============================
-SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
-SURNAME_PREFIXES = {"de", "del", "da", "di", "la", "le", "van", "von", "der"}
-
-# Reloaded each pass from NAME_OVERRIDES_CSV.
-PLAYER_ALIASES: Dict[str, str] = {}
-
-def _base_normalize_name(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower().strip()
-    s = re.sub(r"\(.*?\)", "", s)
-    s = re.sub(r"\[.*?\]", "", s)
-    s = re.sub(r"[-–—·\.']", " ", s)
-    if "," in s:
-        parts = [p.strip() for p in s.split(",")]
-        if len(parts) == 2:
-            s = f"{parts[1]} {parts[0]}"
-        else:
-            s = " ".join(parts)
-    s = re.sub(r"\s+", " ", s).strip()
-    tokens = [t for t in s.split() if not (len(t) == 1 and t.isalpha())]
-    if tokens and tokens[-1].strip(".") in SUFFIXES:
-        tokens = tokens[:-1]
-    return " ".join(tokens)
-
-def load_name_overrides(csv_path: str) -> Dict[str, str]:
-    """
-    Supports:
-      1) CSV with header dg_name,bf_name  (any casing)
-      2) TSV with header (e.g. "Betfair<TAB>DataGolf")
-      3) Two-column file with no header (comma or tab)
-         - If no header, assumes col1=Betfair, col2=DataGolf
-
-    Returns mapping normalized_name -> forced_normalized_name (Betfair-normalized form).
-    """
-    p = Path(csv_path)
-    if not p.exists():
-        return {}
-
-    try:
-        raw = p.read_text(encoding="utf-8-sig")
-    except Exception as e:
-        log(f"⚠️ Could not read {csv_path}: {e}")
-        return {}
-
-    first_nonempty = next((ln for ln in raw.splitlines() if ln.strip()), "")
-    comma_ct = first_nonempty.count(",")
-    tab_ct = first_nonempty.count("\t")
-    delim = "\t" if tab_ct > comma_ct else ","
-
-    out: Dict[str, str] = {}
-
-    try:
-        reader = csv.reader(raw.splitlines(), delimiter=delim)
-        rows = [r for r in reader if r and any(c.strip() for c in r)]
-        if not rows:
-            return {}
-
-        header = [c.strip().lower() for c in rows[0]]
-        has_header = False
-
-        if ("dg_name" in header and "bf_name" in header):
-            has_header = True
-            dg_idx = header.index("dg_name")
-            bf_idx = header.index("bf_name")
-        elif ("betfair" in header and ("datagolf" in header or "data golf" in header)):
-            has_header = True
-            bf_idx = header.index("betfair")
-            dg_idx = header.index("datagolf") if "datagolf" in header else header.index("data golf")
-
-        start_idx = 1 if has_header else 0
-
-        for r in rows[start_idx:]:
-            if len(r) < 2:
-                continue
-
-            if has_header:
-                if max(dg_idx, bf_idx) >= len(r):
-                    continue
-                bf_raw = (r[bf_idx] or "").strip()
-                dg_raw = (r[dg_idx] or "").strip()
-            else:
-                bf_raw = (r[0] or "").strip()
-                dg_raw = (r[1] or "").strip()
-
-            if not bf_raw or not dg_raw:
-                continue
-
-            dg_norm = _base_normalize_name(dg_raw)
-            bf_norm = _base_normalize_name(bf_raw)
-
-            out[dg_norm] = bf_norm
-            out[bf_norm] = bf_norm
-
-    except Exception as e:
-        log(f"⚠️ Could not parse {csv_path}: {e}")
-        return {}
-
-    return out
-
-def normalize_name(s: str) -> str:
-    norm = _base_normalize_name(s)
-    if not norm:
-        return ""
-    return PLAYER_ALIASES.get(norm, norm)
-
-def canonical_player_key(norm_name: str) -> str:
-    if not norm_name:
-        return ""
-    parts = norm_name.split()
-    if len(parts) == 1:
-        return parts[0]
-    if len(parts) >= 3 and parts[-2] in SURNAME_PREFIXES:
-        last = " ".join(parts[-2:])
-    else:
-        last = parts[-1]
-    first_initial = parts[0][0]
-    return f"{first_initial} {last}"
-
-# Event-name aliases (not used for player names)
-EVENT_ALIASES = {
-    "ww technology championship": "world wide technology championship",
-    "wwt championship": "world wide technology championship",
+SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "pgatour": {
+        "label": "PGA Tour",
+        "allowed_hosts": {"pgatour.com", "www.pgatour.com"},
+        "link_pattern": r"/player/",
+        "boundary_pattern": r"^alternates$",
+        "min_field_before_boundary_check": 20,
+        "required_confirm_streak": 2,
+        "allow_auto_giveup": True,
+    },
+    "pgachampions": {
+        "label": "PGA Tour Champions",
+        "allowed_hosts": {"pgatour.com", "www.pgatour.com"},
+        "link_pattern": r"/player/",
+        "boundary_pattern": r"^alternates$",
+        "min_field_before_boundary_check": 20,
+        "required_confirm_streak": 2,
+        "allow_auto_giveup": True,
+    },
+    "dpworld": {
+        "label": "DP World Tour",
+        "allowed_hosts": {"europeantour.com", "www.europeantour.com"},
+        "link_pattern": r"/players/",
+        "boundary_pattern": r"cut.?off",
+        "min_field_before_boundary_check": 20,
+        "required_confirm_streak": 2,
+        "allow_auto_giveup": True,
+    },
+    "lpga": {
+        "label": "LPGA",
+        "allowed_hosts": {"lpga.com", "www.lpga.com"},
+        "link_pattern": r"/athletes/",
+        # LPGA's virtualized list has made its reserve boundary unreliable.
+        # Count every player found and use a higher confirmation threshold.
+        "boundary_pattern": None,
+        "min_field_before_boundary_check": None,
+        "required_confirm_streak": 4,
+        "allow_auto_giveup": False,
+    },
 }
 
-def norm_event_name(s: str) -> str:
-    ns = normalize_name(s)
-    return EVENT_ALIASES.get(ns, ns)
+NAME_LOOKS_ABBREVIATED = re.compile(r"^\w\.\s")
 
-# ==============================
-# DATETIME HELPERS
-# ==============================
-def _parse_dt_any(s: str):
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo:
-                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            return dt
-        except Exception:
-            pass
+
+class ConfigError(RuntimeError):
+    """Raised when the weekly site configuration is missing or invalid."""
+
+
+@dataclass
+class DiffResult:
+    added: list[dict[str, Any]] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    status_lines: list[str] = field(default_factory=list)
+    slack_needed: bool = False
+    proposed_state: Optional[dict[str, Any]] = None
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise ConfigError(
+            f"Golf field configuration is missing at {path}. Save the weekly URLs on the Golf page in the hub."
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read golf field configuration at {path}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
+        raise ConfigError(f"Golf field configuration at {path} must contain a 'sites' list.")
+    return data
+
+
+def validate_site_url(tour_id: str, url: str) -> Optional[str]:
+    site_def = SITE_DEFINITIONS[tour_id]
+    normalized = url.strip()
+    if not normalized:
+        return "URL is empty"
+    if any(marker in normalized.lower() for marker in PLACEHOLDER_MARKERS):
+        return "URL is still a placeholder"
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() not in site_def["allowed_hosts"]:
+        hosts = ", ".join(sorted(site_def["allowed_hosts"]))
+        return f"URL must be HTTPS and use {hosts}"
     return None
 
-# ==============================
-# DATAGOLF HTTP (resilient)
-# ==============================
-def _dg_get_json(url, params, *, tag: str):
+
+def configured_sites(config: dict[str, Any]) -> list[tuple[str, dict[str, Any], str]]:
+    enabled: list[tuple[str, dict[str, Any], str]] = []
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+
+    for site_cfg in config.get("sites", []):
+        if not isinstance(site_cfg, dict) or not site_cfg.get("enabled"):
+            continue
+        tour_id = str(site_cfg.get("id", "")).strip()
+        if tour_id not in SITE_DEFINITIONS:
+            errors.append(f"unknown enabled site id '{tour_id}'")
+            continue
+        if tour_id in seen_ids:
+            errors.append(f"duplicate enabled site id '{tour_id}'")
+            continue
+        seen_ids.add(tour_id)
+        url = str(site_cfg.get("url", "")).strip()
+        url_error = validate_site_url(tour_id, url)
+        if url_error:
+            errors.append(f"{SITE_DEFINITIONS[tour_id]['label']}: {url_error}")
+            continue
+        enabled.append((tour_id, SITE_DEFINITIONS[tour_id], url))
+
+    if errors:
+        raise ConfigError("Invalid golf field configuration: " + "; ".join(errors))
+    if not enabled:
+        raise ConfigError("No golf tours are enabled with valid URLs. Save the weekly URLs on the Golf page in the hub.")
+    return enabled
+
+
+def state_path(tour_id: str) -> Path:
+    return STATE_DIR / f"{tour_id}.json"
+
+
+def load_state(tour_id: str) -> dict[str, Any]:
+    path = state_path(tour_id)
+    if not path.exists():
+        return {}
     try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.SSLError as e1:
-        log(f"WARNING: DG TLS verify failed on {tag}: {e1}. Retrying once with verify=False (INSECURE).")
-        try:
-            r = requests.get(url, params=params, timeout=20, verify=False)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e2:
-            log(f"❌ DG request failed (even verify=False): {url}  err={e2}")
-            return None
-    except Exception as e:
-        log(f"❌ DG request failed on {tag}: {url}  err={e}")
-        return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"WARNING: could not read {site_path_for_log(path)}; starting with a fresh baseline ({exc}).")
+        return {}
+    return data if isinstance(data, dict) else {}
 
-def dg_field_updates(tour: str):
-    return _dg_get_json(
-        f"{DG_BASE}/field-updates",
-        {"tour": tour, "file_format": "json", "key": DG_API_KEY},
-        tag=f"field-updates[{tour}]",
+
+def save_state(tour_id: str, state: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = state_path(tour_id)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def site_path_for_log(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def format_name(raw: str) -> str:
+    collapsed = re.sub(r"\s+", " ", raw).strip()
+
+    def title_word(match: re.Match[str]) -> str:
+        word = match.group(0)
+        return word[0].upper() + word[1:].lower()
+
+    return re.sub(r"\w\S*", title_word, collapsed)
+
+
+def is_valid_name(name: str) -> bool:
+    if not (1 < len(name) < 40):
+        return False
+    if not any(unicodedata.category(character).startswith("L") for character in name):
+        return False
+    if any(character.isdigit() for character in name):
+        return False
+    return not NAME_LOOKS_ABBREVIATED.match(name)
+
+
+def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) -> dict[str, list[str]]:
+    """Scroll a JavaScript-rendered page and accumulate field/reserve names."""
+    link_pattern = re.compile(site_def["link_pattern"])
+    boundary_pattern = (
+        re.compile(site_def["boundary_pattern"], re.IGNORECASE)
+        if site_def["boundary_pattern"]
+        else None
     )
+    min_before_boundary = site_def["min_field_before_boundary_check"] or 0
+    seen: set[str] = set()
+    field_names: list[str] = []
+    alternate_names: list[str] = []
+    past_boundary = False
 
-def dg_get_schedule(tour: str):
-    return _dg_get_json(
-        f"{DG_BASE}/get-schedule",
-        {"tour": tour, "file_format": "json", "key": DG_API_KEY},
-        tag=f"get-schedule[{tour}]",
-    )
-
-# ==============================
-# BUILD A DG EVENT INDEX (name → players)
-# ==============================
-class DGEvent:
-    def __init__(
-        self,
-        tour: str,
-        name: str,
-        event_id: Optional[str],
-        start: Optional[datetime],
-        players: Set[str],
-        display: Dict[str, str],
-    ):
-        self.tour = tour
-        self.name = name
-        self.event_id = event_id
-        self.start = start
-        self.players = players
-        self.display = display  # key -> DG display name
-
-def _pluck_players(rows) -> Tuple[Set[str], Dict[str, str]]:
-    keys: Set[str] = set()
-    display: Dict[str, str] = {}
-    for r in rows or []:
-        if not isinstance(r, dict):
-            continue
-        nm = r.get("player_name") or r.get("name")
-        if not nm:
-            continue
-        norm = normalize_name(nm)
-        key = canonical_player_key(norm)
-        if key:
-            keys.add(key)
-            display.setdefault(key, nm)
-    return keys, display
-
-def _extract_players_from_field_updates_payload(js) -> Tuple[Optional[str], Optional[str], Optional[datetime], Set[str], Dict[str, str]]:
-    if isinstance(js, dict) and "field" in js and "event_name" in js:
-        keys, display = _pluck_players(js.get("field"))
-        return (
-            js.get("event_name"),
-            str(js.get("event_id") or ""),
-            _parse_dt_any(js.get("start_date") or js.get("date") or ""),
-            keys,
-            display,
+    def scan_current_view() -> None:
+        nonlocal past_boundary
+        items = page.evaluate(
+            """
+            () => {
+              const items = [];
+              const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+              let element = walker.currentNode;
+              while (element) {
+                if (element.matches && element.matches('a[href]')) {
+                  items.push({
+                    type: 'link',
+                    href: element.getAttribute('href') || '',
+                    text: element.textContent || ''
+                  });
+                } else {
+                  const directText = Array.from(element.childNodes)
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => node.textContent || '')
+                    .join(' ')
+                    .trim();
+                  if (directText.length > 0 && directText.length < 60) {
+                    items.push({type: 'text', text: directText});
+                  }
+                }
+                element = walker.nextNode();
+              }
+              return items;
+            }
+            """
         )
 
-    if isinstance(js, dict) and isinstance(js.get("events"), list) and js["events"]:
-        e = js["events"][0]
-        keys, display = _pluck_players(e.get("field"))
-        return (
-            e.get("event_name") or e.get("tournament_name") or e.get("name"),
-            str(e.get("event_id") or ""),
-            _parse_dt_any(e.get("start_date") or e.get("date") or ""),
-            keys,
-            display,
-        )
-    return (None, None, None, set(), {})
+        for item in items:
+            if item["type"] == "text":
+                if (
+                    not past_boundary
+                    and boundary_pattern
+                    and len(field_names) >= min_before_boundary
+                    and boundary_pattern.search(item["text"])
+                ):
+                    past_boundary = True
+                continue
+            if not link_pattern.search(item["href"]):
+                continue
+            name = format_name(item["text"])
+            if is_valid_name(name) and name not in seen:
+                seen.add(name)
+                (alternate_names if past_boundary else field_names).append(name)
 
-def build_dg_event_index() -> List[DGEvent]:
-    out: List[DGEvent] = []
+    started = time.monotonic()
+    no_growth_streak = 0
+    last_seen_count = -1
 
-    for tour in DG_TOURS:
-        fu = dg_field_updates(tour)
-        if isinstance(fu, dict):
-            name, eid, start, keys, display = _extract_players_from_field_updates_payload(fu)
-            if keys:
-                log(f"DG field-updates[{tour}] single-event shape matched (DG='{name}', players={len(keys)}).")
-                out.append(DGEvent(tour, name or "", eid or "", start, keys, display))
-            else:
-                evs = fu.get("events") or []
-                if not isinstance(evs, list):
-                    log(f"DG field-updates[{tour}] had no 'events' list. keys={list(fu.keys())[:8]}")
-                for e in evs:
-                    rows = e.get("field") or []
-                    keys, display = _pluck_players(rows)
-                    name = e.get("event_name") or e.get("tournament_name") or e.get("name") or ""
-                    start = _parse_dt_any(e.get("start_date") or e.get("date") or "")
-                    out.append(DGEvent(tour, name, str(e.get("event_id") or ""), start, keys, display))
+    while True:
+        scan_current_view()
+        current_count = len(seen)
+        if current_count == last_seen_count:
+            no_growth_streak += 1
         else:
-            if fu is not None:
-                log(f"DG field-updates[{tour}] returned non-dict; type={type(fu).__name__}")
+            no_growth_streak = 0
+            last_seen_count = current_count
 
-        # supplement with schedule
-        sched = dg_get_schedule(tour)
-        if isinstance(sched, dict) and isinstance(sched.get("events"), list):
-            for e in sched["events"]:
-                name = e.get("event_name") or e.get("tournament_name") or e.get("name") or ""
-                eid  = str(e.get("event_id") or e.get("id") or e.get("dg_event_id") or "")
-                start = _parse_dt_any(e.get("start_date") or e.get("start_time") or e.get("date") or "")
-                if not any(norm_event_name(name) == norm_event_name(x.name) and x.tour == tour for x in out):
-                    out.append(DGEvent(tour, name, eid, start, set(), {}))
+        if no_growth_streak >= 15 or time.monotonic() - started > timeout_s:
+            break
 
-    out = [e for e in out if e.name]
-    return out
-
-# ==============================
-# MATCH A BETFAIR EVENT TO DG
-# ==============================
-def score_event_match(bf_name: str, bf_start: Optional[datetime], dg: DGEvent) -> float:
-    tgt = norm_event_name(bf_name)
-    dgname = norm_event_name(dg.name)
-    name_sim = difflib.SequenceMatcher(None, tgt, dgname).ratio()
-    date_bonus = 0.0
-    if bf_start and dg.start:
-        delta_days = abs((bf_start - dg.start).days)
-        date_bonus = max(0.0, 1.0 - (delta_days / DG_DATE_PADDING_DAYS))
-    return name_sim + 0.25 * date_bonus
-
-def best_dg_match(bf_name: str, bf_start: Optional[datetime], index: List[DGEvent]) -> Optional[DGEvent]:
-    best, best_score = None, -1.0
-    for dg in index:
-        s = score_event_match(bf_name, bf_start, dg)
-        if s > best_score:
-            best, best_score = dg, s
-    if best and best_score >= EVENT_MATCH_THRESHOLD:
-        log(f"DG match: '{bf_name}' ⇄ '{best.name}' (tour={best.tour}, score={best_score:.2f}, players={len(best.players)})")
-        return best
-    return None
-
-# ==============================
-# BETFAIR
-# ==============================
-def betfair_login() -> betfairlightweight.APIClient:
-    if BF_CERTS_DIR and os.path.isdir(BF_CERTS_DIR):
-        trading = betfairlightweight.APIClient(BF_USERNAME, BF_PASSWORD, app_key=BF_APP_KEY, certs=BF_CERTS_DIR)
-        trading.login()
-    else:
-        trading = betfairlightweight.APIClient(BF_USERNAME, BF_PASSWORD, app_key=BF_APP_KEY)
-        trading.login_interactive()
-    return trading
-
-def betfair_list_outrights(trading):
-    mf = bf_market_filter(
-        event_type_ids=[EVENT_TYPE_ID_GOLF],
-        market_type_codes=MARKET_TYPE_CODES,
-        market_start_time={
-            "from": (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "to":   (datetime.now(timezone.utc) + timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-    )
-    cats = trading.betting.list_market_catalogue(
-        filter=mf,
-        market_projection=["EVENT", "RUNNER_DESCRIPTION", "MARKET_START_TIME"],
-        max_results=200,
-        sort="FIRST_TO_START",
-    )
-    return cats
-
-def betfair_active_selection_ids(trading, market_id: str) -> Set[int]:
-    try:
-        books = trading.betting.list_market_book(
-            market_ids=[market_id],
-            price_projection=None,
+        page.evaluate(
+            """
+            () => {
+              window.scrollTo(0, document.body.scrollHeight);
+              window.dispatchEvent(new WheelEvent('wheel', {deltaY: 800, bubbles: true}));
+            }
+            """
         )
-    except Exception as e:
-        log(f"Error fetching market_book for {market_id}: {e}")
-        return set()
+        page.wait_for_timeout(700)
 
-    if not books:
-        return set()
+    return {"field": field_names, "alternates": alternate_names}
 
-    book = books[0]
-    active = {
-        r.selection_id
-        for r in (book.runners or [])
-        if getattr(r, "status", "") == "ACTIVE"
-    }
-    return active
 
-def betfair_market_runners_set(trading, cat) -> Tuple[Set[str], Dict[str, str]]:
-    active_ids = betfair_active_selection_ids(trading, cat.market_id)
+def evaluate_reading(
+    tour_id: str,
+    site_def: dict[str, Any],
+    url: str,
+    live_field: list[str],
+    live_alternates: list[str],
+) -> DiffResult:
+    result = DiffResult()
+    state = load_state(tour_id)
+    previous_field = state.get("confirmed_field")
+    previous_alternates = state.get("confirmed_alternates", [])
+    previous_url = state.get("baseline_url")
+    reject_streak = int(state.get("reject_streak", 0) or 0)
+    miss_streaks = dict(state.get("miss_streaks", {}) or {})
+    seen_streaks = dict(state.get("seen_streaks", {}) or {})
 
-    keys: Set[str] = set()
-    display: Dict[str, str] = {}
-    for r in (cat.runners or []):
-        if not r.runner_name:
-            continue
-        if active_ids and r.selection_id not in active_ids:
-            continue
-        norm = normalize_name(r.runner_name)
-        key = canonical_player_key(norm)
-        if key:
-            keys.add(key)
-            display.setdefault(key, r.runner_name)
-    return keys, display
+    if not live_field:
+        result.status_lines.append(
+            f"{site_def['label']}: found 0 players; the page may not have loaded or its layout may have changed."
+        )
+        return result
 
-# ==============================
-# ALERTS
-# ==============================
-def send_slack(text: str):
-    if SLACK_WEBHOOK_URL:
-        try:
-            resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
-            if resp.status_code != 200:
-                log(f"Slack webhook error: status={resp.status_code}, body={resp.text}")
-        except Exception as e:
-            log(f"Slack webhook send failed: {e}")
-        return
+    if previous_url and previous_url != url:
+        result.status_lines.append(
+            f"{site_def['label']}: new tournament URL detected; resetting the baseline quietly."
+        )
+        previous_field = None
+        previous_alternates = []
+        miss_streaks = {}
+        seen_streaks = {}
+        reject_streak = 0
 
-    if SLACK_BOT_TOKEN and SLACK_CHANNEL:
-        try:
-            resp = requests.post(
+    if (
+        previous_field
+        and len(previous_field) >= 10
+        and len(live_field) < len(previous_field) * SUSPICIOUS_SHORT_READ_THRESHOLD
+    ):
+        allow_giveup = bool(site_def["allow_auto_giveup"])
+        if allow_giveup and reject_streak + 1 >= 6:
+            result.status_lines.append(
+                f"{site_def['label']}: accepted a short list ({len(live_field)} vs {len(previous_field)}) "
+                "as a fresh silent baseline after six consecutive short reads."
+            )
+            previous_field = None
+            reject_streak = 0
+        else:
+            reject_streak += 1
+            streak_label = f"{reject_streak}/6" if allow_giveup else f"{reject_streak}; auto-reset disabled"
+            result.status_lines.append(
+                f"{site_def['label']}: suspiciously short list ({len(live_field)} vs {len(previous_field)}); "
+                f"skipping this read ({streak_label})."
+            )
+            state.update(
+                {
+                    "reject_streak": reject_streak,
+                    "miss_streaks": miss_streaks,
+                    "seen_streaks": seen_streaks,
+                    "baseline_url": url,
+                }
+            )
+            save_state(tour_id, state)
+            return result
+    else:
+        reject_streak = 0
+
+    if previous_field is None:
+        result.status_lines.append(
+            f"{site_def['label']}: stored a silent baseline of {len(live_field)} field players and "
+            f"{len(live_alternates)} reserve-list players."
+        )
+        new_confirmed_field = list(live_field)
+        miss_streaks = {}
+        seen_streaks = {}
+    else:
+        confirmed_set = set(previous_field)
+        current_set = set(live_field)
+        previous_alternate_set = set(previous_alternates)
+        added_raw = [name for name in live_field if name not in confirmed_set]
+        missing_raw = [name for name in previous_field if name not in current_set]
+        required_streak = int(site_def["required_confirm_streak"])
+
+        for name in missing_raw:
+            miss_streaks[name] = int(miss_streaks.get(name, 0)) + 1
+        for name in live_field:
+            miss_streaks.pop(name, None)
+        for name in added_raw:
+            seen_streaks[name] = int(seen_streaks.get(name, 0)) + 1
+        for name in list(seen_streaks):
+            if name not in added_raw:
+                seen_streaks.pop(name, None)
+
+        confirmed_removed = [
+            name for name in missing_raw if miss_streaks.get(name, 0) >= required_streak
+        ]
+        confirmed_added = [
+            name for name in added_raw if seen_streaks.get(name, 0) >= required_streak
+        ]
+        for name in confirmed_removed:
+            miss_streaks.pop(name, None)
+        for name in confirmed_added:
+            seen_streaks.pop(name, None)
+
+        if confirmed_added or confirmed_removed:
+            result.added = [
+                {"name": name, "promoted": name in previous_alternate_set}
+                for name in confirmed_added
+            ]
+            result.removed = confirmed_removed
+            result.slack_needed = True
+            result.status_lines.append(
+                f"{site_def['label']}: FIELD CHANGE; {len(confirmed_added)} added, "
+                f"{len(confirmed_removed)} withdrawn."
+            )
+        elif missing_raw or added_raw:
+            result.status_lines.append(
+                f"{site_def['label']}: no confirmed changes ({len(missing_raw)} missing, "
+                f"{len(added_raw)} newly seen; requires {required_streak} consecutive checks)."
+            )
+        else:
+            result.status_lines.append(
+                f"{site_def['label']}: no field changes ({len(live_field)} field, "
+                f"{len(live_alternates)} reserve)."
+            )
+        new_confirmed_field = [
+            name for name in previous_field if name not in confirmed_removed
+        ] + confirmed_added
+
+    state.update(
+        {
+            "confirmed_field": new_confirmed_field,
+            "confirmed_alternates": list(live_alternates),
+            "baseline_url": url,
+            "reject_streak": reject_streak,
+            "miss_streaks": miss_streaks,
+            "seen_streaks": seen_streaks,
+        }
+    )
+    result.proposed_state = state
+    return result
+
+
+def process_tour(tour_id: str, site_def: dict[str, Any], url: str, browser: Browser) -> DiffResult:
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(1_500)
+        reading = read_field(page, site_def)
+    finally:
+        page.close()
+    return evaluate_reading(tour_id, site_def, url, reading["field"], reading["alternates"])
+
+
+def slack_configuration(config: dict[str, Any]) -> tuple[str, str, str]:
+    webhook = (
+        GOLF_NR_SLACK_WEBHOOK_URL
+        or str(config.get("slack_webhook_url", "")).strip()
+        or LEGACY_SLACK_WEBHOOK_URL
+    )
+    token = GOLF_NR_SLACK_BOT_TOKEN or LEGACY_SLACK_BOT_TOKEN
+    channel = GOLF_NR_SLACK_CHANNEL or LEGACY_SLACK_CHANNEL
+    return webhook, token, channel
+
+
+def slack_config_message(config: dict[str, Any]) -> str:
+    webhook, token, channel = slack_configuration(config)
+    if webhook:
+        return "Golf Slack destination: webhook configured."
+    if token and channel:
+        return "Golf Slack destination: bot token and channel configured."
+    return "Golf Slack destination: NOT CONFIGURED; field changes cannot be delivered."
+
+
+def slack_message(label: str, added: list[dict[str, Any]], removed: list[str]) -> str:
+    text = f"*{label} - Field Update*\n"
+    if added:
+        lines = [
+            f"• {item['name']}" + (" _(promoted from reserve list)_" if item["promoted"] else "")
+            for item in added
+        ]
+        text += "\n➕ *Added*\n" + "\n".join(lines) + "\n"
+    if removed:
+        text += "\n➖ *Withdrawn*\n" + "\n".join(f"• {name}" for name in removed) + "\n"
+    return text
+
+
+def post_to_slack(
+    config: dict[str, Any], label: str, added: list[dict[str, Any]], removed: list[str]
+) -> Optional[str]:
+    webhook, token, channel = slack_configuration(config)
+    text = slack_message(label, added, removed)
+    try:
+        if webhook:
+            response = requests.post(webhook, json={"text": text}, timeout=10)
+            if response.status_code != 200:
+                return f"Slack webhook returned status {response.status_code}."
+            return None
+        if token and channel:
+            response = requests.post(
                 "https://slack.com/api/chat.postMessage",
-                headers={
-                    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-                    "Content-Type": "application/json; charset=utf-8",
-                },
-                json={"channel": SLACK_CHANNEL, "text": text},
+                headers={"Authorization": f"Bearer {token}"},
+                json={"channel": channel, "text": text},
                 timeout=10,
             )
-            if resp.status_code != 200:
-                log(f"Slack API HTTP error: status={resp.status_code}, body={resp.text}")
-            else:
-                data = resp.json()
-                if not data.get("ok"):
-                    log(f"Slack API error: {data.get('error')} (resp={data})")
-        except Exception as e:
-            log(f"Slack API send failed: {e}")
-        return
+            payload = response.json() if response.content else {}
+            if response.status_code != 200 or not payload.get("ok"):
+                return f"Slack API rejected the message ({payload.get('error') or response.status_code})."
+            return None
+    except Exception as exc:
+        return f"Slack post failed: {exc}"
+    return "No Golf Slack webhook or bot token/channel is configured."
 
-    log("Slack disabled: no SLACK_WEBHOOK_URL or SLACK_BOT_TOKEN/SLACK_CHANNEL configured.")
 
-def send_email(subject: str, body: str):
-    if not (EMAIL_SMTP_HOST and EMAIL_TO and EMAIL_FROM):
-        return
-    import smtplib
-    from email.mime.text import MIMEText
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+def run_cycle() -> int:
     try:
-        with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=15) as s:
-            s.starttls()
-            if EMAIL_SMTP_USER and EMAIL_SMTP_PASS:
-                s.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASS)
-            s.send_message(msg)
-    except Exception as e:
-        log(f"Email send failed: {e}")
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("ERROR: Playwright is not installed. Install requirements.txt and Playwright Chromium.")
+        return 1
 
-def alert_for_event(bf_header: str, out_players: List[str], in_players: List[str]):
-    if not out_players and not in_players:
-        return
+    try:
+        config = load_config()
+        sites = configured_sites(config)
+    except ConfigError as exc:
+        log(f"CONFIG ERROR: {exc}")
+        return 1
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = []
-    lines.append(bf_header)
-    lines.append("-" * len(bf_header))
-    lines.append("")
-
-    if out_players:
-        lines.append(f"🚨 ❌ [{ts}] OUT (on Betfair, missing on DG):")
-        for p in out_players:
-            lines.append(f"    - {p}")
-
-    if in_players:
-        lines.append(f"🚨 ✅ [{ts}] IN  (on DG, missing on Betfair):")
-        for p in in_players:
-            lines.append(f"    + {p}")
-
-    text = "```" + "\n".join(lines) + "```"
-    send_slack(text)
-    send_email(subject=f"[Golf NR Check] {bf_header}", body="\n".join(lines))
-
-# ==============================
-# COMPARISON
-# ==============================
-def compare_and_report(trading, alert_state: Dict[str, str]):
-    global PLAYER_ALIASES
-    PLAYER_ALIASES = load_name_overrides(NAME_OVERRIDES_CSV)
-    if PLAYER_ALIASES:
-        log(f"Loaded name overrides: {len(PLAYER_ALIASES)} mappings from '{NAME_OVERRIDES_CSV}'")
-    else:
-        log(f"No name overrides loaded (file missing/empty?): '{NAME_OVERRIDES_CSV}'")
-
-    dg_index = build_dg_event_index()
-    if not dg_index:
-        log("⚠️ No DG events visible right now; skipping this pass.")
-        return
-
-    cats = betfair_list_outrights(trading)
-    if not cats:
-        log("No golf outrights found on Betfair.")
-        return
-
-    state_dirty = False
-
-    for cat in cats:
-        bf_market_id = cat.market_id
-        bf_event_name = getattr(cat.event, "name", "") or ""
-        bf_market_name = cat.market_name or "Outright"
-        bf_start = cat.market_start_time
-
-        if isinstance(bf_start, str):
-            for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+    log(slack_config_message(config))
+    exit_code = 0
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            for tour_id, site_def, url in sites:
+                log(f"--- Checking {site_def['label']} ---")
                 try:
-                    bf_start = datetime.strptime(bf_start, fmt)
-                    break
-                except ValueError:
-                    pass
-        if isinstance(bf_start, datetime) and bf_start.tzinfo:
-            bf_start = bf_start.astimezone(timezone.utc).replace(tzinfo=None)
+                    result = process_tour(tour_id, site_def, url, browser)
+                except Exception as exc:
+                    log(f"ERROR checking {site_def['label']}: {exc}")
+                    exit_code = 1
+                    continue
 
-        dg_match = best_dg_match(bf_event_name, bf_start, dg_index)
-        if ONLY_INCLUDE_EVENTS_ON_DG and not dg_match:
-            continue
+                for line in result.status_lines:
+                    log(line)
 
-        bf_keys, bf_display = betfair_market_runners_set(trading, cat)
-        dg_keys = dg_match.players if dg_match else set()
-        dg_display = dg_match.display if dg_match else {}
+                if result.slack_needed:
+                    error = post_to_slack(config, site_def["label"], result.added, result.removed)
+                    if error:
+                        log(f"ERROR posting to Slack for {site_def['label']}: {error}")
+                        log("The confirmed change was not committed to state and will be retried next cycle.")
+                        exit_code = 1
+                        continue
+                    log(f"{site_def['label']}: Slack field update sent.")
 
-        out_keys = sorted(bf_keys - dg_keys)
-        in_keys  = sorted(dg_keys - bf_keys)
+                if result.proposed_state is not None:
+                    save_state(tour_id, result.proposed_state)
+        finally:
+            browser.close()
+    return exit_code
 
-        out_players = [bf_display.get(k, k) for k in out_keys]
-        in_players  = [dg_display.get(k, k) for k in in_keys]
 
-        header = f"{bf_event_name} :: {bf_market_name} (BF {bf_market_id})"
-        if dg_match:
-            header += f"  [DG {dg_match.tour}:{dg_match.event_id or 'n/a'}]"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Monitor official golf field pages for confirmed changes.")
+    parser.add_argument("--once", action="store_true", help="Run one check cycle and exit.")
+    parser.add_argument(
+        "--repeat-minutes",
+        type=float,
+        default=DEFAULT_REPEAT_MINUTES,
+        help="Minutes between cycles in continuous mode (default: 5).",
+    )
+    return parser.parse_args()
 
-        print("\n" + header)
-        print("-" * len(header))
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if dg_match and not dg_keys:
-            print("  Note: DataGolf field empty/unavailable for this event (schedule present but no field yet).")
+def main() -> int:
+    args = parse_args()
+    if args.repeat_minutes <= 0:
+        log("ERROR: --repeat-minutes must be greater than zero.")
+        return 2
 
-        if out_players:
-            print(f" :alarm: :x: [{ts}] OUT (on Betfair, missing on DG):")
-            for p in out_players:
-                print(f"    - {p}")
-        if in_players:
-            print(f" :alarm: :tickmark: [{ts}] IN  (on DG, missing on Betfair):")
-            for p in in_players:
-                print(f"    + {p}")
-
-        if not out_players and not in_players and bf_keys and dg_keys:
-            print(f"  [{ts}] ✅ Lists match - Betfair v DataGolf.")
-
-        # ---- ALERT DEDUP LOGIC (persistent) ----
-        state_key = _safe_key(f"{bf_market_id}")
-        if out_players or in_players:
-            fp = mismatch_fingerprint(out_players, in_players)
-            prev_fp = alert_state.get(state_key)
-            if prev_fp != fp:
-                alert_for_event(header, out_players, in_players)
-                alert_state[state_key] = fp
-                state_dirty = True
-            else:
-                log(f"Skipping duplicate alert (no change): {bf_event_name} / {bf_market_name} / {bf_market_id}")
-        else:
-            # Optional: clear stored fingerprint if market now matches again
-            if state_key in alert_state:
-                del alert_state[state_key]
-                state_dirty = True
-
-    if state_dirty:
-        save_alert_state(ALERT_STATE_FILE, alert_state)
-
-# ==============================
-# MAIN
-# ==============================
-def main():
-    missing = []
-    if not BF_USERNAME or BF_USERNAME == "REPLACE_ME": missing.append("BETFAIR_USERNAME")
-    if not BF_PASSWORD or BF_PASSWORD == "REPLACE_ME": missing.append("BETFAIR_PASSWORD")
-    if not BF_APP_KEY  or BF_APP_KEY  == "REPLACE_ME": missing.append("BETFAIR_APP_KEY")
-    if not DG_API_KEY  or DG_API_KEY  == "REPLACE_ME": missing.append("DG_API_KEY")
-    if missing:
-        print("⚠️  Please set: " + ", ".join(missing))
-        sys.exit(1)
-
-    trading = betfair_login()
-    log("Connected to Betfair.")
-
-    alert_state = load_alert_state(ALERT_STATE_FILE)
-
-    try:
-        while True:
-            compare_and_report(trading, alert_state)
-            log(f"Sleeping {POLL_SECONDS}s…")
-            time.sleep(POLL_SECONDS)
-    except KeyboardInterrupt:
-        log("Stopping…")
-    finally:
+    log("Starting official Golf field checker.")
+    while True:
         try:
-            save_alert_state(ALERT_STATE_FILE, alert_state)
-        except Exception:
-            pass
+            exit_code = run_cycle()
+        except Exception as exc:
+            log(f"ERROR: Golf check cycle failed before all tours could be checked: {exc}")
+            exit_code = 1
+        if args.once:
+            return exit_code
+        delay_seconds = args.repeat_minutes * 60
+        log(f"Next Golf field check in {args.repeat_minutes:g} minutes.")
         try:
-            trading.logout()
-        except Exception:
-            pass
+            time.sleep(delay_seconds)
+        except KeyboardInterrupt:
+            log("Golf field checker stopped.")
+            return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
