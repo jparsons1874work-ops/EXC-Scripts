@@ -4,23 +4,26 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 from urllib.parse import urlparse
 
 import requests
 
 if TYPE_CHECKING:
-    from playwright.sync_api import Browser, Page
+    from playwright.sync_api import BrowserContext, Page
 
 
 try:
@@ -48,6 +51,10 @@ STATE_DIR = Path(
 DEFAULT_REPEAT_MINUTES = 5.0
 SUSPICIOUS_SHORT_READ_THRESHOLD = 0.6
 PLACEHOLDER_MARKERS = ("example", "replace", "with/yours")
+GOLF_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+)
 
 GOLF_NR_SLACK_WEBHOOK_URL = os.getenv("GOLF_NR_SLACK_WEBHOOK_URL", "").strip()
 GOLF_NR_SLACK_BOT_TOKEN = os.getenv("GOLF_NR_SLACK_BOT_TOKEN", "").strip()
@@ -62,6 +69,8 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "label": "PGA Tour",
         "allowed_hosts": {"pgatour.com", "www.pgatour.com"},
         "link_pattern": r"/player/",
+        "link_selector": 'main a[href*="/player/"]',
+        "name_text_mode": "full",
         "boundary_pattern": r"^alternates$",
         "min_field_before_boundary_check": 20,
         "required_confirm_streak": 2,
@@ -71,6 +80,8 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "label": "PGA Tour Champions",
         "allowed_hosts": {"pgatour.com", "www.pgatour.com"},
         "link_pattern": r"/player/",
+        "link_selector": 'main a[href*="/player/"]',
+        "name_text_mode": "full",
         "boundary_pattern": r"^alternates$",
         "min_field_before_boundary_check": 20,
         "required_confirm_streak": 2,
@@ -80,6 +91,8 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "label": "DP World Tour",
         "allowed_hosts": {"europeantour.com", "www.europeantour.com"},
         "link_pattern": r"/players/",
+        "link_selector": 'main table a[href*="/players/"]',
+        "name_text_mode": "first-line",
         "boundary_pattern": r"cut.?off",
         "min_field_before_boundary_check": 20,
         "required_confirm_streak": 2,
@@ -89,6 +102,8 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "label": "LPGA",
         "allowed_hosts": {"lpga.com", "www.lpga.com"},
         "link_pattern": r"/athletes/",
+        "link_selector": 'main a[href*="/athletes/"]',
+        "name_text_mode": "full",
         # LPGA's virtualized list has made its reserve boundary unreliable.
         # Count every player found and use a higher confirmation threshold.
         "boundary_pattern": None,
@@ -242,6 +257,65 @@ def is_valid_name(name: str) -> bool:
     return not NAME_LOOKS_ABBREVIATED.match(name)
 
 
+def _available_xvfb_display() -> str:
+    for number in range(90, 190):
+        if not Path(f"/tmp/.X11-unix/X{number}").exists():
+            return f":{number}"
+    return f":{200 + (os.getpid() % 700)}"
+
+
+@contextmanager
+def browser_display() -> Iterator[bool]:
+    """Provide a real display on Linux because official sites block headless Chromium."""
+    if not sys.platform.startswith("linux"):
+        yield True
+        return
+
+    existing_display = os.getenv("DISPLAY", "").strip()
+    if existing_display:
+        log(f"Golf browser using existing display {existing_display}.")
+        yield False
+        return
+
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        log(
+            "WARNING: Xvfb is not installed; using headless Chromium. "
+            "PGA Tour or DP World Tour may return Access Denied. Install the Ubuntu xvfb package."
+        )
+        yield True
+        return
+
+    display = _available_xvfb_display()
+    process = subprocess.Popen(
+        [xvfb, display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    socket_path = Path(f"/tmp/.X11-unix/X{display.lstrip(':')}")
+    try:
+        for _ in range(50):
+            if process.poll() is not None:
+                raise RuntimeError("Xvfb stopped before its display became ready")
+            if socket_path.exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Xvfb did not become ready within five seconds")
+        os.environ["DISPLAY"] = display
+        log(f"Golf browser virtual display ready on {display}.")
+        yield False
+    finally:
+        os.environ.pop("DISPLAY", None)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+
 def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) -> dict[str, list[str]]:
     """Scroll a JavaScript-rendered page and accumulate field/reserve names."""
     link_pattern = re.compile(site_def["link_pattern"])
@@ -251,6 +325,8 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
         else None
     )
     min_before_boundary = site_def["min_field_before_boundary_check"] or 0
+    link_selector = site_def.get("link_selector") or f'a[href*="{site_def["link_pattern"]}"]'
+    name_text_mode = site_def.get("name_text_mode", "full")
     seen: set[str] = set()
     field_names: list[str] = []
     alternate_names: list[str] = []
@@ -260,16 +336,19 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
         nonlocal past_boundary
         items = page.evaluate(
             """
-            () => {
+            ({linkSelector, nameTextMode}) => {
               const items = [];
               const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
               let element = walker.currentNode;
               while (element) {
-                if (element.matches && element.matches('a[href]')) {
+                if (element.matches && element.matches(linkSelector)) {
+                  const rawText = element.innerText || element.textContent || '';
                   items.push({
                     type: 'link',
                     href: element.getAttribute('href') || '',
-                    text: element.textContent || ''
+                    text: nameTextMode === 'first-line'
+                      ? rawText.split(/\\r?\\n/)[0]
+                      : rawText
                   });
                 } else {
                   const directText = Array.from(element.childNodes)
@@ -285,7 +364,8 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
               }
               return items;
             }
-            """
+            """,
+            {"linkSelector": link_selector, "nameTextMode": name_text_mode},
         )
 
         for item in items:
@@ -526,16 +606,24 @@ def process_tour(
     site_def: dict[str, Any],
     url: str,
     config_saved_at: str,
-    browser: Browser,
+    browser_context: BrowserContext,
 ) -> DiffResult:
-    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    page = browser_context.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-        page.wait_for_timeout(1_500)
+        try:
+            page.wait_for_selector(site_def["link_selector"], state="attached", timeout=45_000)
+        except Exception:
+            # The zero-player safeguard below owns the failure. Keep the page
+            # title/final URL available so the log identifies denial pages.
+            pass
+        page.wait_for_timeout(1_000)
+        page_title = page.title()
+        final_url = page.url
         reading = read_field(page, site_def)
     finally:
         page.close()
-    return evaluate_reading(
+    result = evaluate_reading(
         tour_id,
         site_def,
         url,
@@ -543,6 +631,11 @@ def process_tour(
         reading["alternates"],
         config_saved_at,
     )
+    if not reading["field"]:
+        result.status_lines.append(
+            f"{site_def['label']}: loaded page title {page_title!r}; final URL {final_url}"
+        )
+    return result
 
 
 def slack_configuration(config: dict[str, Any]) -> tuple[str, str, str]:
@@ -658,13 +751,25 @@ def run_cycle() -> int:
 
     log(slack_config_message(config))
     exit_code = 0
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    with browser_display() as use_headless, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=use_headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1365, "height": 900},
+            user_agent=GOLF_BROWSER_USER_AGENT,
+            locale="en-GB",
+            timezone_id="Europe/London",
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
         try:
             for tour_id, site_def, url, config_saved_at in sites:
                 log(f"--- Checking {site_def['label']} ---")
                 try:
-                    result = process_tour(tour_id, site_def, url, config_saved_at, browser)
+                    result = process_tour(tour_id, site_def, url, config_saved_at, context)
                 except Exception as exc:
                     log(f"ERROR checking {site_def['label']}: {exc}")
                     exit_code = 1
@@ -686,6 +791,7 @@ def run_cycle() -> int:
                 if result.proposed_state is not None:
                     save_state(tour_id, result.proposed_state)
         finally:
+            context.close()
             browser.close()
     return exit_code
 

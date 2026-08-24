@@ -35,7 +35,7 @@ sudo apt install -y \
   fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 \
   libcups2 libdbus-1-3 libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
   libpango-1.0-0 libu2f-udev libvulkan1 libx11-6 libxcb1 libxcomposite1 \
-  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 wget xdg-utils
+  libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 wget xdg-utils xvfb
 
 wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 sudo apt install -y /tmp/google-chrome.deb
@@ -129,7 +129,7 @@ clients authenticate with `Authorization: Bearer <key>`.
 
 Slack webhook routing:
 
-- Golf - Non-Runner Check runs the official tour field scanner continuously and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. Save the four weekly tournament URLs on the Golf page in the Hub. The **Check with Betfair** button uses the standard Betfair API credentials and certificate paths configured above.
+- Golf - Non-Runner Check runs the official tour field scanner continuously and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. Save the four weekly tournament URLs on the Golf page in the Hub. The scanner needs the Ubuntu `xvfb` package because PGA Tour and DP World Tour reject Chromium's default headless mode. The **Check with Betfair** button uses the standard Betfair API credentials and certificate paths configured above.
 - Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.

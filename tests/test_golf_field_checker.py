@@ -162,9 +162,11 @@ class GolfFieldCheckerTests(unittest.TestCase):
         site["min_field_before_boundary_check"] = 1
         markup = """
         <body>
-          <a href="/player/1">Alice Player</a>
-          <h2>Alternates</h2>
-          <a href="/player/2">Reserve Person</a>
+          <main>
+            <a href="/player/1">Alice Player</a>
+            <h2>Alternates</h2>
+            <a href="/player/2">Reserve Person</a>
+          </main>
         </body>
         """
         with sync_playwright() as playwright:
@@ -178,6 +180,36 @@ class GolfFieldCheckerTests(unittest.TestCase):
 
         self.assertEqual(reading["field"], ["Alice Player"])
         self.assertEqual(reading["alternates"], ["Reserve Person"])
+
+    def test_dp_reader_uses_entry_table_and_ignores_player_attachments(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright is not installed in this test environment")
+
+        site = dict(golf.SITE_DEFINITIONS["dpworld"])
+        site["min_field_before_boundary_check"] = 1
+        markup = """
+        <body>
+          <a href="/players/unrelated-1/">Unrelated Ranking Player</a>
+          <main><table><tbody>
+            <tr><td><a href="/players/alice-1/"><strong>PLAYER</strong>, Alice<div>Home Golf Club</div></a></td></tr>
+            <tr><td>Current Cut Off Position - subject to change</td></tr>
+            <tr><td><a href="/players/reserve-2/"><strong>PERSON</strong>, Reserve<div>Other Club</div></a></td></tr>
+          </tbody></table></main>
+        </body>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                reading = golf.read_field(page, site, timeout_s=1)
+            finally:
+                browser.close()
+
+        self.assertEqual(reading["field"], ["Player, Alice"])
+        self.assertEqual(reading["alternates"], ["Person, Reserve"])
 
     def test_scanner_status_messages_include_enabled_urls(self) -> None:
         sites = [

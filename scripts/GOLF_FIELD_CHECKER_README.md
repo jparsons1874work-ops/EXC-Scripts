@@ -72,10 +72,13 @@ send false discrepancy alerts.
 ## Site-reading safeguards
 
 All four sites render their player lists with JavaScript, so Playwright and its
-Chromium browser are required. A read below 60% of the previous field size is
-rejected as likely incomplete. After six consecutive short reads, the three
-non-LPGA sites accept a fresh silent baseline. LPGA never auto-resets on short
-reads.
+Chromium browser are required. PGA Tour and DP World Tour also reject the
+default automated headless browser. On Ubuntu the scanner therefore starts a
+private virtual display with `Xvfb` and runs Chromium in normal display mode;
+install the `xvfb` system package before starting the Hub. A read below 60% of
+the previous field size is rejected as likely incomplete. After six consecutive
+short reads, the three non-LPGA sites accept a fresh silent baseline. LPGA never
+auto-resets on short reads.
 
 If LPGA remains chronically undercounted on EC2, inspect the Hub output first.
 Its list is virtualized and has previously depended on visible browser rendering;
