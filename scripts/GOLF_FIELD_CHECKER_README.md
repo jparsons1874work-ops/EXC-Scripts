@@ -6,9 +6,12 @@ older Data Golf versus Betfair comparison.
 
 ## Operation
 
-- The Hub starts the checker at 07:00 UK time, polls every five minutes, and
-  stops it at 23:00.
-- A Hub restart inside that window starts it again automatically.
+- The Hub starts the checker automatically, polls every five minutes, and keeps
+  it running continuously until it is deliberately stopped.
+- A Hub restart starts it again automatically.
+- Once valid weekly URLs are available, startup sends a green Slack message
+  listing every enabled official page. A graceful/manual stop sends a red
+  scanner-offline message.
 - The first valid read for a tournament is a silent baseline.
 - PGA Tour, PGA Tour Champions, and DP World Tour changes must appear on two
   consecutive checks before Slack is notified.
@@ -51,6 +54,20 @@ Per-tour state is stored under `runtime/output/golf_field_checker/`. If a site's
 saved count is clearly wrong, stop the checker, remove only that tour's JSON
 file, and start the checker again. The next valid read becomes a silent
 baseline.
+
+## User-triggered Betfair comparison
+
+The **Check with Betfair** button runs independently of the continuous official
+field scanner. It calls the Betfair Exchange API, finds the best matching active
+Golf winner market for each enabled competition, and compares active Betfair
+runners with the confirmed official field.
+
+The Hub retains the latest result and shows matching, mismatch, baseline-not-
+ready, event-not-matched, or API-error status per competition. A mismatch lists
+each golfer as either official-field-only or Betfair-only and sends a fresh
+message to the Golf Slack destination for every user-triggered run. Ambiguous
+event matches and empty Betfair reads are shown as attention/errors and do not
+send false discrepancy alerts.
 
 ## Site-reading safeguards
 

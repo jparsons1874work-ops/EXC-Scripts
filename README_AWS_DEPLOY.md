@@ -129,7 +129,7 @@ clients authenticate with `Authorization: Bearer <key>`.
 
 Slack webhook routing:
 
-- Golf - Non-Runner Check reads official tour field pages and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. Save the four weekly tournament URLs on the Golf page in the Hub.
+- Golf - Non-Runner Check runs the official tour field scanner continuously and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. Save the four weekly tournament URLs on the Golf page in the Hub. The **Check with Betfair** button uses the standard Betfair API credentials and certificate paths configured above.
 - Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.

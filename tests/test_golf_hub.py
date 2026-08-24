@@ -103,6 +103,27 @@ class GolfHubTests(unittest.TestCase):
             inplay=None,
             parsed_output_message="",
             golf=golf_context,
+            golf_betfair={
+                "status": "complete",
+                "summary": "mismatch",
+                "rows": [
+                    {
+                        "competition": "PGA Tour",
+                        "status": "mismatch",
+                        "official_count": 2,
+                        "betfair_count": 1,
+                        "betfair_event_name": "Test Championship",
+                        "betfair_market_id": "1.234",
+                        "official_only": ["Cara Golfer"],
+                        "betfair_only": [],
+                        "message": "Field discrepancy found.",
+                    }
+                ],
+                "mismatch_count": 1,
+                "slack_status": "sent",
+                "started_at_label": "24 Aug 2026 14:00:00",
+                "completed_at_label": "24 Aug 2026 14:01:00",
+            },
             ufc=None,
             pfl=None,
             reminders=None,
@@ -112,6 +133,8 @@ class GolfHubTests(unittest.TestCase):
 
         self.assertIn("Tracked Competitions", html)
         self.assertIn("Confirmed Field Changes", html)
+        self.assertIn("Check with Betfair", html)
+        self.assertIn("Betfair Exchange Field Comparison", html)
         self.assertIn("Cara Golfer", html)
 
 

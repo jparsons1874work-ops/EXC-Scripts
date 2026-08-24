@@ -36,8 +36,9 @@ class ScriptAutomationTests(unittest.TestCase):
         inplay = SCRIPTS_BY_ID["betfair-in-play-start-checker"]
 
         self.assertEqual(golf.default_args, ("--repeat-minutes", "5"))
-        self.assertEqual(golf.auto_start_times, ("07:00",))
-        self.assertEqual(golf.auto_stop_times, ("23:00",))
+        self.assertIsNone(golf.allowed_window)
+        self.assertEqual(golf.auto_start_times, ())
+        self.assertEqual(golf.auto_stop_times, ())
         self.assertTrue(golf.auto_start_on_hub_start)
         self.assertEqual(duplicate_match.auto_start_times, ("07:00",))
         self.assertEqual(duplicate_match.auto_stop_times, ("23:00",))

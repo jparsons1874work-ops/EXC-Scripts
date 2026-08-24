@@ -134,6 +134,7 @@
   <div class="message">No confirmed additions or withdrawals have been recorded for the current tournament links.</div>
   {% endif %}
 </section>
+{% include "partials/golf_betfair_panel.html" %}
 {% endif %}
 
 <section class="detail-layout">
@@ -170,6 +171,9 @@
     </form>
     <form method="post" action="/scripts/{{ spec.id }}/start" class="form-stack controls">
       <button class="button button-primary" type="submit" {% if not golf.configured or state.status == "running" or state.status == "stopping" %}disabled{% endif %}>Start</button>
+    </form>
+    <form method="post" action="/scripts/{{ spec.id }}/check-betfair" class="form-stack controls">
+      <button class="button button-ghost" type="submit" {% if not golf.configured %}disabled{% endif %}>Check with Betfair</button>
     </form>
     {% elif spec.id == "ufc-live-start-scanner" %}
     {% if request.query_params.get("error") == "missing-ufc-url" %}

@@ -20,6 +20,7 @@ from fastapi.templating import Jinja2Templates
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
 from app.config import APP_DIR, CONFIG_DIR, OUTPUT_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
 from app.cricket_fixture_api import fixture_refresh_service, router as cricket_fixture_api_router
+from app.golf_betfair_check import golf_betfair_check_service
 from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.reminders import daily_reminders_context
@@ -115,6 +116,13 @@ def _golf_time_label(value: Any) -> str:
         return parsed.astimezone(ZoneInfo("Europe/London")).strftime("%d %b %Y %H:%M:%S")
     except ValueError:
         return raw
+
+
+def _golf_betfair_context() -> dict[str, Any]:
+    snapshot = golf_betfair_check_service.snapshot()
+    snapshot["started_at_label"] = _golf_time_label(snapshot.get("started_at"))
+    snapshot["completed_at_label"] = _golf_time_label(snapshot.get("completed_at"))
+    return snapshot
 
 
 def _golf_context() -> dict[str, Any]:
@@ -400,6 +408,7 @@ async def script_detail(request: Request, script_id: str):
                 inplay=inplay,
                 parsed_output_message=parsed_output_message,
                 golf=_golf_context() if spec.id == GOLF_SCRIPT_ID else None,
+                golf_betfair=_golf_betfair_context() if spec.id == GOLF_SCRIPT_ID else None,
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
                 pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
                 reminders=daily_reminders_context() if spec.id == REMINDERS_SCRIPT_ID else None,
@@ -468,6 +477,29 @@ async def save_golf_config(request: Request):
     data.update({"sites": sites, "last_saved_at": saved_at})
     await asyncio.to_thread(_write_golf_config, data)
     return RedirectResponse(f"/scripts/{GOLF_SCRIPT_ID}", status_code=303)
+
+
+@app.post("/scripts/golf-non-runner-check/check-betfair")
+async def start_golf_betfair_check(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    if not _golf_context()["configured"]:
+        return RedirectResponse(f"/scripts/{GOLF_SCRIPT_ID}?error=missing-golf-urls", status_code=303)
+    await asyncio.to_thread(golf_betfair_check_service.start)
+    return RedirectResponse(f"/scripts/{GOLF_SCRIPT_ID}", status_code=303)
+
+
+@app.get("/scripts/golf-non-runner-check/betfair-status", response_class=HTMLResponse)
+async def golf_betfair_status(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    return templates.TemplateResponse(
+        request,
+        "partials/golf_betfair_panel.html",
+        template_context(request, golf_betfair=_golf_betfair_context()),
+    )
 
 
 @app.post("/scripts/ufc-live-start-scanner/config")

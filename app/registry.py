@@ -80,10 +80,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "scripts/Golf_Exchange_NR_Checks.py",
         ("--repeat-minutes", "5"),
         long_running=True,
-        allowed_window=RunWindow("07:00", "23:00"),
-        timeout_seconds=17 * 60 * 60,
-        auto_start_times=("07:00",),
-        auto_stop_times=("23:00",),
+        timeout_seconds=10 * 365 * 24 * 60 * 60,
         auto_start_on_hub_start=True,
     ),
     script(

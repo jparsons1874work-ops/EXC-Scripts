@@ -179,6 +179,33 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertEqual(reading["field"], ["Alice Player"])
         self.assertEqual(reading["alternates"], ["Reserve Person"])
 
+    def test_scanner_status_messages_include_enabled_urls(self) -> None:
+        sites = [
+            (
+                "pgatour",
+                self.site,
+                self.url,
+                "2026-08-24T12:00:00Z",
+            )
+        ]
+
+        active = golf.scanner_status_message(True, sites)
+        offline = golf.scanner_status_message(False, sites)
+
+        self.assertIn("scanner active", active)
+        self.assertIn(self.url, active)
+        self.assertIn("scanner offline", offline)
+        self.assertIn(self.url, offline)
+
+    def test_scanner_status_uses_golf_slack_destination(self) -> None:
+        sites = [("pgatour", self.site, self.url, "")]
+        with patch.object(golf, "send_slack_text", return_value=None) as send:
+            sent = golf.announce_scanner_status(True, {"sites": []}, sites)
+
+        self.assertTrue(sent)
+        self.assertIn(self.url, send.call_args.args[1])
+        self.assertEqual(send.call_args.kwargs["timeout"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import time
 import unicodedata
@@ -102,6 +103,10 @@ NAME_LOOKS_ABBREVIATED = re.compile(r"^\w\.\s")
 
 class ConfigError(RuntimeError):
     """Raised when the weekly site configuration is missing or invalid."""
+
+
+class ScannerStop(RuntimeError):
+    """Raised by a termination signal so the offline alert can be attempted."""
 
 
 @dataclass
@@ -573,14 +578,11 @@ def slack_message(label: str, added: list[dict[str, Any]], removed: list[str]) -
     return text
 
 
-def post_to_slack(
-    config: dict[str, Any], label: str, added: list[dict[str, Any]], removed: list[str]
-) -> Optional[str]:
+def send_slack_text(config: dict[str, Any], text: str, timeout: float = 10) -> Optional[str]:
     webhook, token, channel = slack_configuration(config)
-    text = slack_message(label, added, removed)
     try:
         if webhook:
-            response = requests.post(webhook, json={"text": text}, timeout=10)
+            response = requests.post(webhook, json={"text": text}, timeout=timeout)
             if response.status_code != 200:
                 return f"Slack webhook returned status {response.status_code}."
             return None
@@ -589,7 +591,7 @@ def post_to_slack(
                 "https://slack.com/api/chat.postMessage",
                 headers={"Authorization": f"Bearer {token}"},
                 json={"channel": channel, "text": text},
-                timeout=10,
+                timeout=timeout,
             )
             payload = response.json() if response.content else {}
             if response.status_code != 200 or not payload.get("ok"):
@@ -598,6 +600,46 @@ def post_to_slack(
     except Exception as exc:
         return f"Slack post failed: {exc}"
     return "No Golf Slack webhook or bot token/channel is configured."
+
+
+def post_to_slack(
+    config: dict[str, Any], label: str, added: list[dict[str, Any]], removed: list[str]
+) -> Optional[str]:
+    return send_slack_text(config, slack_message(label, added, removed))
+
+
+def scanner_status_message(active: bool, sites: list[tuple[str, dict[str, Any], str, str]]) -> str:
+    if active:
+        lines = ["🟢 *Golf official field scanner active*", "Checking every 5 minutes:"]
+        lines.extend(f"• *{site_def['label']}:* <{url}|official field page>" for _, site_def, url, _ in sites)
+    else:
+        lines = ["🔴 *Golf official field scanner offline*", "The continuous official-field checks have stopped."]
+        if sites:
+            lines.append("Configured competitions at shutdown:")
+            lines.extend(f"• *{site_def['label']}:* <{url}|official field page>" for _, site_def, url, _ in sites)
+    return "\n".join(lines)
+
+
+def announce_scanner_status(active: bool, config: dict[str, Any], sites: list[tuple[str, dict[str, Any], str, str]]) -> bool:
+    error = send_slack_text(config, scanner_status_message(active, sites), timeout=5)
+    if error:
+        log(f"ERROR sending Golf scanner {'active' if active else 'offline'} message: {error}")
+        return False
+    log(f"Golf scanner {'active' if active else 'offline'} message sent to Slack.")
+    return True
+
+
+def configured_status_message() -> tuple[dict[str, Any], list[tuple[str, dict[str, Any], str, str]]] | None:
+    try:
+        config = load_config()
+        return config, configured_sites(config)
+    except ConfigError as exc:
+        log(f"Scanner active Slack message pending valid weekly URLs: {exc}")
+        return None
+
+
+def _raise_scanner_stop(signum, _frame) -> None:
+    raise ScannerStop(f"received signal {signum}")
 
 
 def run_cycle() -> int:
@@ -667,21 +709,35 @@ def main() -> int:
         return 2
 
     log("Starting official Golf field checker.")
-    while True:
-        try:
-            exit_code = run_cycle()
-        except Exception as exc:
-            log(f"ERROR: Golf check cycle failed before all tours could be checked: {exc}")
-            exit_code = 1
-        if args.once:
-            return exit_code
-        delay_seconds = args.repeat_minutes * 60
-        log(f"Next Golf field check in {args.repeat_minutes:g} minutes.")
-        try:
+    if args.once:
+        return run_cycle()
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, _raise_scanner_stop)
+    active_announced = False
+    status_config: dict[str, Any] = {}
+    status_sites: list[tuple[str, dict[str, Any], str, str]] = []
+    try:
+        while True:
+            if not active_announced:
+                status = configured_status_message()
+                if status is not None:
+                    status_config, status_sites = status
+                    active_announced = announce_scanner_status(True, status_config, status_sites)
+            try:
+                run_cycle()
+            except Exception as exc:
+                log(f"ERROR: Golf check cycle failed before all tours could be checked: {exc}")
+            delay_seconds = args.repeat_minutes * 60
+            log(f"Next Golf field check in {args.repeat_minutes:g} minutes.")
             time.sleep(delay_seconds)
-        except KeyboardInterrupt:
-            log("Golf field checker stopped.")
-            return 0
+    except (KeyboardInterrupt, ScannerStop) as exc:
+        log(f"Golf field checker stopping ({exc}).")
+        return 0
+    finally:
+        if active_announced:
+            announce_scanner_status(False, status_config, status_sites)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

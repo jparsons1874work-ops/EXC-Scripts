@@ -37,7 +37,7 @@ Required values depend on which scripts you run:
 - `APP_PASSWORD` protects the app. If absent, local dev is allowed with a visible warning.
 - Betfair scripts need `BETFAIR_USERNAME`, `BETFAIR_PASSWORD`, `BETFAIR_APP_KEY`, and cert/key file paths or B64 cert values.
 - Decimal scripts need `DECIMAL_USERNAME` and `DECIMAL_PASSWORD`.
-- Golf - Non-Runner Check reads the four tours' official JavaScript-rendered field pages. Install Playwright Chromium once on each machine, then save the current tournament URLs on the Golf page in the Hub. See `scripts/GOLF_FIELD_CHECKER_README.md`.
+- Golf - Non-Runner Check reads the four tours' official JavaScript-rendered field pages continuously. Install Playwright Chromium once on each machine, then save the current tournament URLs on the Golf page in the Hub. Its user-triggered Betfair comparison also requires the standard Betfair API credentials and certificates. See `scripts/GOLF_FIELD_CHECKER_README.md`.
 - Golf - Non-Runner Check Slack notifications should use `GOLF_NR_SLACK_WEBHOOK_URL`, or `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`. If using bot token/channel, invite the bot to the target Slack channel and grant `chat:write`.
 - Tennis integrity Slack notifications use `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the tennis-specific value is missing.
 - Betfair duplicate match and duplicate market Slack notifications use `DUPE_MATCH_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the duplicate-specific value is missing.

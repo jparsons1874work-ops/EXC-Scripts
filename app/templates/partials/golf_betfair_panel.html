@@ -1,0 +1,95 @@
+<section
+  class="panel reminders-panel"
+  id="golf-betfair-panel"
+  {% if golf_betfair.status == "running" %}
+  hx-get="/scripts/golf-non-runner-check/betfair-status"
+  hx-trigger="every 3s"
+  hx-swap="outerHTML"
+  {% endif %}
+>
+  <div class="panel-header">
+    <h2>Betfair Exchange Field Comparison</h2>
+    {% if golf_betfair.completed_at_label %}
+    <span class="meta">Last completed {{ golf_betfair.completed_at_label }} UK</span>
+    {% elif golf_betfair.started_at_label %}
+    <span class="meta">Started {{ golf_betfair.started_at_label }} UK</span>
+    {% endif %}
+  </div>
+
+  {% if golf_betfair.status == "running" %}
+  <div class="message">Checking active Betfair Exchange Golf winner markets. The official-site monitor continues running independently.</div>
+  {% elif golf_betfair.status == "failed" %}
+  <div class="error">Betfair field check failed: {{ golf_betfair.error or "Unknown error" }}</div>
+  {% elif golf_betfair.status == "idle" %}
+  <div class="message">Use <strong>Check with Betfair</strong> to compare every enabled official field with its active Betfair Exchange winner market.</div>
+  {% else %}
+    {% if golf_betfair.summary == "matching" %}
+    <div class="message"><span class="state-label state-ok">All matching</span> Every checked official field matches Betfair.</div>
+    {% elif golf_betfair.summary == "mismatch" %}
+    <div class="error"><span class="state-label state-warn">Mismatch found</span> A fresh Golf Slack alert was attempted for this run.</div>
+    {% else %}
+    <div class="warning">Some competitions need attention before they can be compared.</div>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Competition</th>
+            <th>Result</th>
+            <th>Official field</th>
+            <th>Betfair event / field</th>
+            <th>Difference</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in golf_betfair.rows %}
+          <tr>
+            <td><strong>{{ row.competition }}</strong></td>
+            <td>
+              {% if row.status == "matching" %}
+              <span class="state-label state-ok">Matching</span>
+              {% elif row.status == "mismatch" %}
+              <span class="state-label state-warn">Mismatch</span>
+              {% elif row.status == "not_ready" %}
+              <span class="state-label state-muted">Baseline not ready</span>
+              {% elif row.status == "event_not_found" %}
+              <span class="state-label state-warn">Event not matched</span>
+              {% else %}
+              <span class="state-label state-warn">Check error</span>
+              {% endif %}
+            </td>
+            <td>{{ row.official_count }}</td>
+            <td>
+              {% if row.betfair_event_name %}
+              <strong>{{ row.betfair_event_name }}</strong><br>
+              {{ row.betfair_count if row.betfair_count is not none else "-" }} players
+              {% if row.betfair_market_id %}<br><span class="meta">{{ row.betfair_market_id }}</span>{% endif %}
+              {% else %}
+              <span class="meta">Not available</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.status == "matching" %}
+              No differences
+              {% elif row.status == "mismatch" %}
+                {% for player in row.official_only %}
+                <strong>{{ player }}</strong> — official field only{% if not loop.last or row.betfair_only %}<br>{% endif %}
+                {% endfor %}
+                {% for player in row.betfair_only %}
+                <strong>{{ player }}</strong> — Betfair only{% if not loop.last %}<br>{% endif %}
+                {% endfor %}
+              {% else %}
+              {{ row.message }}
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if golf_betfair.mismatch_count %}
+    <div class="meta">Slack result: {{ golf_betfair.slack_status }}</div>
+    {% endif %}
+  {% endif %}
+</section>
