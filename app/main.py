@@ -10,6 +10,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -17,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.auth import clear_login_cookie, is_authenticated, password_configured, require_auth, set_login_cookie, verify_password
-from app.config import APP_DIR, CONFIG_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
+from app.config import APP_DIR, CONFIG_DIR, OUTPUT_DIR, PROJECT_ROOT, app_password, branding_assets, ensure_runtime_dirs
 from app.cricket_fixture_api import fixture_refresh_service, router as cricket_fixture_api_router
 from app.parsers import parse_cricket_time_check_output, parse_inplay_checker_state
 from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
@@ -38,6 +39,7 @@ PARSER_TIMEOUT_SECONDS = 2.0
 _parser_locks = {script_id: threading.Lock() for script_id in SCRIPTS_BY_ID}
 GOLF_SCRIPT_ID = "golf-non-runner-check"
 GOLF_CONFIG_PATH = CONFIG_DIR / "golf_field_checker.json"
+GOLF_STATE_DIR = OUTPUT_DIR / "golf_field_checker"
 GOLF_SITES = (
     ("pgatour", "PGA Tour", ("pgatour.com", "www.pgatour.com")),
     ("pgachampions", "PGA Tour Champions", ("pgatour.com", "www.pgatour.com")),
@@ -90,6 +92,31 @@ def _write_golf_config(data: dict[str, Any]) -> None:
     temporary.replace(GOLF_CONFIG_PATH)
 
 
+def _read_golf_state(site_id: str) -> dict[str, Any]:
+    path = GOLF_STATE_DIR / f"{site_id}.json"
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("golf_state_read_failed path=%s error=%r", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _golf_time_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo("Europe/London")).strftime("%d %b %Y %H:%M:%S")
+    except ValueError:
+        return raw
+
+
 def _golf_context() -> dict[str, Any]:
     data = _read_golf_config()
     configured = {
@@ -98,18 +125,49 @@ def _golf_context() -> dict[str, Any]:
         if isinstance(item, dict)
     }
     sites = []
+    changes: list[dict[str, Any]] = []
     for site_id, label, _ in GOLF_SITES:
         item = configured.get(site_id, {})
+        url = str(item.get("url", "") or "")
+        config_saved_at = str(item.get("url_saved_at", "") or "")
+        state = _read_golf_state(site_id)
+        state_matches_url = bool(
+            url
+            and str(state.get("baseline_url", "") or "") == url
+            and str(state.get("config_saved_at", "") or "") == config_saved_at
+        )
+        field = list(state.get("confirmed_field", []) or []) if state_matches_url else []
+        reserves = list(state.get("confirmed_alternates", []) or []) if state_matches_url else []
+        if state_matches_url:
+            for change in state.get("change_history", []) or []:
+                if not isinstance(change, dict):
+                    continue
+                changes.append(
+                    {
+                        "competition": label,
+                        "timestamp_raw": str(change.get("timestamp", "") or ""),
+                        "timestamp": _golf_time_label(change.get("timestamp")),
+                        "change": str(change.get("change", "") or ""),
+                        "player": str(change.get("player", "") or ""),
+                        "note": str(change.get("note", "") or ""),
+                    }
+                )
         sites.append(
             {
                 "id": site_id,
                 "label": label,
-                "url": str(item.get("url", "") or ""),
+                "url": url,
                 "enabled": bool(item.get("enabled")),
+                "tracking_since": _golf_time_label(item.get("url_saved_at")),
+                "last_checked": _golf_time_label(state.get("last_checked_at")) if state_matches_url else "",
+                "field_count": len(field) if state_matches_url else None,
+                "reserve_count": len(reserves) if state_matches_url else None,
             }
         )
+    changes.sort(key=lambda item: item["timestamp_raw"], reverse=True)
     return {
         "sites": sites,
+        "changes": changes,
         "configured": any(item["enabled"] and item["url"] for item in sites),
         "last_saved_at": str(data.get("last_saved_at", "") or ""),
     }
@@ -380,6 +438,13 @@ async def save_golf_config(request: Request):
     if auth_redirect:
         return auth_redirect
     form = dict(await request.form())
+    data = _read_golf_config()
+    previous_sites = {
+        str(item.get("id", "")): item
+        for item in data.get("sites", [])
+        if isinstance(item, dict)
+    }
+    saved_at = _utc_timestamp()
     sites: list[dict[str, Any]] = []
     for site_id, _, _ in GOLF_SITES:
         url = str(form.get(f"{site_id}_url", "") or "").strip()
@@ -389,11 +454,19 @@ async def save_golf_config(request: Request):
                 f"/scripts/{GOLF_SCRIPT_ID}?error=invalid-golf-url&site={site_id}",
                 status_code=303,
             )
-        sites.append({"id": site_id, "enabled": enabled, "url": url})
-    await asyncio.to_thread(
-        _write_golf_config,
-        {"sites": sites, "last_saved_at": _utc_timestamp()},
-    )
+        previous = previous_sites.get(site_id, {})
+        previous_url = str(previous.get("url", "") or "")
+        url_saved_at = str(previous.get("url_saved_at", "") or "") if previous_url == url else saved_at
+        sites.append(
+            {
+                "id": site_id,
+                "enabled": enabled,
+                "url": url,
+                "url_saved_at": url_saved_at if url else "",
+            }
+        )
+    data.update({"sites": sites, "last_saved_at": saved_at})
+    await asyncio.to_thread(_write_golf_config, data)
     return RedirectResponse(f"/scripts/{GOLF_SCRIPT_ID}", status_code=303)
 
 

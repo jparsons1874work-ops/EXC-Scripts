@@ -46,6 +46,96 @@
 </section>
 {% endif %}
 
+{% if spec.id == "golf-non-runner-check" %}
+<section class="panel reminders-panel">
+  <div class="panel-header">
+    <h2>Tracked Competitions</h2>
+    <span class="meta">Times shown in UK time</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Competition</th>
+          <th>Status</th>
+          <th>Field</th>
+          <th>Reserves</th>
+          <th>Tracking since</th>
+          <th>Last successful check</th>
+          <th>Official page</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for site in golf.sites %}
+        <tr>
+          <td><strong>{{ site.label }}</strong></td>
+          <td>
+            {% if site.enabled %}
+            <span class="state-label state-ok">Enabled</span>
+            {% else %}
+            <span class="state-label state-muted">Disabled</span>
+            {% endif %}
+          </td>
+          <td>{% if site.field_count is not none %}{{ site.field_count }}{% else %}-{% endif %}</td>
+          <td>{% if site.reserve_count is not none %}{{ site.reserve_count }}{% else %}-{% endif %}</td>
+          <td>{{ site.tracking_since or "Not configured" }}</td>
+          <td>{{ site.last_checked or "Not checked yet" }}</td>
+          <td>
+            {% if site.url %}
+            <a href="{{ site.url }}" target="_blank" rel="noopener noreferrer">Open field page</a>
+            {% else %}
+            <span class="meta">No link saved</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel reminders-panel">
+  <div class="panel-header">
+    <h2>Confirmed Field Changes</h2>
+    <span class="meta">Since each current tournament link was entered</span>
+  </div>
+  {% if golf.changes %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time (UK)</th>
+          <th>Competition</th>
+          <th>Change</th>
+          <th>Player</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for change in golf.changes %}
+        <tr>
+          <td>{{ change.timestamp }}</td>
+          <td>{{ change.competition }}</td>
+          <td>
+            {% if change.change == "Addition" %}
+            <span class="state-label state-ok">Addition</span>
+            {% else %}
+            <span class="state-label state-warn">Withdrawal</span>
+            {% endif %}
+          </td>
+          <td><strong>{{ change.player }}</strong></td>
+          <td>{{ change.note or "-" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="message">No confirmed additions or withdrawals have been recorded for the current tournament links.</div>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="detail-layout">
   <div class="panel">
     <div class="panel-header">

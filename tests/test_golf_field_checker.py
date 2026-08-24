@@ -85,6 +85,14 @@ class GolfFieldCheckerTests(unittest.TestCase):
 
     def test_new_tournament_url_resets_without_alerting(self) -> None:
         self.evaluate_and_commit(["Alice Player", "Bob Golfer"])
+        self.states["pgatour"]["change_history"] = [
+            {
+                "timestamp": "2026-08-24T10:00:00Z",
+                "change": "Addition",
+                "player": "Old Tournament Player",
+                "note": "",
+            }
+        ]
         new_url = "https://www.pgatour.com/tournaments/2026/new/R2026002/field"
 
         result = golf.evaluate_reading(
@@ -92,7 +100,36 @@ class GolfFieldCheckerTests(unittest.TestCase):
         )
 
         self.assertFalse(result.slack_needed)
-        self.assertIn("new tournament URL", result.status_lines[0])
+        self.assertIn("new tournament configuration", result.status_lines[0])
+        self.assertEqual(result.proposed_state["change_history"], [])
+
+    def test_confirmed_changes_are_appended_to_history(self) -> None:
+        self.evaluate_and_commit(["Alice Player", "Bob Golfer"], ["Cara Golfer"])
+        self.evaluate_and_commit(["Alice Player", "Cara Golfer"])
+        result = golf.evaluate_reading(
+            "pgatour", self.site, self.url, ["Alice Player", "Cara Golfer"], []
+        )
+
+        with patch.object(golf, "utc_timestamp", return_value="2026-08-24T14:15:00Z"):
+            golf.append_change_history(result)
+
+        self.assertEqual(
+            result.proposed_state["change_history"],
+            [
+                {
+                    "timestamp": "2026-08-24T14:15:00Z",
+                    "change": "Addition",
+                    "player": "Cara Golfer",
+                    "note": "Promoted from reserve list",
+                },
+                {
+                    "timestamp": "2026-08-24T14:15:00Z",
+                    "change": "Withdrawal",
+                    "player": "Bob Golfer",
+                    "note": "",
+                },
+            ],
+        )
 
     def test_uncommitted_alert_is_retried_after_slack_failure(self) -> None:
         self.evaluate_and_commit(["Alice Player", "Bob Golfer"])

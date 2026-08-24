@@ -11,6 +11,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
@@ -116,6 +117,10 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     if not path.exists():
         raise ConfigError(
@@ -144,8 +149,8 @@ def validate_site_url(tour_id: str, url: str) -> Optional[str]:
     return None
 
 
-def configured_sites(config: dict[str, Any]) -> list[tuple[str, dict[str, Any], str]]:
-    enabled: list[tuple[str, dict[str, Any], str]] = []
+def configured_sites(config: dict[str, Any]) -> list[tuple[str, dict[str, Any], str, str]]:
+    enabled: list[tuple[str, dict[str, Any], str, str]] = []
     errors: list[str] = []
     seen_ids: set[str] = set()
 
@@ -165,7 +170,14 @@ def configured_sites(config: dict[str, Any]) -> list[tuple[str, dict[str, Any], 
         if url_error:
             errors.append(f"{SITE_DEFINITIONS[tour_id]['label']}: {url_error}")
             continue
-        enabled.append((tour_id, SITE_DEFINITIONS[tour_id], url))
+        enabled.append(
+            (
+                tour_id,
+                SITE_DEFINITIONS[tour_id],
+                url,
+                str(site_cfg.get("url_saved_at", "") or ""),
+            )
+        )
 
     if errors:
         raise ConfigError("Invalid golf field configuration: " + "; ".join(errors))
@@ -323,15 +335,18 @@ def evaluate_reading(
     url: str,
     live_field: list[str],
     live_alternates: list[str],
+    config_saved_at: str = "",
 ) -> DiffResult:
     result = DiffResult()
     state = load_state(tour_id)
     previous_field = state.get("confirmed_field")
     previous_alternates = state.get("confirmed_alternates", [])
     previous_url = state.get("baseline_url")
+    previous_config_saved_at = str(state.get("config_saved_at", "") or "")
     reject_streak = int(state.get("reject_streak", 0) or 0)
     miss_streaks = dict(state.get("miss_streaks", {}) or {})
     seen_streaks = dict(state.get("seen_streaks", {}) or {})
+    promotion_candidates = set(state.get("promotion_candidates", []) or [])
 
     if not live_field:
         result.status_lines.append(
@@ -339,15 +354,20 @@ def evaluate_reading(
         )
         return result
 
-    if previous_url and previous_url != url:
+    url_changed = bool(previous_url and previous_url != url)
+    configuration_changed = bool(config_saved_at and config_saved_at != previous_config_saved_at)
+    if url_changed or configuration_changed:
         result.status_lines.append(
-            f"{site_def['label']}: new tournament URL detected; resetting the baseline quietly."
+            f"{site_def['label']}: new tournament configuration detected; resetting the baseline quietly."
         )
         previous_field = None
         previous_alternates = []
         miss_streaks = {}
         seen_streaks = {}
+        promotion_candidates = set()
         reject_streak = 0
+        state["change_history"] = []
+        state["tracking_started_at"] = utc_timestamp()
 
     if (
         previous_field
@@ -374,7 +394,9 @@ def evaluate_reading(
                     "reject_streak": reject_streak,
                     "miss_streaks": miss_streaks,
                     "seen_streaks": seen_streaks,
+                    "promotion_candidates": sorted(promotion_candidates),
                     "baseline_url": url,
+                    "config_saved_at": config_saved_at,
                 }
             )
             save_state(tour_id, state)
@@ -390,6 +412,8 @@ def evaluate_reading(
         new_confirmed_field = list(live_field)
         miss_streaks = {}
         seen_streaks = {}
+        promotion_candidates = set()
+        state.setdefault("tracking_started_at", utc_timestamp())
     else:
         confirmed_set = set(previous_field)
         current_set = set(live_field)
@@ -404,9 +428,12 @@ def evaluate_reading(
             miss_streaks.pop(name, None)
         for name in added_raw:
             seen_streaks[name] = int(seen_streaks.get(name, 0)) + 1
+            if name in previous_alternate_set:
+                promotion_candidates.add(name)
         for name in list(seen_streaks):
             if name not in added_raw:
                 seen_streaks.pop(name, None)
+                promotion_candidates.discard(name)
 
         confirmed_removed = [
             name for name in missing_raw if miss_streaks.get(name, 0) >= required_streak
@@ -421,7 +448,7 @@ def evaluate_reading(
 
         if confirmed_added or confirmed_removed:
             result.added = [
-                {"name": name, "promoted": name in previous_alternate_set}
+                {"name": name, "promoted": name in promotion_candidates}
                 for name in confirmed_added
             ]
             result.removed = confirmed_removed
@@ -443,22 +470,59 @@ def evaluate_reading(
         new_confirmed_field = [
             name for name in previous_field if name not in confirmed_removed
         ] + confirmed_added
+        for name in confirmed_added:
+            promotion_candidates.discard(name)
 
     state.update(
         {
             "confirmed_field": new_confirmed_field,
             "confirmed_alternates": list(live_alternates),
             "baseline_url": url,
+            "config_saved_at": config_saved_at,
             "reject_streak": reject_streak,
             "miss_streaks": miss_streaks,
             "seen_streaks": seen_streaks,
+            "promotion_candidates": sorted(promotion_candidates),
+            "last_checked_at": utc_timestamp(),
         }
     )
     result.proposed_state = state
     return result
 
 
-def process_tour(tour_id: str, site_def: dict[str, Any], url: str, browser: Browser) -> DiffResult:
+def append_change_history(result: DiffResult) -> None:
+    if result.proposed_state is None or not result.slack_needed:
+        return
+    timestamp = utc_timestamp()
+    history = list(result.proposed_state.get("change_history", []) or [])
+    for item in result.added:
+        history.append(
+            {
+                "timestamp": timestamp,
+                "change": "Addition",
+                "player": item["name"],
+                "note": "Promoted from reserve list" if item.get("promoted") else "",
+            }
+        )
+    for player in result.removed:
+        history.append(
+            {
+                "timestamp": timestamp,
+                "change": "Withdrawal",
+                "player": player,
+                "note": "",
+            }
+        )
+    result.proposed_state["change_history"] = history
+
+
+def process_tour(
+    tour_id: str,
+    site_def: dict[str, Any],
+    url: str,
+    config_saved_at: str,
+    browser: Browser,
+) -> DiffResult:
     page = browser.new_page(viewport={"width": 1280, "height": 900})
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -466,7 +530,14 @@ def process_tour(tour_id: str, site_def: dict[str, Any], url: str, browser: Brow
         reading = read_field(page, site_def)
     finally:
         page.close()
-    return evaluate_reading(tour_id, site_def, url, reading["field"], reading["alternates"])
+    return evaluate_reading(
+        tour_id,
+        site_def,
+        url,
+        reading["field"],
+        reading["alternates"],
+        config_saved_at,
+    )
 
 
 def slack_configuration(config: dict[str, Any]) -> tuple[str, str, str]:
@@ -548,10 +619,10 @@ def run_cycle() -> int:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
-            for tour_id, site_def, url in sites:
+            for tour_id, site_def, url, config_saved_at in sites:
                 log(f"--- Checking {site_def['label']} ---")
                 try:
-                    result = process_tour(tour_id, site_def, url, browser)
+                    result = process_tour(tour_id, site_def, url, config_saved_at, browser)
                 except Exception as exc:
                     log(f"ERROR checking {site_def['label']}: {exc}")
                     exit_code = 1
@@ -568,6 +639,7 @@ def run_cycle() -> int:
                         exit_code = 1
                         continue
                     log(f"{site_def['label']}: Slack field update sent.")
+                    append_change_history(result)
 
                 if result.proposed_state is not None:
                     save_state(tour_id, result.proposed_state)

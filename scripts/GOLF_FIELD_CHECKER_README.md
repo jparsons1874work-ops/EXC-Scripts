@@ -35,6 +35,12 @@ The checker reloads this configuration before every cycle, so saving URLs does
 not require a process restart. Runtime configuration is stored in
 `runtime/config/golf_field_checker.json` and is intentionally ignored by Git.
 
+The Golf page also shows all four competitions with their current field and
+reserve counts, tracking start time, latest successful check, and official
+link. Its confirmed-change table records every addition and withdrawal for the
+current tournament URL with a UK timestamp. Changing a tournament URL hides
+the old tournament's history and starts a new history with the silent baseline.
+
 ## Slack and state
 
 Slack continues to use `GOLF_NR_SLACK_WEBHOOK_URL`, or
