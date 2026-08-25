@@ -63,7 +63,10 @@
             <td>
               {% if row.betfair_event_name %}
               <strong>{{ row.betfair_event_name }}</strong><br>
-              {{ row.betfair_count if row.betfair_count is not none else "-" }} players
+              {{ row.betfair_count if row.betfair_count is not none else "-" }} selections
+              {% if row.betfair_compared_count is defined and row.betfair_compared_count != row.betfair_count %}
+              <br><span class="meta">{{ row.betfair_compared_count }} golfers compared; {{ row.betfair_count - row.betfair_compared_count }} market options ignored</span>
+              {% endif %}
               {% if row.betfair_market_id %}<br><span class="meta">{{ row.betfair_market_id }}</span>{% endif %}
               {% else %}
               <span class="meta">Not available</span>

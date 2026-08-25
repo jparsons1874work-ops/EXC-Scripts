@@ -107,16 +107,18 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "allowed_hosts": {"lpga.com", "www.lpga.com"},
         "link_pattern": r"/athletes/",
         "link_selector": 'a[href*="/athletes/"]',
+        "row_selector": 'tr, [role="row"]',
         "ready_selector": "text=Entered",
         "name_text_mode": "full",
         "boundary_pattern": None,
         "min_field_before_boundary_check": None,
         "membership_ancestor_pattern": r"\b(?:entered|reserve\s*#\d+)\b",
         "reserve_ancestor_pattern": r"\breserve\s*#\d+\b",
+        "allow_name_suffix_digit": True,
         "required_confirm_streak": 4,
         "allow_auto_giveup": False,
         # Rebuild the old all-players baseline silently when this reader lands.
-        "reader_revision": "lpga-explicit-reserves-v1",
+        "reader_revision": "lpga-entry-rows-v2",
     },
 }
 
@@ -254,13 +256,15 @@ def format_name(raw: str) -> str:
     return re.sub(r"\w\S*", title_word, collapsed)
 
 
-def is_valid_name(name: str) -> bool:
+def is_valid_name(name: str, allow_suffix_digit: bool = False) -> bool:
     if not (1 < len(name) < 40):
         return False
     if not any(unicodedata.category(character).startswith("L") for character in name):
         return False
     if any(character.isdigit() for character in name):
-        return False
+        suffix_digits = re.findall(r"\d", name)
+        if not allow_suffix_digit or len(suffix_digits) != 1 or not re.search(r"[A-Za-z]\d$", name):
+            return False
     return not NAME_LOOKS_ABBREVIATED.match(name)
 
 
@@ -334,8 +338,10 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
     min_before_boundary = site_def["min_field_before_boundary_check"] or 0
     link_selector = site_def.get("link_selector") or f'a[href*="{site_def["link_pattern"]}"]'
     name_text_mode = site_def.get("name_text_mode", "full")
+    row_selector = site_def.get("row_selector") or ""
     membership_ancestor_pattern = site_def.get("membership_ancestor_pattern") or ""
     reserve_ancestor_pattern = site_def.get("reserve_ancestor_pattern") or ""
+    allow_name_suffix_digit = bool(site_def.get("allow_name_suffix_digit"))
     seen: set[str] = set()
     field_names: list[str] = []
     alternate_names: list[str] = []
@@ -347,6 +353,7 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
             """
             ({
               linkSelector,
+              rowSelector,
               nameTextMode,
               boundaryPattern,
               minBeforeBoundary,
@@ -363,6 +370,38 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
               const reserveRegex = reserveAncestorPattern
                 ? new RegExp(reserveAncestorPattern, 'i')
                 : null;
+
+              // LPGA includes valid entrants without athlete-profile links.
+              // Read the complete entry row so those golfers are retained and
+              // the explicit Entered / Reserve status remains authoritative.
+              if (rowSelector && membershipRegex) {
+                const rows = Array.from(document.querySelectorAll(rowSelector));
+                for (const row of rows) {
+                  const rowText = (row.innerText || row.textContent || '')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                  if (!rowText || rowText.length >= 500) continue;
+                  const statusMatch = membershipRegex.exec(rowText);
+                  if (!statusMatch) continue;
+                  let rawName = rowText.slice(0, statusMatch.index).trim();
+                  rawName = rawName
+                    .replace(/^(?:\\d+|\\*+)\\s+/, '')
+                    .replace(/\\s+[A-Z]{3}(?:\\s+[A-Z]{3})?$/, '')
+                    .replace(/\\s*\\(a\\)$/, '')
+                    .trim();
+                  if (!rawName) continue;
+                  const athleteLink = row.querySelector(linkSelector);
+                  items.push({
+                    type: 'link',
+                    href: athleteLink ? athleteLink.getAttribute('href') || '' : '',
+                    text: rawName,
+                    fromRow: true,
+                    isReserve: reserveRegex ? reserveRegex.test(rowText) : false
+                  });
+                }
+                return items;
+              }
+
               const events = Array.from(document.querySelectorAll(linkSelector))
                 .map(element => ({type: 'link', node: element}));
 
@@ -442,6 +481,7 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
             """,
             {
                 "linkSelector": link_selector,
+                "rowSelector": row_selector,
                 "nameTextMode": name_text_mode,
                 "boundaryPattern": site_def.get("boundary_pattern") or "",
                 "minBeforeBoundary": min_before_boundary,
@@ -460,10 +500,10 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
                 ):
                     past_boundary = True
                 continue
-            if not link_pattern.search(item["href"]):
+            if not item.get("fromRow") and not link_pattern.search(item["href"]):
                 continue
             name = format_name(item["text"])
-            if is_valid_name(name) and name not in seen:
+            if is_valid_name(name, allow_name_suffix_digit) and name not in seen:
                 seen.add(name)
                 (alternate_names if past_boundary or item.get("isReserve") else field_names).append(name)
 

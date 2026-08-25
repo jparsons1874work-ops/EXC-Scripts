@@ -81,6 +81,27 @@ class GolfBetfairCheckTests(unittest.TestCase):
         self.assertEqual(result["official_only"], [])
         self.assertEqual(result["betfair_only"], [])
 
+    def test_lpga_lee_suffix_matches_betfair_name(self) -> None:
+        with patch.object(checker, "load_name_aliases", return_value={}):
+            result = checker.compare_player_lists(
+                ["Jeongeun Lee5"],
+                ["JeongEun Lee"],
+            )
+
+        self.assertTrue(result["matching"])
+
+    def test_betfair_count_keeps_ignored_market_options_visible(self) -> None:
+        with patch.object(checker, "load_name_aliases", return_value={}):
+            result = checker.compare_player_lists(
+                ["Alice Player"],
+                ["Alice Player", "Any Other Player", "Field", "The Field"],
+            )
+
+        self.assertTrue(result["matching"])
+        self.assertEqual(result["betfair_count"], 4)
+        self.assertEqual(result["betfair_compared_count"], 1)
+        self.assertEqual(len(result["ignored_betfair"]), 3)
+
     def test_catalogue_selection_prefers_main_winner_market(self) -> None:
         event = SimpleNamespace(id="event-1", name="Test Open")
         top_five = SimpleNamespace(
@@ -104,7 +125,7 @@ class GolfBetfairCheckTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].market_id, "1.winner")
 
-    def test_only_active_betfair_runners_are_compared(self) -> None:
+    def test_all_catalogue_selections_are_compared(self) -> None:
         event = checker.BetfairEvent(
             "event-1",
             "Test Open",
@@ -115,17 +136,9 @@ class GolfBetfairCheckTests(unittest.TestCase):
                 SimpleNamespace(selection_id=2, runner_name="Withdrawn Golfer"),
             ],
         )
-        book = SimpleNamespace(
-            runners=[
-                SimpleNamespace(selection_id=1, status="ACTIVE"),
-                SimpleNamespace(selection_id=2, status="REMOVED"),
-            ]
-        )
-        client = SimpleNamespace(betting=SimpleNamespace(list_market_book=Mock(return_value=[book])))
+        names = checker.betfair_selection_names(event)
 
-        names = checker.active_betfair_names(client, event)
-
-        self.assertEqual(names, ["Alice Player"])
+        self.assertEqual(names, ["Alice Player", "Withdrawn Golfer"])
 
     def test_perform_check_sends_fresh_slack_for_mismatch(self) -> None:
         official = [
@@ -152,7 +165,7 @@ class GolfBetfairCheckTests(unittest.TestCase):
             patch.object(checker, "child_environment", return_value={}),
             patch.object(checker, "betfair_login", return_value=client),
             patch.object(checker, "list_betfair_events", return_value=[event]),
-            patch.object(checker, "active_betfair_names", return_value=["Alice Player"]),
+            patch.object(checker, "betfair_selection_names", return_value=["Alice Player"]),
             patch.object(checker, "load_name_aliases", return_value={}),
             patch.object(checker, "send_discrepancy_slack", return_value="sent") as slack,
         ):

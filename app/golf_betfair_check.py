@@ -175,6 +175,9 @@ def _base_normalize_player(value: str) -> str:
         parts = [part.strip() for part in normalized.split(",", 1)]
         normalized = f"{parts[1]} {parts[0]}"
     normalized = re.sub(r"[-–—·.']", " ", normalized)
+    # LPGA uses Lee5 / Lee6 to distinguish two Jeongeun Lees. Betfair's
+    # outright market omits the suffix for the entered Lee5 player.
+    normalized = re.sub(r"(?<=[a-z])\d+\b", "", normalized)
     tokens = [token for token in re.sub(r"\s+", " ", normalized).strip().split() if token]
     if tokens and tokens[-1] in {"jr", "jnr", "sr", "ii", "iii", "iv", "v"}:
         tokens.pop()
@@ -223,8 +226,10 @@ def compare_player_lists(official_names: list[str], betfair_names: list[str]) ->
         key = player_key(name, aliases)
         if key:
             official.setdefault(key, name)
+    ignored_betfair: list[str] = []
     for name in betfair_names:
         if _base_normalize_player(name) in IGNORED_RUNNER_NAMES:
+            ignored_betfair.append(name)
             continue
         key = player_key(name, aliases)
         if key:
@@ -236,7 +241,9 @@ def compare_player_lists(official_names: list[str], betfair_names: list[str]) ->
         "official_only": official_only,
         "betfair_only": betfair_only,
         "official_count": len(official),
-        "betfair_count": len(betfair),
+        "betfair_count": len([name for name in betfair_names if str(name).strip()]),
+        "betfair_compared_count": len(betfair),
+        "ignored_betfair": ignored_betfair,
     }
 
 
@@ -286,19 +293,12 @@ def list_betfair_events(client: betfairlightweight.APIClient) -> list[BetfairEve
     return catalogue_events(list(catalogues or []))
 
 
-def active_betfair_names(client: betfairlightweight.APIClient, event: BetfairEvent) -> list[str]:
-    books = client.betting.list_market_book(market_ids=[event.market_id], price_projection=None)
-    if not books:
-        raise RuntimeError(f"Betfair returned no market book for {event.market_id}")
-    active_ids = {
-        int(getattr(runner, "selection_id"))
-        for runner in (getattr(books[0], "runners", None) or [])
-        if str(getattr(runner, "status", "") or "").upper() == "ACTIVE"
-    }
+def betfair_selection_names(event: BetfairEvent) -> list[str]:
+    """Return every selection displayed in the Exchange market catalogue."""
     return [
         str(getattr(runner, "runner_name", "") or "")
         for runner in event.runners
-        if int(getattr(runner, "selection_id")) in active_ids
+        if str(getattr(runner, "runner_name", "") or "").strip()
     ]
 
 
@@ -439,9 +439,9 @@ def perform_check() -> dict[str, Any]:
                 continue
             used_event_ids.add(event.event_id)
             try:
-                betfair_names = active_betfair_names(client, event)
+                betfair_names = betfair_selection_names(event)
                 if not betfair_names:
-                    raise RuntimeError("Betfair returned 0 active runners; skipped to avoid a false discrepancy")
+                    raise RuntimeError("Betfair returned 0 market selections; skipped to avoid a false discrepancy")
                 comparison = compare_player_lists(official["official_names"], betfair_names)
             except Exception as exc:
                 rows.append(

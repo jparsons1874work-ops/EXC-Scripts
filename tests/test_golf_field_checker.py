@@ -241,9 +241,12 @@ class GolfFieldCheckerTests(unittest.TestCase):
         markup = """
         <body>
           <div><a href="/athletes/champion">Unrelated Champion</a></div>
-          <div>1 <a href="/athletes/alice-player">Alice Player</a> Entered 1</div>
-          <h2>Reserves</h2>
-          <div>** <a href="/athletes/reserve-person">Reserve Person</a> Reserve #1 20</div>
+          <table><tbody>
+            <tr><th>1</th><td><a href="/athletes/alice-player">Alice Player</a> USA USA</td><td>Entered</td><td>1</td></tr>
+            <tr><th>2</th><td>Unlinked Golfer (a) CAN CAN</td><td>Entered</td><td>2</td></tr>
+            <tr><th>3</th><td><a href="/athletes/jeong-eun-lee5">Jeongeun Lee5</a> KOR KOR</td><td>Entered</td><td>3</td></tr>
+            <tr><th>**</th><td><a href="/athletes/reserve-person">Reserve Person</a> ENG ENG</td><td>Reserve #1</td><td>20</td></tr>
+          </tbody></table>
         </body>
         """
         with sync_playwright() as playwright:
@@ -255,7 +258,7 @@ class GolfFieldCheckerTests(unittest.TestCase):
             finally:
                 browser.close()
 
-        self.assertEqual(reading["field"], ["Alice Player"])
+        self.assertEqual(reading["field"], ["Alice Player", "Unlinked Golfer", "Jeongeun Lee5"])
         self.assertEqual(reading["alternates"], ["Reserve Person"])
 
     def test_scanner_status_messages_include_enabled_urls(self) -> None:
