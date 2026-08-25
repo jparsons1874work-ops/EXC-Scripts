@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from scripts import Golf_Exchange_NR_Checks as golf
@@ -102,6 +103,25 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertFalse(result.slack_needed)
         self.assertIn("new tournament configuration", result.status_lines[0])
         self.assertEqual(result.proposed_state["change_history"], [])
+
+    def test_lpga_reader_revision_rebuilds_field_and_reserves_silently(self) -> None:
+        site = golf.SITE_DEFINITIONS["lpga"]
+        url = "https://www.lpga.com/tournaments/test/entries"
+        self.states["lpga"] = {
+            "confirmed_field": ["Alice Player", "Reserve Person"],
+            "confirmed_alternates": [],
+            "baseline_url": url,
+        }
+
+        result = golf.evaluate_reading(
+            "lpga", site, url, ["Alice Player"], ["Reserve Person"]
+        )
+
+        self.assertFalse(result.slack_needed)
+        self.assertIn("reader updated", result.status_lines[0])
+        self.assertEqual(result.proposed_state["confirmed_field"], ["Alice Player"])
+        self.assertEqual(result.proposed_state["confirmed_alternates"], ["Reserve Person"])
+        self.assertEqual(result.proposed_state["reader_revision"], site["reader_revision"])
 
     def test_confirmed_changes_are_appended_to_history(self) -> None:
         self.evaluate_and_commit(["Alice Player", "Bob Golfer"], ["Cara Golfer"])
@@ -211,6 +231,33 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertEqual(reading["field"], ["Player, Alice"])
         self.assertEqual(reading["alternates"], ["Person, Reserve"])
 
+    def test_lpga_reader_splits_the_explicit_reserves_section(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest("Playwright is not installed in this test environment")
+
+        site = dict(golf.SITE_DEFINITIONS["lpga"])
+        markup = """
+        <body>
+          <div><a href="/athletes/champion">Unrelated Champion</a></div>
+          <div>1 <a href="/athletes/alice-player">Alice Player</a> Entered 1</div>
+          <h2>Reserves</h2>
+          <div>** <a href="/athletes/reserve-person">Reserve Person</a> Reserve #1 20</div>
+        </body>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(markup)
+                reading = golf.read_field(page, site, timeout_s=1)
+            finally:
+                browser.close()
+
+        self.assertEqual(reading["field"], ["Alice Player"])
+        self.assertEqual(reading["alternates"], ["Reserve Person"])
+
     def test_scanner_status_messages_include_enabled_urls(self) -> None:
         sites = [
             (
@@ -237,6 +284,15 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertIn(self.url, send.call_args.args[1])
         self.assertEqual(send.call_args.kwargs["timeout"], 5)
+
+    def test_scanner_heartbeat_slots_follow_uk_time(self) -> None:
+        winter = datetime(2026, 1, 15, 7, 5, tzinfo=timezone.utc)
+        summer = datetime(2026, 8, 25, 6, 5, tzinfo=timezone.utc)
+        outside_window = datetime(2026, 8, 25, 6, 25, tzinfo=timezone.utc)
+
+        self.assertIn("T07:00:00", golf.scheduled_heartbeat_slot(winter))
+        self.assertIn("T07:00:00", golf.scheduled_heartbeat_slot(summer))
+        self.assertIsNone(golf.scheduled_heartbeat_slot(outside_window))
 
 
 if __name__ == "__main__":

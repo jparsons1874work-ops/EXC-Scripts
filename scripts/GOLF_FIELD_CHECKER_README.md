@@ -12,13 +12,15 @@ older Data Golf versus Betfair comparison.
 - Once valid weekly URLs are available, startup sends a green Slack message
   listing every enabled official page. A graceful/manual stop sends a red
   scanner-offline message.
+- While it remains online, the same green active message is sent again at
+  07:00 and 23:00 UK time every day as a team heartbeat.
 - The first valid read for a tournament is a silent baseline.
 - PGA Tour, PGA Tour Champions, and DP World Tour changes must appear on two
   consecutive checks before Slack is notified.
 - LPGA changes must appear on four consecutive checks because its virtualized
   page has historically produced inconsistent partial reads.
-- Reserve-list reshuffling is ignored. LPGA is the exception: everyone found
-  is counted as field because its field/reserve boundary is not reliable.
+- Reserve-list reshuffling is ignored. The LPGA page's explicit **Reserves**
+  heading is used to keep its main field and reserves separate.
 - A URL change is treated as a new tournament and creates a fresh silent
   baseline.
 - A Slack failure does not commit the change to state, so delivery is retried.
@@ -82,4 +84,6 @@ auto-resets on short reads.
 
 If LPGA remains chronically undercounted on EC2, inspect the Hub output first.
 Its list is virtualized and has previously depended on visible browser rendering;
-headless behavior may need revisiting if the official site changes.
+headless behavior may need revisiting if the official site changes. A change to
+the LPGA field/reserve reader triggers one silent baseline rebuild so reserves
+are not incorrectly reported as mass withdrawals.

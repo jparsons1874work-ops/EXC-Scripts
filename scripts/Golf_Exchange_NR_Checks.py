@@ -19,11 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserContext, Page
+    from playwright.sync_api import Browser, BrowserContext, Page
 
 
 try:
@@ -51,6 +52,9 @@ STATE_DIR = Path(
 DEFAULT_REPEAT_MINUTES = 5.0
 SUSPICIOUS_SHORT_READ_THRESHOLD = 0.6
 PLACEHOLDER_MARKERS = ("example", "replace", "with/yours")
+UK_TIMEZONE = ZoneInfo("Europe/London")
+SCANNER_HEARTBEAT_HOURS = (7, 23)
+SCANNER_HEARTBEAT_WINDOW_MINUTES = 20
 GOLF_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
@@ -102,14 +106,17 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "label": "LPGA",
         "allowed_hosts": {"lpga.com", "www.lpga.com"},
         "link_pattern": r"/athletes/",
-        "link_selector": 'main a[href*="/athletes/"]',
+        "link_selector": 'a[href*="/athletes/"]',
+        "ready_selector": "text=Entered",
         "name_text_mode": "full",
-        # LPGA's virtualized list has made its reserve boundary unreliable.
-        # Count every player found and use a higher confirmation threshold.
         "boundary_pattern": None,
         "min_field_before_boundary_check": None,
+        "membership_ancestor_pattern": r"\b(?:entered|reserve\s*#\d+)\b",
+        "reserve_ancestor_pattern": r"\breserve\s*#\d+\b",
         "required_confirm_streak": 4,
         "allow_auto_giveup": False,
+        # Rebuild the old all-players baseline silently when this reader lands.
+        "reader_revision": "lpga-explicit-reserves-v1",
     },
 }
 
@@ -327,6 +334,8 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
     min_before_boundary = site_def["min_field_before_boundary_check"] or 0
     link_selector = site_def.get("link_selector") or f'a[href*="{site_def["link_pattern"]}"]'
     name_text_mode = site_def.get("name_text_mode", "full")
+    membership_ancestor_pattern = site_def.get("membership_ancestor_pattern") or ""
+    reserve_ancestor_pattern = site_def.get("reserve_ancestor_pattern") or ""
     seen: set[str] = set()
     field_names: list[str] = []
     alternate_names: list[str] = []
@@ -336,20 +345,46 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
         nonlocal past_boundary
         items = page.evaluate(
             """
-            ({linkSelector, nameTextMode}) => {
+            ({linkSelector, nameTextMode, membershipAncestorPattern, reserveAncestorPattern}) => {
               const items = [];
+              const membershipRegex = membershipAncestorPattern
+                ? new RegExp(membershipAncestorPattern, 'i')
+                : null;
+              const reserveRegex = reserveAncestorPattern
+                ? new RegExp(reserveAncestorPattern, 'i')
+                : null;
               const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
               let element = walker.currentNode;
               while (element) {
                 if (element.matches && element.matches(linkSelector)) {
                   const rawText = element.innerText || element.textContent || '';
-                  items.push({
-                    type: 'link',
-                    href: element.getAttribute('href') || '',
-                    text: nameTextMode === 'first-line'
-                      ? rawText.split(/\\r?\\n/)[0]
-                      : rawText
-                  });
+                  let ancestor = element;
+                  let classificationText = '';
+                  for (let depth = 0; ancestor && depth < 8; depth += 1) {
+                    if (ancestor.tagName === 'BODY' || ancestor.tagName === 'HTML') {
+                      break;
+                    }
+                    const candidateText = ancestor.innerText || '';
+                    if (
+                      membershipRegex
+                      && candidateText.length < 300
+                      && membershipRegex.test(candidateText)
+                    ) {
+                      classificationText = candidateText;
+                      break;
+                    }
+                    ancestor = ancestor.parentElement;
+                  }
+                  if (!membershipRegex || classificationText) {
+                    items.push({
+                      type: 'link',
+                      href: element.getAttribute('href') || '',
+                      text: nameTextMode === 'first-line'
+                        ? rawText.split(/\\r?\\n/)[0]
+                        : rawText,
+                      isReserve: reserveRegex ? reserveRegex.test(classificationText) : false
+                    });
+                  }
                 } else {
                   const directText = Array.from(element.childNodes)
                     .filter(node => node.nodeType === Node.TEXT_NODE)
@@ -365,7 +400,12 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
               return items;
             }
             """,
-            {"linkSelector": link_selector, "nameTextMode": name_text_mode},
+            {
+                "linkSelector": link_selector,
+                "nameTextMode": name_text_mode,
+                "membershipAncestorPattern": membership_ancestor_pattern,
+                "reserveAncestorPattern": reserve_ancestor_pattern,
+            },
         )
 
         for item in items:
@@ -383,7 +423,7 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
             name = format_name(item["text"])
             if is_valid_name(name) and name not in seen:
                 seen.add(name)
-                (alternate_names if past_boundary else field_names).append(name)
+                (alternate_names if past_boundary or item.get("isReserve") else field_names).append(name)
 
     started = time.monotonic()
     no_growth_streak = 0
@@ -428,6 +468,8 @@ def evaluate_reading(
     previous_alternates = state.get("confirmed_alternates", [])
     previous_url = state.get("baseline_url")
     previous_config_saved_at = str(state.get("config_saved_at", "") or "")
+    reader_revision = str(site_def.get("reader_revision", "") or "")
+    previous_reader_revision = str(state.get("reader_revision", "") or "")
     reject_streak = int(state.get("reject_streak", 0) or 0)
     miss_streaks = dict(state.get("miss_streaks", {}) or {})
     seen_streaks = dict(state.get("seen_streaks", {}) or {})
@@ -453,6 +495,16 @@ def evaluate_reading(
         reject_streak = 0
         state["change_history"] = []
         state["tracking_started_at"] = utc_timestamp()
+    elif previous_field is not None and reader_revision and reader_revision != previous_reader_revision:
+        result.status_lines.append(
+            f"{site_def['label']}: field/reserve reader updated; resetting the baseline quietly."
+        )
+        previous_field = None
+        previous_alternates = []
+        miss_streaks = {}
+        seen_streaks = {}
+        promotion_candidates = set()
+        reject_streak = 0
 
     if (
         previous_field
@@ -482,6 +534,7 @@ def evaluate_reading(
                     "promotion_candidates": sorted(promotion_candidates),
                     "baseline_url": url,
                     "config_saved_at": config_saved_at,
+                    "reader_revision": reader_revision,
                 }
             )
             save_state(tour_id, state)
@@ -564,6 +617,7 @@ def evaluate_reading(
             "confirmed_alternates": list(live_alternates),
             "baseline_url": url,
             "config_saved_at": config_saved_at,
+            "reader_revision": reader_revision,
             "reject_streak": reject_streak,
             "miss_streaks": miss_streaks,
             "seen_streaks": seen_streaks,
@@ -612,7 +666,11 @@ def process_tour(
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         try:
-            page.wait_for_selector(site_def["link_selector"], state="attached", timeout=45_000)
+            page.wait_for_selector(
+                site_def.get("ready_selector") or site_def["link_selector"],
+                state="attached",
+                timeout=45_000,
+            )
         except Exception:
             # The zero-player safeguard below owns the failure. Keep the page
             # title/final URL available so the log identifies denial pages.
@@ -636,6 +694,19 @@ def process_tour(
             f"{site_def['label']}: loaded page title {page_title!r}; final URL {final_url}"
         )
     return result
+
+
+def new_browser_context(browser: Browser) -> BrowserContext:
+    context = browser.new_context(
+        viewport={"width": 1365, "height": 900},
+        user_agent=GOLF_BROWSER_USER_AGENT,
+        locale="en-GB",
+        timezone_id="Europe/London",
+    )
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    return context
 
 
 def slack_configuration(config: dict[str, Any]) -> tuple[str, str, str]:
@@ -703,7 +774,11 @@ def post_to_slack(
 
 def scanner_status_message(active: bool, sites: list[tuple[str, dict[str, Any], str, str]]) -> str:
     if active:
-        lines = ["🟢 *Golf official field scanner active*", "Checking every 5 minutes:"]
+        lines = [
+            "🟢 *Golf official field scanner active*",
+            "Checking every 5 minutes. Scheduled heartbeat: 07:00 and 23:00 UK.",
+            "Configured competitions:",
+        ]
         lines.extend(f"• *{site_def['label']}:* <{url}|official field page>" for _, site_def, url, _ in sites)
     else:
         lines = ["🔴 *Golf official field scanner offline*", "The continuous official-field checks have stopped."]
@@ -731,6 +806,18 @@ def configured_status_message() -> tuple[dict[str, Any], list[tuple[str, dict[st
         return None
 
 
+def scheduled_heartbeat_slot(now_utc: Optional[datetime] = None) -> Optional[str]:
+    """Return the current UK heartbeat slot during its retry window."""
+    current_utc = now_utc or datetime.now(timezone.utc)
+    current_uk = current_utc.astimezone(UK_TIMEZONE)
+    for hour in SCANNER_HEARTBEAT_HOURS:
+        scheduled = current_uk.replace(hour=hour, minute=0, second=0, microsecond=0)
+        elapsed_seconds = (current_uk - scheduled).total_seconds()
+        if 0 <= elapsed_seconds < SCANNER_HEARTBEAT_WINDOW_MINUTES * 60:
+            return scheduled.isoformat()
+    return None
+
+
 def _raise_scanner_stop(signum, _frame) -> None:
     raise ScannerStop(f"received signal {signum}")
 
@@ -756,20 +843,23 @@ def run_cycle() -> int:
             headless=use_headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(
-            viewport={"width": 1365, "height": 900},
-            user_agent=GOLF_BROWSER_USER_AGENT,
-            locale="en-GB",
-            timezone_id="Europe/London",
-        )
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        context = new_browser_context(browser)
+        lpga_browser = None
+        lpga_context = None
         try:
             for tour_id, site_def, url, config_saved_at in sites:
                 log(f"--- Checking {site_def['label']} ---")
                 try:
-                    result = process_tour(tour_id, site_def, url, config_saved_at, context)
+                    tour_context = context
+                    if tour_id == "lpga":
+                        if lpga_context is None:
+                            lpga_browser = playwright.chromium.launch(
+                                headless=True,
+                                args=["--disable-blink-features=AutomationControlled"],
+                            )
+                            lpga_context = new_browser_context(lpga_browser)
+                        tour_context = lpga_context
+                    result = process_tour(tour_id, site_def, url, config_saved_at, tour_context)
                 except Exception as exc:
                     log(f"ERROR checking {site_def['label']}: {exc}")
                     exit_code = 1
@@ -791,6 +881,10 @@ def run_cycle() -> int:
                 if result.proposed_state is not None:
                     save_state(tour_id, result.proposed_state)
         finally:
+            if lpga_context is not None:
+                lpga_context.close()
+            if lpga_browser is not None:
+                lpga_browser.close()
             context.close()
             browser.close()
     return exit_code
@@ -821,6 +915,7 @@ def main() -> int:
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, _raise_scanner_stop)
     active_announced = False
+    last_heartbeat_slot = ""
     status_config: dict[str, Any] = {}
     status_sites: list[tuple[str, dict[str, Any], str, str]] = []
     try:
@@ -830,10 +925,20 @@ def main() -> int:
                 if status is not None:
                     status_config, status_sites = status
                     active_announced = announce_scanner_status(True, status_config, status_sites)
+                    if active_announced:
+                        last_heartbeat_slot = scheduled_heartbeat_slot() or last_heartbeat_slot
             try:
                 run_cycle()
             except Exception as exc:
                 log(f"ERROR: Golf check cycle failed before all tours could be checked: {exc}")
+            heartbeat_slot = scheduled_heartbeat_slot()
+            if active_announced and heartbeat_slot and heartbeat_slot != last_heartbeat_slot:
+                status = configured_status_message()
+                if status is not None:
+                    heartbeat_config, heartbeat_sites = status
+                    if announce_scanner_status(True, heartbeat_config, heartbeat_sites):
+                        status_config, status_sites = heartbeat_config, heartbeat_sites
+                        last_heartbeat_slot = heartbeat_slot
             delay_seconds = args.repeat_minutes * 60
             log(f"Next Golf field check in {args.repeat_minutes:g} minutes.")
             time.sleep(delay_seconds)
