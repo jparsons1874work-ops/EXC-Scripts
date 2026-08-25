@@ -174,6 +174,29 @@ class ScriptRunner:
             ).start()
         return snapshot
 
+    def restart(self, script_id: str, args: list[str], wait_seconds: float = 20.0) -> ScriptRunState:
+        """Stop an active job and start a clean replacement process."""
+        state = self.get_state(script_id)
+        if self._is_active_locked(state):
+            self.stop(script_id, "Script was restarted for a fresh check.")
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                state = self.get_state(script_id)
+                if not self._is_active_locked(state):
+                    break
+                time.sleep(0.1)
+
+            state = self.get_state(script_id)
+            if self._is_active_locked(state):
+                with self._state_locks[script_id]:
+                    current = self._states[script_id]
+                    current.message = "Restart could not finish because the previous process did not stop."
+                    current.last_error = current.message
+                    self._append_locked(script_id, current.message, job_id=current.job_id)
+                    return self._copy_state_locked(script_id)
+
+        return self.start(script_id, args)
+
     def stop_expired_windows(self, at=None) -> None:
         for script_id, spec in SCRIPTS_BY_ID.items():
             if not spec.long_running:

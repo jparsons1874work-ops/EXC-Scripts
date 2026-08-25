@@ -345,57 +345,97 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
         nonlocal past_boundary
         items = page.evaluate(
             """
-            ({linkSelector, nameTextMode, membershipAncestorPattern, reserveAncestorPattern}) => {
+            ({
+              linkSelector,
+              nameTextMode,
+              boundaryPattern,
+              minBeforeBoundary,
+              membershipAncestorPattern,
+              reserveAncestorPattern
+            }) => {
               const items = [];
+              const boundaryRegex = boundaryPattern
+                ? new RegExp(boundaryPattern, 'i')
+                : null;
               const membershipRegex = membershipAncestorPattern
                 ? new RegExp(membershipAncestorPattern, 'i')
                 : null;
               const reserveRegex = reserveAncestorPattern
                 ? new RegExp(reserveAncestorPattern, 'i')
                 : null;
-              const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-              let element = walker.currentNode;
-              while (element) {
-                if (element.matches && element.matches(linkSelector)) {
-                  const rawText = element.innerText || element.textContent || '';
-                  let ancestor = element;
-                  let classificationText = '';
-                  for (let depth = 0; ancestor && depth < 8; depth += 1) {
-                    if (ancestor.tagName === 'BODY' || ancestor.tagName === 'HTML') {
-                      break;
-                    }
-                    const candidateText = ancestor.innerText || '';
-                    if (
-                      membershipRegex
-                      && candidateText.length < 300
-                      && membershipRegex.test(candidateText)
-                    ) {
-                      classificationText = candidateText;
-                      break;
-                    }
-                    ancestor = ancestor.parentElement;
+              const events = Array.from(document.querySelectorAll(linkSelector))
+                .map(element => ({type: 'link', node: element}));
+
+              // Only inspect text nodes when this tour has a field/reserve
+              // boundary. Walking every element and calculating innerText on
+              // the live PGA page can block Chromium for several minutes.
+              if (boundaryRegex) {
+                const textWalker = document.createTreeWalker(
+                  document.body,
+                  NodeFilter.SHOW_TEXT
+                );
+                let textNode = textWalker.nextNode();
+                while (textNode) {
+                  const directText = (textNode.nodeValue || '').trim();
+                  if (
+                    directText.length > 0
+                    && directText.length < 60
+                    && boundaryRegex.test(directText)
+                  ) {
+                    events.push({type: 'boundary', node: textNode, text: directText});
                   }
-                  if (!membershipRegex || classificationText) {
-                    items.push({
-                      type: 'link',
-                      href: element.getAttribute('href') || '',
-                      text: nameTextMode === 'first-line'
-                        ? rawText.split(/\\r?\\n/)[0]
-                        : rawText,
-                      isReserve: reserveRegex ? reserveRegex.test(classificationText) : false
-                    });
-                  }
-                } else {
-                  const directText = Array.from(element.childNodes)
-                    .filter(node => node.nodeType === Node.TEXT_NODE)
-                    .map(node => node.textContent || '')
-                    .join(' ')
-                    .trim();
-                  if (directText.length > 0 && directText.length < 60) {
-                    items.push({type: 'text', text: directText});
-                  }
+                  textNode = textWalker.nextNode();
                 }
-                element = walker.nextNode();
+              }
+
+              events.sort((left, right) => {
+                if (left.node === right.node) return 0;
+                const position = left.node.compareDocumentPosition(right.node);
+                return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+              });
+
+              let linkCount = 0;
+              let afterBoundary = false;
+              for (const event of events) {
+                if (event.type === 'boundary') {
+                  if (!afterBoundary && linkCount >= minBeforeBoundary) {
+                    afterBoundary = true;
+                    items.push({type: 'text', text: event.text});
+                  }
+                  continue;
+                }
+
+                const element = event.node;
+                linkCount += 1;
+                const rawText = element.innerText || element.textContent || '';
+                let ancestor = element;
+                let classificationText = '';
+                for (let depth = 0; ancestor && depth < 8; depth += 1) {
+                  if (ancestor.tagName === 'BODY' || ancestor.tagName === 'HTML') {
+                    break;
+                  }
+                  const candidateText = ancestor.innerText || '';
+                  if (
+                    membershipRegex
+                    && candidateText.length < 300
+                    && membershipRegex.test(candidateText)
+                  ) {
+                    classificationText = candidateText;
+                    break;
+                  }
+                  ancestor = ancestor.parentElement;
+                }
+                if (!membershipRegex || classificationText) {
+                  items.push({
+                    type: 'link',
+                    href: element.getAttribute('href') || '',
+                    text: nameTextMode === 'first-line'
+                      ? rawText.split(/\\r?\\n/)[0]
+                      : rawText,
+                    isReserve: afterBoundary
+                      || (reserveRegex ? reserveRegex.test(classificationText) : false)
+                  });
+                }
               }
               return items;
             }
@@ -403,6 +443,8 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
             {
                 "linkSelector": link_selector,
                 "nameTextMode": name_text_mode,
+                "boundaryPattern": site_def.get("boundary_pattern") or "",
+                "minBeforeBoundary": min_before_boundary,
                 "membershipAncestorPattern": membership_ancestor_pattern,
                 "reserveAncestorPattern": reserve_ancestor_pattern,
             },
@@ -664,21 +706,28 @@ def process_tour(
 ) -> DiffResult:
     page = browser_context.new_page()
     try:
+        log(f"{site_def['label']}: loading official page.")
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        log(f"{site_def['label']}: page loaded; waiting for the player list.")
         try:
             page.wait_for_selector(
                 site_def.get("ready_selector") or site_def["link_selector"],
                 state="attached",
                 timeout=45_000,
             )
-        except Exception:
+            log(f"{site_def['label']}: player list ready; reading names.")
+        except Exception as exc:
             # The zero-player safeguard below owns the failure. Keep the page
             # title/final URL available so the log identifies denial pages.
-            pass
+            log(f"{site_def['label']}: player-list wait ended without a match ({exc}).")
         page.wait_for_timeout(1_000)
         page_title = page.title()
         final_url = page.url
         reading = read_field(page, site_def)
+        log(
+            f"{site_def['label']}: page read complete "
+            f"({len(reading['field'])} field, {len(reading['alternates'])} reserve)."
+        )
     finally:
         page.close()
     result = evaluate_reading(

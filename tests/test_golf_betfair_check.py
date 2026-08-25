@@ -70,6 +70,17 @@ class GolfBetfairCheckTests(unittest.TestCase):
         self.assertEqual(result["official_only"], ["Rory McIlroy"])
         self.assertEqual(result["betfair_only"], ["Tommy Fleetwood"])
 
+    def test_player_comparison_matches_non_decomposing_name_accents(self) -> None:
+        with patch.object(checker, "load_name_aliases", return_value={}):
+            result = checker.compare_player_lists(
+                ["Nørgaard, Niklas"],
+                ["Niklas Norgaard"],
+            )
+
+        self.assertTrue(result["matching"])
+        self.assertEqual(result["official_only"], [])
+        self.assertEqual(result["betfair_only"], [])
+
     def test_catalogue_selection_prefers_main_winner_market(self) -> None:
         event = SimpleNamespace(id="event-1", name="Test Open")
         top_five = SimpleNamespace(

@@ -437,7 +437,11 @@ async def start_script(request: Request, script_id: str):
         return RedirectResponse(f"/scripts/{script_id}?error=missing-ufc-url", status_code=303)
     if script_id == PFL_SCRIPT_ID and not str(form.get("pfl_event_url", "") or _read_pfl_config().get("pfl_event_url", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-pfl-url", status_code=303)
-    await asyncio.to_thread(runner.start, script_id, _default_args_for_start(spec, form))
+    start_args = _default_args_for_start(spec, form)
+    if script_id == GOLF_SCRIPT_ID:
+        await asyncio.to_thread(runner.restart, script_id, start_args)
+    else:
+        await asyncio.to_thread(runner.start, script_id, start_args)
     return RedirectResponse(f"/scripts/{script_id}", status_code=303)
 
 

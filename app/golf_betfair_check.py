@@ -156,7 +156,21 @@ def best_event_match(hint: str, events: list[BetfairEvent], used_event_ids: set[
 def _base_normalize_player(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value or "")
     normalized = "".join(character for character in normalized if not unicodedata.combining(character))
-    normalized = re.sub(r"\([^)]*\)", " ", normalized.lower())
+    normalized = normalized.lower().translate(
+        str.maketrans(
+            {
+                "ø": "o",
+                "ð": "d",
+                "þ": "th",
+                "ł": "l",
+                "đ": "d",
+                "æ": "ae",
+                "œ": "oe",
+                "ß": "ss",
+            }
+        )
+    )
+    normalized = re.sub(r"\([^)]*\)", " ", normalized)
     if "," in normalized:
         parts = [part.strip() for part in normalized.split(",", 1)]
         normalized = f"{parts[1]} {parts[0]}"

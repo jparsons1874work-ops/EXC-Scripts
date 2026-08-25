@@ -95,6 +95,30 @@ class ScriptAutomationTests(unittest.TestCase):
 
         runner.start.assert_called_once_with(spec.id, [])
 
+    def test_restart_stops_active_job_before_starting_fresh_process(self) -> None:
+        runner = ScriptRunner.__new__(ScriptRunner)
+        runner.get_state = Mock(
+            side_effect=[
+                SimpleNamespace(status="running"),
+                SimpleNamespace(status="idle"),
+                SimpleNamespace(status="idle"),
+            ]
+        )
+        runner.stop = Mock()
+        expected = SimpleNamespace(status="running", job_id="fresh-job")
+        runner.start = Mock(return_value=expected)
+
+        with patch.object(runner_module.time, "sleep"):
+            result = runner.restart("golf-non-runner-check", ["--repeat-minutes", "5"])
+
+        runner.stop.assert_called_once_with(
+            "golf-non-runner-check", "Script was restarted for a fresh check."
+        )
+        runner.start.assert_called_once_with(
+            "golf-non-runner-check", ["--repeat-minutes", "5"]
+        )
+        self.assertIs(result, expected)
+
     def test_inplay_restart_break_stops_before_catch_up(self) -> None:
         spec = SCRIPTS_BY_ID["betfair-in-play-start-checker"]
         self.assertFalse(window_status(spec, datetime(2026, 8, 1, 23, 0, tzinfo=UK_TZ))[0])
