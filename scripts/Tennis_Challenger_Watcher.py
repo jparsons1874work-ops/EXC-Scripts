@@ -27,6 +27,8 @@ from app.tennis_challenger import (
     CONFIG_PATH,
     STATE_PATH,
     atomic_write_json,
+    fetch_upcoming_betfair_tennis_events,
+    match_betfair_event,
     normalize_tournament_url,
     read_config,
     read_state,
@@ -56,6 +58,7 @@ ALERT_FLAG_BY_TYPE = {
 DEFAULT_POLL_SECONDS = 3.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
+BETFAIR_REFRESH_SECONDS = 5 * 60
 EVENT_ROW_SELECTOR = '[data-event-row="true"]'
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -256,7 +259,12 @@ def slack_message(alert_type: str, match: dict[str, Any]) -> str:
     players = f"{match.get('player1', '?')} v {match.get('player2', '?')}"
     tournament = str(match.get("tournament", "ATP Challenger"))
     url = str(match.get("url", ""))
-    common = [f"*Match:* {players}", f"*Tournament:* {tournament}"]
+    betfair_event_id = str(match.get("betfair_event_id", "") or "")
+    common = [
+        f"*Match:* {players}",
+        f"*Tournament:* {tournament}",
+        f"*Betfair event ID:* `{betfair_event_id}`" if betfair_event_id else "*Betfair event ID:* Not matched",
+    ]
     if alert_type == "serve_detected":
         lines = ["🎾 *ATP Challenger — toss decided*", *common]
         lines.append(f"*First server:* {match.get('server', 'Detected')}")
@@ -422,6 +430,7 @@ def fetch_tournament_feed(
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         },
+        params={"_": int(time.time() * 1000)},
         timeout=20,
     )
     response.raise_for_status()
@@ -733,6 +742,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     }
     alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
     feed_configs: dict[str, dict[str, Any]] = {}
+    betfair_events: list[Any] = []
+    betfair_loaded_at = 0.0
     session = requests.Session()
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
 
@@ -763,6 +774,16 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 )
                 STOP_EVENT.wait(max(1.0, poll_seconds))
                 continue
+
+            if betfair_loaded_at == 0.0 or time.monotonic() - betfair_loaded_at >= BETFAIR_REFRESH_SECONDS:
+                try:
+                    log("Refreshing upcoming Betfair tennis events")
+                    betfair_events = fetch_upcoming_betfair_tennis_events()
+                    betfair_loaded_at = time.monotonic()
+                    log(f"Betfair event cache loaded: {len(betfair_events)} upcoming tennis event(s)")
+                except Exception as exc:
+                    betfair_loaded_at = time.monotonic()
+                    log(f"Betfair event refresh failed; Flashscore monitoring will continue: {exc}")
 
             for old_url in set(feed_configs) - set(links):
                 feed_configs.pop(old_url, None)
@@ -806,6 +827,34 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         "last_checked_at": now,
                         "last_error": "",
                     }
+                    if betfair_events and not next_match.get("betfair_event_id"):
+                        betfair_event, betfair_score, betfair_reason = match_betfair_event(
+                            next_match,
+                            betfair_events,
+                        )
+                        if betfair_event is not None:
+                            next_match.update(
+                                {
+                                    "betfair_event_id": betfair_event.event_id,
+                                    "betfair_event_name": betfair_event.event_name,
+                                    "betfair_match_score": round(betfair_score, 1),
+                                    "betfair_match_message": "Matched",
+                                }
+                            )
+                            if str((previous or {}).get("betfair_event_id", "")) != betfair_event.event_id:
+                                log(
+                                    f"Betfair matched: {next_match['player1']} v {next_match['player2']} "
+                                    f"-> {betfair_event.event_id} ({betfair_event.event_name})"
+                                )
+                        else:
+                            next_match.update(
+                                {
+                                    "betfair_event_id": "",
+                                    "betfair_event_name": "",
+                                    "betfair_match_score": round(betfair_score, 1),
+                                    "betfair_match_message": betfair_reason,
+                                }
+                            )
                     if previous is None:
                         next_match["alerts_sent"] = hydrate_initial_alert_flags(next_match)
                     else:

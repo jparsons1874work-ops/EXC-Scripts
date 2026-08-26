@@ -24,6 +24,7 @@ from app.tennis_challenger import (
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
     extract_feed_config,
+    fetch_tournament_feed,
     hydrate_initial_alert_flags,
     load_tournament_rows,
     normalize_scraped_match,
@@ -127,6 +128,43 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(rows[2]["raw_status"], "Finished")
         self.assertEqual(rows[2]["set_score"], {"home": 0, "away": 2})
 
+    def test_flashscore_feed_request_has_a_unique_cache_buster(self) -> None:
+        payload = (
+            "AA÷live123¬AD÷1787757600¬AB÷2¬AC÷47¬AE÷Basing M.¬AF÷Deckers A."
+            "¬AG÷0¬AH÷0¬WA÷15¬WB÷30¬AI÷y¬~"
+        )
+
+        class FakeResponse:
+            status_code = 200
+            text = payload
+            headers = {"Age": "0"}
+
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+        class FakeSession:
+            call = None
+
+            def get(self, url, **kwargs):
+                self.call = (url, kwargs)
+                return FakeResponse()
+
+        session = FakeSession()
+        rows = fetch_tournament_feed(
+            session,
+            {
+                "feed_url": "https://global.flashscore.ninja/2/x/feed/test",
+                "feed_sign": "feed-sign",
+                "source_url": AUGSBURG_URL,
+            },
+            "Augsburg (Singles)",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIsInstance(session.call[1]["params"]["_"], int)
+        self.assertEqual(session.call[1]["headers"]["Cache-Control"], "no-cache")
+
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
         self.assertTrue(spec.long_running)
@@ -156,6 +194,11 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(alerts, ["serve_detected"])
         self.assertEqual(match["server"], "Kopp S.")
         self.assertIn("toss decided", slack_message("serve_detected", match))
+
+    def test_slack_alert_includes_the_betfair_event_id(self) -> None:
+        match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
+        match["betfair_event_id"] = "1.234567890"
+        self.assertIn("*Betfair event ID:* `1.234567890`", slack_message("match_started", match))
 
     def test_dedicated_challenger_webhook_is_used(self) -> None:
         with patch.dict(
@@ -293,7 +336,14 @@ class TennisChallengerTests(unittest.TestCase):
         )
         client = SimpleNamespace(betting=betting, logout=lambda: None)
         matches = [
-            {"id": "a", "status": "scheduled", "player1": "Kopp S.", "player2": "Krumich M.", "tournament": "Augsburg"},
+            {
+                "id": "a",
+                "status": "scheduled",
+                "player1": "Kopp S.",
+                "player2": "Krumich M.",
+                "tournament": "Augsburg",
+                "betfair_event_id": "1",
+            },
             {"id": "b", "status": "scheduled", "player1": "Brady C. / Howse M.", "player2": "Doe J. / Roe A.", "tournament": "Augsburg Doubles"},
         ]
 

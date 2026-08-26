@@ -290,6 +290,28 @@ def parse_betfair_events(results: Iterable[Any]) -> list[BetfairTennisEvent]:
     return events
 
 
+def fetch_upcoming_betfair_tennis_events() -> list[BetfairTennisEvent]:
+    environment = child_environment()
+    client = betfair_login(environment)
+    try:
+        now = datetime.now(timezone.utc)
+        results = client.betting.list_events(
+            filter=market_filter(
+                event_type_ids=[TENNIS_EVENT_TYPE_ID],
+                market_start_time={
+                    "from": (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": (now + timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+            )
+        )
+        return parse_betfair_events(results)
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            logger.warning("tennis_challenger_betfair_logout_failed", exc_info=True)
+
+
 def match_betfair_event(match: dict[str, Any], events: Iterable[BetfairTennisEvent]) -> tuple[BetfairTennisEvent | None, float, str]:
     player1 = str(match.get("player1", "") or "")
     player2 = str(match.get("player2", "") or "")
@@ -350,10 +372,16 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
             )
         )
         events = parse_betfair_events(event_results)
+        events_by_id = {event.event_id: event for event in events}
         rows: list[dict[str, Any]] = []
         event_matches: dict[str, BetfairTennisEvent] = {}
         for match in scheduled:
-            event, score, reason = match_betfair_event(match, events)
+            known_event_id = str(match.get("betfair_event_id", "") or "")
+            event = events_by_id.get(known_event_id)
+            if event is not None:
+                score, reason = 100.0, "Matched by watcher"
+            else:
+                event, score, reason = match_betfair_event(match, events)
             base = {
                 "match_id": str(match.get("id", "")),
                 "match": f"{match.get('player1', '?')} v {match.get('player2', '?')}",

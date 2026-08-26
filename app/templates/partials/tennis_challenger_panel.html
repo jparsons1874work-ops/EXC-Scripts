@@ -53,7 +53,12 @@
         {% for match in tennis_challenger.matches %}
         <tr class="match-row match-row-{{ match.status }}">
           <td>{{ match.tournament }}</td>
-          <td><a href="{{ match.url }}" target="_blank" rel="noopener noreferrer"><strong>{{ match.player1 }} v {{ match.player2 }}</strong></a></td>
+          <td>
+            <a href="{{ match.url }}" target="_blank" rel="noopener noreferrer"><strong>{{ match.player1 }} v {{ match.player2 }}</strong></a>
+            <div class="meta">
+              {% if match.betfair_event_id %}Betfair {{ match.betfair_event_id }}{% else %}{{ match.betfair_match_message or "Betfair not matched" }}{% endif %}
+            </div>
+          </td>
           <td>
             <span class="state-label {% if match.status == 'live' %}state-ok{% elif match.status in ['error', 'suspended'] %}state-warn{% else %}state-muted{% endif %}">{{ match.display_status or match.status|title }}</span>
           </td>
