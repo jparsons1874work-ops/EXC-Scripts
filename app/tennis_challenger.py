@@ -179,6 +179,40 @@ def is_future_scheduled_match(match: dict[str, Any], now: datetime | None = None
     return candidate.date() > reference.date()
 
 
+def match_start_sort_key(match: dict[str, Any]) -> tuple[float, str]:
+    player = str(match.get("player1", "")).casefold()
+    scheduled_at = str(match.get("scheduled_at", "") or "").strip()
+    if scheduled_at:
+        try:
+            parsed = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp(), player
+        except ValueError:
+            pass
+    display_time = str(match.get("start_time", "") or match.get("display_status", ""))
+    fallback = re.search(r"\b(\d{1,2})\.(\d{1,2})\.\s+(\d{1,2}):(\d{2})", display_time)
+    if fallback:
+        day, month, hour, minute = map(int, fallback.groups())
+        try:
+            parsed = datetime(datetime.now(UK_TIMEZONE).year, month, day, hour, minute, tzinfo=UK_TIMEZONE)
+            return parsed.timestamp(), player
+        except ValueError:
+            pass
+    return float("inf"), player
+
+
+def group_matches_by_tournament(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for match in matches:
+        tournament = str(match.get("tournament", "") or "ATP Challenger")
+        grouped.setdefault(tournament, []).append(match)
+    return [
+        {"tournament": tournament, "matches": sorted(grouped[tournament], key=match_start_sort_key)}
+        for tournament in sorted(grouped, key=str.casefold)
+    ]
+
+
 def watcher_context() -> dict[str, Any]:
     config = read_config()
     state = read_state()
@@ -224,6 +258,8 @@ def watcher_context() -> dict[str, Any]:
         "matches": matches,
         "today_matches": today_matches,
         "future_matches": future_matches,
+        "today_match_groups": group_matches_by_tournament(today_matches),
+        "future_match_groups": group_matches_by_tournament(future_matches),
         "alerts": alert_rows,
         "counts": {
             "total": len(matches),

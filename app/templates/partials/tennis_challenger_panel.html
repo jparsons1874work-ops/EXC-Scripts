@@ -49,8 +49,10 @@
           <th>Game betting</th>
         </tr>
       </thead>
+      {% for group in tennis_challenger.today_match_groups %}
       <tbody>
-        {% for match in tennis_challenger.today_matches %}
+        <tr><th colspan="6">{{ group.tournament }}</th></tr>
+        {% for match in group.matches %}
         <tr class="match-row match-row-{{ match.status }}">
           <td>{{ match.tournament }}</td>
           <td>
@@ -80,6 +82,7 @@
         </tr>
         {% endfor %}
       </tbody>
+      {% endfor %}
     </table>
   </div>
   {% else %}
@@ -107,8 +110,10 @@
           <th>Game betting</th>
         </tr>
       </thead>
+      {% for group in tennis_challenger.future_match_groups %}
       <tbody>
-        {% for match in tennis_challenger.future_matches %}
+        <tr><th colspan="4">{{ group.tournament }}</th></tr>
+        {% for match in group.matches %}
         <tr class="match-row match-row-scheduled">
           <td>{{ match.tournament }}</td>
           <td>
@@ -132,6 +137,7 @@
         </tr>
         {% endfor %}
       </tbody>
+      {% endfor %}
     </table>
   </div>
   {% else %}

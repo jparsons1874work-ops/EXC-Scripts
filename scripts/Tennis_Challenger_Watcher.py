@@ -60,6 +60,7 @@ DEFAULT_POLL_SECONDS = 3.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
 BETFAIR_REFRESH_SECONDS = 5 * 60
+FIXTURES_REFRESH_SECONDS = 60
 EVENT_ROW_SELECTOR = '[data-event-row="true"]'
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -222,6 +223,8 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
         if match.get("status") == "live":
             return ["match_started"]
         return []
+    if satisfied["match_complete"] and not sent.get(ALERT_FLAG_BY_TYPE["match_complete"]):
+        return ["match_complete"]
     order = ["serve_detected", "match_started", "set_1_complete", "set_2_complete", "match_complete"]
     alerts: list[str] = []
     for alert_type in order:
@@ -453,6 +456,35 @@ def fetch_tournament_feed(
         )
     age = response.headers.get("Age", "unknown")
     log(f"{label}: feed returned {len(rows)} match(es), cache age {age}s")
+    return rows
+
+
+def extract_fixtures_feed(html: str) -> str:
+    match = re.search(
+        r"cjs\.initialFeeds\[\s*['\"]fixtures['\"]\s*\]\s*=\s*\{\s*data\s*:\s*`(.*?)`",
+        str(html or ""),
+        re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError("Flashscore fixtures page did not expose its fixtures data")
+    return match.group(1)
+
+
+def fetch_tournament_fixtures(
+    session: requests.Session,
+    config: dict[str, str],
+    label: str,
+) -> list[dict[str, Any]]:
+    fixtures_url = config["source_url"].rstrip("/") + "/fixtures/"
+    response = session.get(
+        fixtures_url,
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        params={"_": int(time.time() * 1000)},
+        timeout=25,
+    )
+    response.raise_for_status()
+    rows = parse_tournament_feed(extract_fixtures_feed(response.text), config["source_url"])
+    log(f"{label}: fixtures page returned {len(rows)} named future match(es)")
     return rows
 
 
@@ -753,6 +785,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     }
     alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
     feed_configs: dict[str, dict[str, Any]] = {}
+    fixture_rows: dict[str, list[dict[str, Any]]] = {}
+    fixtures_loaded_at: dict[str, float] = {}
     betfair_events: list[Any] = []
     betfair_loaded_at = 0.0
     betfair_client: Any = None
@@ -818,6 +852,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
             for old_url in set(feed_configs) - set(links):
                 feed_configs.pop(old_url, None)
+                fixture_rows.pop(old_url, None)
+                fixtures_loaded_at.pop(old_url, None)
 
             for url in links:
                 tournament = tournament_label_from_url(url)
@@ -838,13 +874,38 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         config = load_feed_config(session, url, tournament)
                         config["loaded_at"] = time.monotonic()
                         feed_configs[url] = config
-                    raw_matches = fetch_tournament_feed(session, config, tournament)
+                    summary_matches = fetch_tournament_feed(session, config, tournament)
                     source_errors.pop(url, None)
                 except Exception as exc:
                     source_errors[url] = str(exc)
                     feed_configs.pop(url, None)
                     log(f"Tournament feed failed for {tournament}: {exc}")
                     continue
+
+                if (
+                    url not in fixture_rows
+                    or time.monotonic() - fixtures_loaded_at.get(url, 0.0) >= FIXTURES_REFRESH_SECONDS
+                ):
+                    try:
+                        fixture_rows[url] = fetch_tournament_fixtures(session, config, tournament)
+                        fixtures_loaded_at[url] = time.monotonic()
+                    except Exception as exc:
+                        fixtures_loaded_at[url] = time.monotonic()
+                        log(f"Future fixture refresh failed for {tournament}; using prior rows: {exc}")
+
+                combined_matches = {
+                    str(item.get("id", "")): item
+                    for item in fixture_rows.get(url, [])
+                    if item.get("id")
+                }
+                combined_matches.update(
+                    {
+                        str(item.get("id", "")): item
+                        for item in summary_matches
+                        if item.get("id")
+                    }
+                )
+                raw_matches = list(combined_matches.values())
 
                 now = utc_timestamp()
                 for raw in raw_matches:

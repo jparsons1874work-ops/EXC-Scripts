@@ -15,6 +15,7 @@ import app.main as hub
 from app.registry import SCRIPTS_BY_ID
 from app.tennis_challenger import (
     BetfairTennisEvent,
+    group_matches_by_tournament,
     is_future_scheduled_match,
     is_game_market,
     match_betfair_event,
@@ -26,6 +27,7 @@ from app.tennis_challenger import (
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
     extract_feed_config,
+    extract_fixtures_feed,
     fetch_tournament_feed,
     hydrate_initial_alert_flags,
     load_tournament_rows,
@@ -131,6 +133,17 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(rows[2]["raw_status"], "Finished")
         self.assertEqual(rows[2]["set_score"], {"home": 0, "away": 2})
 
+    def test_flashscore_fixtures_payload_is_read_from_the_fixtures_page(self) -> None:
+        payload = (
+            "SA÷2¬~AA÷future123¬AD÷1787824800¬AB÷1¬AE÷Monday J.¬AF÷Ribecai M.¬~"
+        )
+        html = f"<script>cjs.initialFeeds['fixtures'] = {{ data: `{payload}`, refresh: 0 }};</script>"
+        self.assertEqual(extract_fixtures_feed(html), payload)
+        rows = parse_tournament_feed(extract_fixtures_feed(html), AUGSBURG_URL)
+        self.assertEqual([(row["id"], row["player1"], row["player2"]) for row in rows], [
+            ("future123", "Monday J.", "Ribecai M."),
+        ])
+
     def test_flashscore_feed_request_has_a_unique_cache_buster(self) -> None:
         payload = (
             "AA÷live123¬AD÷1787757600¬AB÷2¬AC÷47¬AE÷Basing M.¬AF÷Deckers A."
@@ -206,6 +219,17 @@ class TennisChallengerTests(unittest.TestCase):
                 reference,
             )
         )
+
+    def test_match_groups_are_split_by_competition_and_sorted_by_time(self) -> None:
+        groups = group_matches_by_tournament(
+            [
+                {"tournament": "Roehampton (Singles)", "player1": "Later", "scheduled_at": "2026-08-27T12:00:00Z"},
+                {"tournament": "Roehampton (Doubles)", "player1": "Doubles", "scheduled_at": "2026-08-27T11:30:00Z"},
+                {"tournament": "Roehampton (Singles)", "player1": "Earlier", "scheduled_at": "2026-08-27T10:00:00Z"},
+            ]
+        )
+        self.assertEqual([group["tournament"] for group in groups], ["Roehampton (Doubles)", "Roehampton (Singles)"])
+        self.assertEqual([match["player1"] for match in groups[1]["matches"]], ["Earlier", "Later"])
 
     def test_pre_match_serve_marker_triggers_first_alert(self) -> None:
         match = normalize_scraped_match(
@@ -305,6 +329,34 @@ class TennisChallengerTests(unittest.TestCase):
         )
         finished["alerts_sent"] = dict(live_set_3["alerts_sent"])
         self.assertEqual(pending_alerts(live_set_3, finished), ["match_complete"])
+
+    def test_straight_sets_finish_sends_only_match_complete(self) -> None:
+        previous = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 2",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "5", "away": "3"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        previous["alerts_sent"] = hydrate_initial_alert_flags(previous)
+        previous["alerts_sent"].update({"match_started": True, "set_1_complete": True})
+        finished = normalize_scraped_match(
+            raw_match(
+                raw_status="Finished",
+                is_scheduled=False,
+                set_score={"home": "2", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "6", "away": "3"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        finished["alerts_sent"] = dict(previous["alerts_sent"])
+        self.assertEqual(pending_alerts(previous, finished), ["match_complete"])
 
     def test_historical_finished_match_does_not_alert_when_first_discovered(self) -> None:
         finished = normalize_scraped_match(
@@ -439,6 +491,44 @@ class TennisChallengerTests(unittest.TestCase):
                     "start_time": "27.08. 11:00",
                     "betfair_event_id": "1.222222222",
                     "game_betting": {"status": "clear", "game_market_count": 0, "market_names": []},
+                }
+            ],
+            "today_match_groups": [
+                {
+                    "tournament": "Augsburg (Singles)",
+                    "matches": [
+                        {
+                            "id": "abc123",
+                            "tournament": "Augsburg (Singles)",
+                            "url": "https://www.flashscore.com/match/tennis/a/b/?mid=abc123",
+                            "player1": "Kopp S.",
+                            "player2": "Krumich M.",
+                            "status": "scheduled",
+                            "display_status": "26.08. 09:00",
+                            "score_label": "-",
+                            "server": "",
+                            "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
+                        }
+                    ],
+                }
+            ],
+            "future_match_groups": [
+                {
+                    "tournament": "Augsburg (Singles)",
+                    "matches": [
+                        {
+                            "id": "future123",
+                            "tournament": "Augsburg (Singles)",
+                            "url": "https://www.flashscore.com/match/tennis/c/d/?mid=future123",
+                            "player1": "Future A.",
+                            "player2": "Future B.",
+                            "status": "scheduled",
+                            "display_status": "27.08. 11:00",
+                            "start_time": "27.08. 11:00",
+                            "betfair_event_id": "1.222222222",
+                            "game_betting": {"status": "clear", "game_market_count": 0, "market_names": []},
+                        }
+                    ],
                 }
             ],
             "game_check": {"status": "complete", "completed_at_label": "26 Aug 2026 10:01:00", "error": ""},
