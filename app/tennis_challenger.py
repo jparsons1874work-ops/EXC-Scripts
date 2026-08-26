@@ -151,6 +151,34 @@ def current_score_label(match: dict[str, Any]) -> str:
     return " · ".join([part for part in [base if base != "-" else "", *additions] if part]) or "-"
 
 
+def is_future_scheduled_match(match: dict[str, Any], now: datetime | None = None) -> bool:
+    if str(match.get("status", "")) != "scheduled":
+        return False
+    reference = (now or datetime.now(timezone.utc)).astimezone(UK_TIMEZONE)
+    scheduled_at = str(match.get("scheduled_at", "") or "").strip()
+    if scheduled_at:
+        try:
+            parsed = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(UK_TIMEZONE).date() > reference.date()
+        except ValueError:
+            pass
+
+    date_match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.", str(match.get("start_time", "") or ""))
+    if not date_match:
+        return False
+    day, month = map(int, date_match.groups())
+    year = reference.year
+    try:
+        candidate = datetime(year, month, day, tzinfo=UK_TIMEZONE)
+    except ValueError:
+        return False
+    if candidate.date() < reference.date() and reference.month == 12 and month == 1:
+        candidate = candidate.replace(year=year + 1)
+    return candidate.date() > reference.date()
+
+
 def watcher_context() -> dict[str, Any]:
     config = read_config()
     state = read_state()
@@ -179,6 +207,9 @@ def watcher_context() -> dict[str, Any]:
             str(item.get("player1", "")),
         )
     )
+    future_matches = [item for item in matches if is_future_scheduled_match(item)]
+    future_ids = {str(item.get("id", "")) for item in future_matches}
+    today_matches = [item for item in matches if str(item.get("id", "")) not in future_ids]
     alert_rows = []
     for alert in list(state.get("alerts", []) or [])[-50:][::-1]:
         if not isinstance(alert, dict):
@@ -191,6 +222,8 @@ def watcher_context() -> dict[str, Any]:
         "last_saved_at": uk_time_label(config.get("last_saved_at")),
         "watcher": state,
         "matches": matches,
+        "today_matches": today_matches,
+        "future_matches": future_matches,
         "alerts": alert_rows,
         "counts": {
             "total": len(matches),
@@ -290,12 +323,18 @@ def parse_betfair_events(results: Iterable[Any]) -> list[BetfairTennisEvent]:
     return events
 
 
-def fetch_upcoming_betfair_tennis_events() -> list[BetfairTennisEvent]:
-    environment = child_environment()
-    client = betfair_login(environment)
+def create_betfair_client() -> betfairlightweight.APIClient:
+    return betfair_login(child_environment())
+
+
+def fetch_upcoming_betfair_tennis_events(
+    client: betfairlightweight.APIClient | None = None,
+) -> list[BetfairTennisEvent]:
+    owns_client = client is None
+    active_client = client or create_betfair_client()
     try:
         now = datetime.now(timezone.utc)
-        results = client.betting.list_events(
+        results = active_client.betting.list_events(
             filter=market_filter(
                 event_type_ids=[TENNIS_EVENT_TYPE_ID],
                 market_start_time={
@@ -306,10 +345,11 @@ def fetch_upcoming_betfair_tennis_events() -> list[BetfairTennisEvent]:
         )
         return parse_betfair_events(results)
     finally:
-        try:
-            client.logout()
-        except Exception:
-            logger.warning("tennis_challenger_betfair_logout_failed", exc_info=True)
+        if owns_client:
+            try:
+                active_client.logout()
+            except Exception:
+                logger.warning("tennis_challenger_betfair_logout_failed", exc_info=True)
 
 
 def match_betfair_event(match: dict[str, Any], events: Iterable[BetfairTennisEvent]) -> tuple[BetfairTennisEvent | None, float, str]:

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +15,7 @@ import app.main as hub
 from app.registry import SCRIPTS_BY_ID
 from app.tennis_challenger import (
     BetfairTennisEvent,
+    is_future_scheduled_match,
     is_game_market,
     match_betfair_event,
     normalize_tournament_url,
@@ -125,6 +127,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(rows[0]["server_side"], "home")
         self.assertEqual(rows[0]["set_parts"][0], {"home": "6", "away": "6"})
         self.assertTrue(rows[1]["is_scheduled"])
+        self.assertEqual(rows[1]["scheduled_at"], "2026-08-27T09:00:00Z")
         self.assertEqual(rows[2]["raw_status"], "Finished")
         self.assertEqual(rows[2]["set_score"], {"home": 0, "away": 2})
 
@@ -182,6 +185,27 @@ class TennisChallengerTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             normalize_tournament_url("https://www.flashscore.com/tennis/atp-singles/us-open/")
+
+    def test_future_match_split_uses_the_uk_calendar_date(self) -> None:
+        reference = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        self.assertFalse(
+            is_future_scheduled_match(
+                {"status": "scheduled", "scheduled_at": "2026-08-26T22:30:00Z"},
+                reference,
+            )
+        )
+        self.assertTrue(
+            is_future_scheduled_match(
+                {"status": "scheduled", "scheduled_at": "2026-08-27T08:00:00Z"},
+                reference,
+            )
+        )
+        self.assertFalse(
+            is_future_scheduled_match(
+                {"status": "live", "scheduled_at": "2026-08-27T08:00:00Z"},
+                reference,
+            )
+        )
 
     def test_pre_match_serve_marker_triggers_first_alert(self) -> None:
         match = normalize_scraped_match(
@@ -389,6 +413,34 @@ class TennisChallengerTests(unittest.TestCase):
                     "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
                 }
             ],
+            "today_matches": [
+                {
+                    "id": "abc123",
+                    "tournament": "Augsburg (Singles)",
+                    "url": "https://www.flashscore.com/match/tennis/a/b/?mid=abc123",
+                    "player1": "Kopp S.",
+                    "player2": "Krumich M.",
+                    "status": "scheduled",
+                    "display_status": "26.08. 09:00",
+                    "score_label": "-",
+                    "server": "",
+                    "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
+                }
+            ],
+            "future_matches": [
+                {
+                    "id": "future123",
+                    "tournament": "Augsburg (Singles)",
+                    "url": "https://www.flashscore.com/match/tennis/c/d/?mid=future123",
+                    "player1": "Future A.",
+                    "player2": "Future B.",
+                    "status": "scheduled",
+                    "display_status": "27.08. 11:00",
+                    "start_time": "27.08. 11:00",
+                    "betfair_event_id": "1.222222222",
+                    "game_betting": {"status": "clear", "game_market_count": 0, "market_names": []},
+                }
+            ],
             "game_check": {"status": "complete", "completed_at_label": "26 Aug 2026 10:01:00", "error": ""},
             "last_sweep_label": "26 Aug 2026 10:00:03",
             "watcher": {"last_error": "", "sources": []},
@@ -408,6 +460,9 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertIn("Check game betting", html)
         self.assertIn("Kopp S. v Krumich M.", html)
         self.assertIn("Action needed", html)
+        self.assertIn("Tomorrow and future matches", html)
+        self.assertIn("Future A. v Future B.", html)
+        self.assertIn("Betfair 1.222222222", html)
 
 
 if __name__ == "__main__":

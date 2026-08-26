@@ -36,7 +36,7 @@
     {% endif %}
   </div>
   {% if tennis_challenger.game_check.error %}<div class="error">{{ tennis_challenger.game_check.error }}</div>{% endif %}
-  {% if tennis_challenger.matches %}
+  {% if tennis_challenger.today_matches %}
   <div class="table-wrap">
     <table class="challenger-table">
       <thead>
@@ -50,7 +50,7 @@
         </tr>
       </thead>
       <tbody>
-        {% for match in tennis_challenger.matches %}
+        {% for match in tennis_challenger.today_matches %}
         <tr class="match-row match-row-{{ match.status }}">
           <td>{{ match.tournament }}</td>
           <td>
@@ -83,7 +83,59 @@
     </table>
   </div>
   {% else %}
-  <div class="message">Save tournament links and start the watcher. Discovered matches will appear here.</div>
+  <div class="message">No matches are scheduled or in play today.</div>
+  {% endif %}
+</section>
+
+<section class="panel challenger-match-panel">
+  <div class="panel-header">
+    <h2>Tomorrow and future matches</h2>
+    {% if tennis_challenger.game_check.status == "running" %}
+    <span class="state-label">Checking Betfair…</span>
+    {% elif tennis_challenger.game_check.completed_at_label %}
+    <span class="meta">Game betting checked {{ tennis_challenger.game_check.completed_at_label }}</span>
+    {% endif %}
+  </div>
+  {% if tennis_challenger.future_matches %}
+  <div class="table-wrap">
+    <table class="challenger-table">
+      <thead>
+        <tr>
+          <th>Tournament</th>
+          <th>Match</th>
+          <th>Scheduled</th>
+          <th>Game betting</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for match in tennis_challenger.future_matches %}
+        <tr class="match-row match-row-scheduled">
+          <td>{{ match.tournament }}</td>
+          <td>
+            <a href="{{ match.url }}" target="_blank" rel="noopener noreferrer"><strong>{{ match.player1 }} v {{ match.player2 }}</strong></a>
+            <div class="meta">
+              {% if match.betfair_event_id %}Betfair {{ match.betfair_event_id }}{% else %}{{ match.betfair_match_message or "Betfair not matched" }}{% endif %}
+            </div>
+          </td>
+          <td><span class="state-label state-muted">{{ match.display_status or match.start_time }}</span></td>
+          <td>
+            {% if match.game_betting.status == "clear" %}
+            <span class="state-label state-ok">✓ Deleted</span>
+            {% elif match.game_betting.status == "needs_action" %}
+            <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
+            {% elif match.game_betting.status == "event_not_found" %}
+            <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
+            {% else %}
+            <span class="state-label state-muted">Not checked</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="message">No matches are currently scheduled after today.</div>
   {% endif %}
 </section>
 

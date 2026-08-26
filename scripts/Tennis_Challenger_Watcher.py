@@ -27,6 +27,7 @@ from app.tennis_challenger import (
     CONFIG_PATH,
     STATE_PATH,
     atomic_write_json,
+    create_betfair_client,
     fetch_upcoming_betfair_tennis_events,
     match_betfair_event,
     normalize_tournament_url,
@@ -179,6 +180,7 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
         "finish_reason": status if status in COMPLETED_STATUSES and status != "finished" else "",
         "display_status": str(raw.get("raw_status", "") or status.title()),
         "start_time": str(raw.get("raw_status", "") or "") if status == "scheduled" else "",
+        "scheduled_at": str(raw.get("scheduled_at", "") or ""),
         "set_score": {
             "home": clean_score_value((raw.get("set_score") or {}).get("home")),
             "away": clean_score_value((raw.get("set_score") or {}).get("away")),
@@ -358,6 +360,14 @@ def feed_start_time(value: str) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(UK_TIMEZONE).strftime("%d.%m. %H:%M")
 
 
+def feed_start_datetime(value: str) -> str:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def parse_tournament_feed(payload: str, source_url: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for chunk in str(payload or "").split("¬~"):
@@ -401,6 +411,7 @@ def parse_tournament_feed(payload: str, source_url: str) -> list[dict[str, Any]]
                 "url": f"https://www.flashscore.com/match/tennis/{match_id}/",
                 "player1": player1,
                 "player2": player2,
+                "scheduled_at": feed_start_datetime(fields.get("AD", "")),
                 "raw_status": raw_status,
                 "row_classes": f"event__match event__match--{status}",
                 "set_score": set_score,
@@ -744,6 +755,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     feed_configs: dict[str, dict[str, Any]] = {}
     betfair_events: list[Any] = []
     betfair_loaded_at = 0.0
+    betfair_client: Any = None
     session = requests.Session()
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
 
@@ -775,14 +787,33 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 STOP_EVENT.wait(max(1.0, poll_seconds))
                 continue
 
-            if betfair_loaded_at == 0.0 or time.monotonic() - betfair_loaded_at >= BETFAIR_REFRESH_SECONDS:
+            unmatched_scheduled = any(
+                item.get("status") == "scheduled" and not item.get("betfair_event_id")
+                for item in matches.values()
+            )
+            should_refresh_betfair = (
+                betfair_loaded_at == 0.0
+                or unmatched_scheduled
+                or time.monotonic() - betfair_loaded_at >= BETFAIR_REFRESH_SECONDS
+            )
+            if should_refresh_betfair:
                 try:
-                    log("Refreshing upcoming Betfair tennis events")
-                    betfair_events = fetch_upcoming_betfair_tennis_events()
+                    if betfair_client is None:
+                        log("Connecting to Betfair for event matching")
+                        betfair_client = create_betfair_client()
+                    reason = "unmatched scheduled match(es)" if unmatched_scheduled else "scheduled refresh"
+                    log(f"Refreshing upcoming Betfair tennis events ({reason})")
+                    betfair_events = fetch_upcoming_betfair_tennis_events(betfair_client)
                     betfair_loaded_at = time.monotonic()
                     log(f"Betfair event cache loaded: {len(betfair_events)} upcoming tennis event(s)")
                 except Exception as exc:
                     betfair_loaded_at = time.monotonic()
+                    if betfair_client is not None:
+                        try:
+                            betfair_client.logout()
+                        except Exception:
+                            pass
+                        betfair_client = None
                     log(f"Betfair event refresh failed; Flashscore monitoring will continue: {exc}")
 
             for old_url in set(feed_configs) - set(links):
@@ -918,6 +949,11 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
     finally:
         session.close()
+        if betfair_client is not None:
+            try:
+                betfair_client.logout()
+            except Exception:
+                log("Betfair logout failed while stopping watcher")
 
     write_runtime_state(matches, alerts, [], last_error="", phase="Stopped")
     log("Direct feed watcher stopped cleanly.")
