@@ -24,6 +24,7 @@ from app.tennis_challenger import (
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
     hydrate_initial_alert_flags,
+    load_tournament_rows,
     normalize_scraped_match,
     pending_alerts,
     slack_message,
@@ -71,6 +72,24 @@ class TennisChallengerTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Monitor configured Flashscore ATP Challenger tournaments", completed.stdout)
+
+    def test_tournament_loader_waits_for_attached_not_visible_rows(self) -> None:
+        class FakePage:
+            wait_options = None
+
+            def goto(self, *_args, **_kwargs):
+                return None
+
+            def wait_for_selector(self, _selector, **options):
+                self.wait_options = options
+
+            def eval_on_selector_all(self, _selector, _extractor):
+                return [raw_match()]
+
+        page = FakePage()
+        rows = load_tournament_rows(page, AUGSBURG_URL)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(page.wait_options["state"], "attached")
 
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]

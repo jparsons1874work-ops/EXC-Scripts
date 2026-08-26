@@ -55,6 +55,7 @@ ALERT_FLAG_BY_TYPE = {
 DEFAULT_POLL_SECONDS = 3.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
+EVENT_ROW_SELECTOR = '[data-event-row="true"]'
 
 
 ROW_EXTRACTOR = r"""
@@ -293,8 +294,39 @@ def configured_links() -> list[str]:
 
 
 def extract_page_rows(page: Any) -> list[dict[str, Any]]:
-    rows = page.eval_on_selector_all('[data-event-row="true"]', ROW_EXTRACTOR)
+    rows = page.eval_on_selector_all(EVENT_ROW_SELECTOR, ROW_EXTRACTOR)
     return [row for row in rows or [] if isinstance(row, dict)]
+
+
+def page_diagnostic(page: Any) -> str:
+    details: list[str] = []
+    try:
+        details.append(f"url={page.url}")
+    except Exception:
+        pass
+    try:
+        details.append(f"title={page.title()!r}")
+    except Exception:
+        pass
+    try:
+        body = " ".join(page.locator("body").inner_text(timeout=2000).split())[:300]
+        if body:
+            details.append(f"body={body!r}")
+    except Exception:
+        pass
+    return "; ".join(details) or "page diagnostics unavailable"
+
+
+def load_tournament_rows(page: Any, url: str) -> list[dict[str, Any]]:
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    # Fresh server profiles can leave the event list behind a first-visit layer.
+    # The score data is usable as soon as the rows are attached to the DOM; it
+    # does not need to be visually unobscured for extraction.
+    page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=30000)
+    rows = extract_page_rows(page)
+    if not rows:
+        raise RuntimeError(f"Tournament page returned no match rows ({page_diagnostic(page)})")
+    return rows
 
 
 def _handle_stop(_signum: int, _frame: Any) -> None:
@@ -364,7 +396,14 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
             ),
         )
+        context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in {"image", "media", "font"}
+            else route.continue_(),
+        )
         log(f"Watcher started. Config: {CONFIG_PATH}. State: {STATE_PATH}.")
+        write_runtime_state(matches, alerts, [], last_error="")
 
         try:
             while not STOP_EVENT.is_set():
@@ -390,15 +429,18 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                             pages[url] = page
                         if needs_reload:
                             log(f"Loading {tournament_label_from_url(url)}")
-                            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_selector('[data-event-row="true"]', timeout=20000)
+                            raw_matches = load_tournament_rows(page, url)
                             loaded_at[url] = time.monotonic()
-                        raw_matches = extract_page_rows(page)
+                        else:
+                            raw_matches = extract_page_rows(page)
                         if not raw_matches:
-                            raise RuntimeError("Tournament page returned no match rows")
+                            raise RuntimeError(
+                                f"Tournament page returned no match rows ({page_diagnostic(page)})"
+                            )
                         source_errors.pop(url, None)
                     except Exception as exc:
-                        source_errors[url] = str(exc)
+                        diagnostic = page_diagnostic(page) if page is not None else "page was not created"
+                        source_errors[url] = f"{exc} [{diagnostic}]"
                         loaded_at[url] = 0
                         log(f"Tournament read failed for {tournament_label_from_url(url)}: {exc}")
                         continue
