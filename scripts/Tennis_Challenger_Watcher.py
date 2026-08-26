@@ -198,14 +198,42 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
     }
 
 
+def score_value_has_progress(value: Any) -> bool:
+    text = str(value if value is not None else "").strip().upper()
+    if text in {"A", "AD"}:
+        return True
+    try:
+        return float(text) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def first_point_played(match: dict[str, Any]) -> bool:
+    if str(match.get("status", "")) == "finished":
+        return True
+    score_sections = [
+        match.get("set_score", {}),
+        match.get("current_game", {}),
+        match.get("current_points", {}),
+        *(match.get("sets", []) or []),
+    ]
+    return any(
+        score_value_has_progress(value)
+        for section in score_sections
+        if isinstance(section, dict)
+        for value in section.values()
+    )
+
+
 def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
     status = str(match.get("status", ""))
     current_set = int(match.get("current_set_number") or 0)
     completed = status == "finished"
     set_count = len(match.get("sets", []) or [])
+    started = first_point_played(match)
     return {
-        "serve_detected": bool(status == "scheduled" and match.get("server")),
-        "match_started": status == "live" or completed,
+        "serve_detected": bool(match.get("server") and not started and not completed),
+        "match_started": started,
         "set_1_complete": current_set >= 2 or (completed and set_count >= 1),
         "set_2_complete": current_set >= 3 or (completed and set_count >= 2),
         "match_complete": completed,
@@ -220,7 +248,7 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
             return []
         if satisfied["serve_detected"]:
             return ["serve_detected"]
-        if match.get("status") == "live":
+        if satisfied["match_started"]:
             return ["match_started"]
         return []
     if satisfied["match_complete"] and not sent.get(ALERT_FLAG_BY_TYPE["match_complete"]):
@@ -228,8 +256,6 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
     order = ["serve_detected", "match_started", "set_1_complete", "set_2_complete", "match_complete"]
     alerts: list[str] = []
     for alert_type in order:
-        if alert_type == "serve_detected" and match.get("status") != "scheduled":
-            continue
         if satisfied[alert_type] and not sent.get(ALERT_FLAG_BY_TYPE[alert_type]):
             alerts.append(alert_type)
     return alerts

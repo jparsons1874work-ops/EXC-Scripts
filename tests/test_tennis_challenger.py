@@ -29,6 +29,7 @@ from scripts.Tennis_Challenger_Watcher import (
     extract_feed_config,
     extract_fixtures_feed,
     fetch_tournament_feed,
+    first_point_played,
     hydrate_initial_alert_flags,
     load_tournament_rows,
     normalize_scraped_match,
@@ -242,6 +243,65 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(alerts, ["serve_detected"])
         self.assertEqual(match["server"], "Kopp S.")
         self.assertIn("toss decided", slack_message("serve_detected", match))
+
+    def test_live_row_with_server_but_no_point_sends_toss_before_match_started(self) -> None:
+        scheduled = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
+        scheduled["alerts_sent"] = hydrate_initial_alert_flags(scheduled)
+
+        toss_decided = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 1",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "0", "away": "0"},
+                set_parts=[{"home": "0", "away": "0"}],
+                current_points={"home": "0", "away": "0"},
+                server_side="home",
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        toss_decided["alerts_sent"] = dict(scheduled["alerts_sent"])
+        toss_alerts = pending_alerts(scheduled, toss_decided)
+        self.assertFalse(first_point_played(toss_decided))
+        self.assertEqual(toss_alerts, ["serve_detected"])
+        apply_sent(toss_decided, toss_alerts)
+
+        first_point = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 1",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "0", "away": "0"},
+                set_parts=[{"home": "0", "away": "0"}],
+                current_points={"home": "15", "away": "0"},
+                server_side="home",
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        first_point["alerts_sent"] = dict(toss_decided["alerts_sent"])
+        self.assertTrue(first_point_played(first_point))
+        self.assertEqual(pending_alerts(toss_decided, first_point), ["match_started"])
+
+    def test_new_live_row_without_score_does_not_claim_match_started(self) -> None:
+        waiting_for_first_point = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 1",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "0", "away": "0"},
+                set_parts=[{"home": "0", "away": "0"}],
+                current_points={"home": "0", "away": "0"},
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        waiting_for_first_point["alerts_sent"] = hydrate_initial_alert_flags(waiting_for_first_point)
+        self.assertEqual(pending_alerts(None, waiting_for_first_point), [])
 
     def test_slack_alert_includes_the_betfair_event_id(self) -> None:
         match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
