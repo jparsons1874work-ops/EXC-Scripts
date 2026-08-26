@@ -112,6 +112,7 @@ GOLF_NR_SLACK_CHANNEL=
 SLACK_BOT_TOKEN=
 SLACK_CHANNEL=
 TENNIS_INTEGRITY_SLACK_WEBHOOK_URL=
+Webhook_Challenger=
 DUPE_MATCH_SLACK_WEBHOOK_URL=
 SLACK_WEBHOOK_URL=
 Slack_Webhook_TIP=
@@ -131,6 +132,7 @@ Slack webhook routing:
 
 - Golf - Non-Runner Check runs the official tour field scanner continuously and uses `GOLF_NR_SLACK_WEBHOOK_URL` when set. It can also use `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`; invite the bot to the channel and grant `chat:write`. The active status with configured URLs is sent at startup and again at 07:00 and 23:00 UK time daily; a graceful stop sends the offline status. Save the four weekly tournament URLs on the Golf page in the Hub. The scanner needs the Ubuntu `xvfb` package because PGA Tour and DP World Tour reject Chromium's default headless mode. The **Check with Betfair** button uses the standard Betfair API credentials and certificate paths configured above.
 - Tennis - Integrity Check uses `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
+- Tennis - Challenger Watcher uses the dedicated `Webhook_Challenger` value and does not fall back to another sport's Slack destination. Save the weekly Flashscore ATP Challenger tournament links on its Hub page, then start the watcher. The server must have Playwright Chromium installed using the commands above.
 - Betfair - Duplicate Match Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL`, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair - Duplicate Market Check uses `DUPE_MATCH_SLACK_WEBHOOK_URL` for Slack alerts, with `SLACK_WEBHOOK_URL` only as a backwards-compatible fallback.
 - Betfair In-Play Start Checker uses `Slack_Webhook_TIP` exactly from `/opt/betfair-scripts/.env`. Do not rename it to `SLACK_WEBHOOK_TIP` or `SLACK_WEBHOOK_URL`, and do not commit it, hardcode it, or print it in logs.

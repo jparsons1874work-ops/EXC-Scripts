@@ -1,0 +1,106 @@
+<section class="panel challenger-overview">
+  <div class="panel-header">
+    <h2>Scanner overview</h2>
+    <span class="meta">{% if tennis_challenger.last_sweep_label %}Last scan {{ tennis_challenger.last_sweep_label }}{% else %}Not scanned yet{% endif %}</span>
+  </div>
+  <div class="metric-row challenger-metrics">
+    <div class="metric"><span class="metric-label">In scope</span><span class="metric-value">{{ tennis_challenger.counts.total }}</span></div>
+    <div class="metric"><span class="metric-label">Scheduled</span><span class="metric-value">{{ tennis_challenger.counts.scheduled }}</span></div>
+    <div class="metric"><span class="metric-label">Live</span><span class="metric-value">{{ tennis_challenger.counts.live }}</span></div>
+    <div class="metric"><span class="metric-label">Finished</span><span class="metric-value">{{ tennis_challenger.counts.finished }}</span></div>
+  </div>
+  {% if tennis_challenger.watcher.last_error %}
+  <div class="error">{{ tennis_challenger.watcher.last_error }}</div>
+  {% endif %}
+  {% if tennis_challenger.watcher.sources %}
+  <div class="source-health">
+    {% for source in tennis_challenger.watcher.sources %}
+    <span class="state-label {% if source.status == 'ok' %}state-ok{% else %}state-warn{% endif %}" title="{{ source.error }}">{{ source.label }}</span>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel challenger-match-panel">
+  <div class="panel-header">
+    <h2>Matches in scope</h2>
+    {% if tennis_challenger.game_check.status == "running" %}
+    <span class="state-label">Checking Betfair…</span>
+    {% elif tennis_challenger.game_check.status == "failed" %}
+    <span class="state-label state-warn">Game check failed</span>
+    {% elif tennis_challenger.game_check.completed_at_label %}
+    <span class="meta">Game betting checked {{ tennis_challenger.game_check.completed_at_label }}</span>
+    {% endif %}
+  </div>
+  {% if tennis_challenger.game_check.error %}<div class="error">{{ tennis_challenger.game_check.error }}</div>{% endif %}
+  {% if tennis_challenger.matches %}
+  <div class="table-wrap">
+    <table class="challenger-table">
+      <thead>
+        <tr>
+          <th>Tournament</th>
+          <th>Match</th>
+          <th>Status</th>
+          <th>Score</th>
+          <th>Serving</th>
+          <th>Game betting</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for match in tennis_challenger.matches %}
+        <tr class="match-row match-row-{{ match.status }}">
+          <td>{{ match.tournament }}</td>
+          <td><a href="{{ match.url }}" target="_blank" rel="noopener noreferrer"><strong>{{ match.player1 }} v {{ match.player2 }}</strong></a></td>
+          <td>
+            <span class="state-label {% if match.status == 'live' %}state-ok{% elif match.status in ['error', 'suspended'] %}state-warn{% else %}state-muted{% endif %}">{{ match.display_status or match.status|title }}</span>
+          </td>
+          <td class="score-cell">{{ match.score_label }}</td>
+          <td>{% if match.server %}🎾 {{ match.server }}{% else %}-{% endif %}</td>
+          <td>
+            {% if match.status != "scheduled" %}
+            <span class="state-label state-muted">Not applicable</span>
+            {% elif match.game_betting.status == "clear" %}
+            <span class="state-label state-ok">✓ Deleted</span>
+            {% elif match.game_betting.status == "needs_action" %}
+            <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
+            {% elif match.game_betting.status == "event_not_found" %}
+            <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
+            {% else %}
+            <span class="state-label state-muted">Not checked</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="message">Save tournament links and start the watcher. Discovered matches will appear here.</div>
+  {% endif %}
+</section>
+
+<section class="panel challenger-alert-panel">
+  <div class="panel-header">
+    <h2>Recent Slack alerts</h2>
+    <span class="meta">Latest 50</span>
+  </div>
+  {% if tennis_challenger.alerts %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Time</th><th>Alert</th><th>Match</th><th>Tournament</th></tr></thead>
+      <tbody>
+        {% for alert in tennis_challenger.alerts %}
+        <tr>
+          <td>{{ alert.timestamp }}</td>
+          <td>{{ alert.type|replace('_', ' ')|title }}</td>
+          <td>{{ alert.match }}</td>
+          <td>{{ alert.tournament }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="message">No Slack alerts have been sent for the current watcher state.</div>
+  {% endif %}
+</section>

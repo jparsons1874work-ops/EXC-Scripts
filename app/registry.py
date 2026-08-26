@@ -171,6 +171,15 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         auto_start_on_hub_start=True,
     ),
     script(
+        "Tennis - Challenger Watcher",
+        "Tennis",
+        "Monitors selected ATP Challenger tournaments and sends operational Slack alerts.",
+        "scripts/Tennis_Challenger_Watcher.py",
+        ("--poll-seconds", "3", "--reload-minutes", "15"),
+        long_running=True,
+        timeout_seconds=10 * 365 * 24 * 60 * 60,
+    ),
+    script(
         "Cricket - Time Check Today",
         "Cricket",
         "Compares today's Betfair and Decimal cricket fixture start times.",

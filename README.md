@@ -40,6 +40,7 @@ Required values depend on which scripts you run:
 - Golf - Non-Runner Check reads the four tours' official JavaScript-rendered field pages continuously. Install Playwright Chromium once on each machine, then save the current tournament URLs on the Golf page in the Hub. Its user-triggered Betfair comparison also requires the standard Betfair API credentials and certificates. See `scripts/GOLF_FIELD_CHECKER_README.md`.
 - Golf - Non-Runner Check Slack notifications should use `GOLF_NR_SLACK_WEBHOOK_URL`, or `GOLF_NR_SLACK_BOT_TOKEN` plus `GOLF_NR_SLACK_CHANNEL`. If using bot token/channel, invite the bot to the target Slack channel and grant `chat:write`.
 - Tennis integrity Slack notifications use `TENNIS_INTEGRITY_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the tennis-specific value is missing.
+- ATP Challenger watcher notifications use the dedicated `Webhook_Challenger` value and do not fall back to another sport's Slack destination.
 - Betfair duplicate match and duplicate market Slack notifications use `DUPE_MATCH_SLACK_WEBHOOK_URL`, falling back to `SLACK_WEBHOOK_URL` only if the duplicate-specific value is missing.
 - Betfair In-Play Start Checker uses `Slack_Webhook_TIP` exactly from the hub's server-side config/environment. It does not use `SLACK_WEBHOOK_URL`, Slack bot tokens, threads, or recovery messages.
 - Other Slack integrations may use `SLACK_WEBHOOK_URL` or bot token/channel values, depending on the script.
@@ -118,3 +119,9 @@ These paths are ignored by Git. Logs are overwritten at the start of each run.
 Never commit secrets, certificates, `.env`, real `credentials.json`, local JSON config, browser profiles, logs, or generated output files.
 
 The tennis integrity scanner needs an operational `integrity_list.xlsx` file in `scripts/Integrity-Scanner/data/`. This file is intentionally not included in the clean Git-ready repo.
+
+## ATP Challenger Watcher
+
+Open **Tennis - Challenger Watcher** in the Hub, paste one Flashscore Challenger Men singles or doubles tournament link per line, save the weekly list, and select **Start watcher**. The page shows every discovered match, current live scores, the detected server, and recent Slack alerts.
+
+The watcher sends exactly-once Slack alerts when the first server appears before play, when the match starts, after Sets 1 and 2, and when the match ends. **Check game betting** makes a read-only Betfair API comparison for scheduled matches; a red cross means game-by-game markets are still present, while a green tick means none were returned for the matched Betfair event.

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}ATP Challenger Watcher · Scripts Hub{% endblock %}
+{% block content %}
+<header class="page-header">
+  <div class="page-title-block">
+    {% if assets.logo %}
+    <img class="header-logo compact" src="{{ assets.logo }}" alt="Betfair">
+    {% endif %}
+    <span class="eyebrow">Tennis operations</span>
+    <h1>ATP Challenger Watcher</h1>
+    <p>Monitor manual-coverage tournaments, follow live scores and send actionable Slack alerts.</p>
+  </div>
+  <div id="status-badge" hx-get="/scripts/{{ spec.id }}/status" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "partials/status_badge.html" %}
+  </div>
+</header>
+
+{% if request.query_params.get("error") == "missing-tournament-links" %}
+<div class="error">Save at least one ATP Challenger tournament link before starting the watcher.</div>
+{% elif request.query_params.get("error") == "invalid-tournament-link" %}
+<div class="error">Use one Flashscore Challenger Men singles or doubles tournament link per line.</div>
+{% endif %}
+
+<section class="challenger-controls">
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Weekly tournament links</h2>
+      {% if tennis_challenger.last_saved_at %}<span class="meta">Saved {{ tennis_challenger.last_saved_at }}</span>{% endif %}
+    </div>
+    <p class="meta">Paste the Flashscore tournament summary, fixtures, results or draw link. One tournament per line.</p>
+    <form method="post" action="/scripts/{{ spec.id }}/config" class="form-stack controls">
+      <label for="tournament_links">Manual ATP Challenger tournaments</label>
+      <textarea id="tournament_links" name="tournament_links" rows="7" placeholder="https://www.flashscore.com/tennis/challenger-men-singles/example/">{{ tennis_challenger.links_text }}</textarea>
+      <button class="button button-ghost" type="submit">Save tournament links</button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Watcher controls</h2>
+      <span class="meta">Checks every 3 seconds</span>
+    </div>
+    <div class="challenger-action-stack">
+      <form method="post" action="/scripts/{{ spec.id }}/start">
+        <button class="button button-primary button-wide" type="submit" {% if not tennis_challenger.configured or state.status in ["running", "stopping"] %}disabled{% endif %}>Start watcher</button>
+      </form>
+      <form method="post" action="/scripts/{{ spec.id }}/stop">
+        <button class="button button-danger" type="submit" {% if state.status not in ["running", "stopping"] %}disabled{% endif %}>Stop watcher</button>
+      </form>
+      <form method="post" action="/scripts/{{ spec.id }}/check-game-betting">
+        <button class="button button-ghost button-wide" type="submit" {% if not tennis_challenger.matches or tennis_challenger.game_check.status == "running" %}disabled{% endif %}>Check game betting</button>
+      </form>
+    </div>
+    <div class="message compact-message">
+      Slack alerts: toss/first server, match started, Set 1 complete, Set 2 complete and match complete.
+    </div>
+    {% if state.message %}<div class="message compact-message">{{ state.message }}</div>{% endif %}
+  </div>
+</section>
+
+<div id="challenger-panel" hx-get="/scripts/{{ spec.id }}/panel" hx-trigger="every 3s" hx-swap="innerHTML">
+  {% include "partials/tennis_challenger_panel.html" %}
+</div>
+
+<details class="panel challenger-console-panel">
+  <summary>Watcher log</summary>
+  <div class="console challenger-console">{{ state.output_lines[-300:]|join('\n') if state.output_lines else 'No output yet.' }}</div>
+</details>
+{% endblock %}

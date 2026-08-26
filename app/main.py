@@ -26,6 +26,12 @@ from app.registry import CATEGORIES, SCRIPT_REGISTRY, SCRIPTS_BY_ID
 from app.reminders import daily_reminders_context
 from app.runner import RUNNING, STOPPING, default_args_for, runner
 from app.scheduler import window_status
+from app.tennis_challenger import (
+    game_betting_check_service,
+    parse_tournament_links,
+    save_config as save_tennis_challenger_config,
+    watcher_context as tennis_challenger_context,
+)
 
 
 ensure_runtime_dirs()
@@ -52,6 +58,7 @@ UFC_CONFIG_PATH = CONFIG_DIR / "ufc_live_start_scanner.json"
 PFL_SCRIPT_ID = "pfl-live-start-scanner"
 PFL_CONFIG_PATH = CONFIG_DIR / "pfl_live_start_scanner.json"
 REMINDERS_SCRIPT_ID = "betfair-event-reminders"
+TENNIS_CHALLENGER_SCRIPT_ID = "tennis-challenger-watcher"
 
 
 class ParserBusyError(RuntimeError):
@@ -395,9 +402,10 @@ async def script_detail(request: Request, script_id: str):
         state = await asyncio.to_thread(runner.get_state, script_id)
         allowed, window_label = window_status(spec)
         cricket, inplay, parsed_output_message = await _parsed_output(spec, state)
+        template_name = "tennis_challenger.html" if spec.id == TENNIS_CHALLENGER_SCRIPT_ID else "script_detail.html"
         return templates.TemplateResponse(
             request,
-            "script_detail.html",
+            template_name,
             template_context(
                 request,
                 spec=spec,
@@ -412,6 +420,7 @@ async def script_detail(request: Request, script_id: str):
                 ufc=_ufc_context() if spec.id == UFC_SCRIPT_ID else None,
                 pfl=_pfl_context() if spec.id == PFL_SCRIPT_ID else None,
                 reminders=daily_reminders_context() if spec.id == REMINDERS_SCRIPT_ID else None,
+                tennis_challenger=tennis_challenger_context() if spec.id == TENNIS_CHALLENGER_SCRIPT_ID else None,
             ),
         )
     finally:
@@ -437,12 +446,52 @@ async def start_script(request: Request, script_id: str):
         return RedirectResponse(f"/scripts/{script_id}?error=missing-ufc-url", status_code=303)
     if script_id == PFL_SCRIPT_ID and not str(form.get("pfl_event_url", "") or _read_pfl_config().get("pfl_event_url", "")).strip():
         return RedirectResponse(f"/scripts/{script_id}?error=missing-pfl-url", status_code=303)
+    if script_id == TENNIS_CHALLENGER_SCRIPT_ID and not tennis_challenger_context()["configured"]:
+        return RedirectResponse(f"/scripts/{script_id}?error=missing-tournament-links", status_code=303)
     start_args = _default_args_for_start(spec, form)
     if script_id == GOLF_SCRIPT_ID:
         await asyncio.to_thread(runner.restart, script_id, start_args)
     else:
         await asyncio.to_thread(runner.start, script_id, start_args)
     return RedirectResponse(f"/scripts/{script_id}", status_code=303)
+
+
+@app.post("/scripts/tennis-challenger-watcher/config")
+async def save_tennis_challenger_links(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    form = dict(await request.form())
+    try:
+        links = parse_tournament_links(str(form.get("tournament_links", "") or ""))
+    except ValueError:
+        return RedirectResponse(
+            f"/scripts/{TENNIS_CHALLENGER_SCRIPT_ID}?error=invalid-tournament-link",
+            status_code=303,
+        )
+    await asyncio.to_thread(save_tennis_challenger_config, links)
+    return RedirectResponse(f"/scripts/{TENNIS_CHALLENGER_SCRIPT_ID}", status_code=303)
+
+
+@app.post("/scripts/tennis-challenger-watcher/check-game-betting")
+async def start_tennis_challenger_game_betting_check(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    await asyncio.to_thread(game_betting_check_service.start)
+    return RedirectResponse(f"/scripts/{TENNIS_CHALLENGER_SCRIPT_ID}", status_code=303)
+
+
+@app.get("/scripts/tennis-challenger-watcher/panel", response_class=HTMLResponse)
+async def tennis_challenger_panel(request: Request):
+    auth_redirect = require_auth(request)
+    if auth_redirect:
+        return auth_redirect
+    return templates.TemplateResponse(
+        request,
+        "partials/tennis_challenger_panel.html",
+        template_context(request, tennis_challenger=tennis_challenger_context()),
+    )
 
 
 @app.post("/scripts/golf-non-runner-check/config")
