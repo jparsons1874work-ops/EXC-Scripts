@@ -403,29 +403,23 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             "headless": True,
             "args": ["--disable-dev-shm-usage", "--no-sandbox"],
         }
-        chrome_binary = os.getenv("CHROME_BINARY", "").strip()
+        # The Hub's global CHROME_BINARY is intended for other scanners. This
+        # watcher deliberately mirrors the working FlashMultiviewer by using
+        # Playwright's own Chromium unless a Challenger-specific override is set.
+        chrome_binary = os.getenv("CHALLENGER_CHROME_BINARY", "").strip()
         if chrome_binary and Path(chrome_binary).is_file():
             launch_options["executable_path"] = chrome_binary
-        if chrome_binary and Path(chrome_binary).is_file():
-            log(f"Using configured Chrome binary: {chrome_binary}")
+            log(f"Using Challenger Chrome override: {chrome_binary}")
         else:
-            log("Using Playwright Chromium")
+            log("Using Playwright bundled Chromium (Multiviewer-compatible mode)")
         browser = playwright.chromium.launch(**launch_options)
-        log("Browser process launched")
+        log(f"Browser process launched: Chromium {browser.version}")
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},
-            locale="en-GB",
-            timezone_id="Europe/London",
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome Safari/537.36"
             ),
-        )
-        context.route(
-            "**/*",
-            lambda route: route.abort()
-            if route.request.resource_type in {"image", "media", "font"}
-            else route.continue_(),
         )
         log(f"Watcher started. Config: {CONFIG_PATH}. State: {STATE_PATH}.")
         write_runtime_state(matches, alerts, [], last_error="", phase="Starting first scan")
