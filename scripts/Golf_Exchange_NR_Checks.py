@@ -868,12 +868,12 @@ def scanner_status_message(active: bool, sites: list[tuple[str, dict[str, Any], 
             "Checking every 5 minutes. Scheduled heartbeat: 07:00 and 23:00 UK.",
             "Configured competitions:",
         ]
-        lines.extend(f"• *{site_def['label']}:* <{url}|official field page>" for _, site_def, url, _ in sites)
+        lines.extend(f"• *{site_def['label']}*" for _, site_def, _, _ in sites)
     else:
         lines = ["🔴 *Golf official field scanner offline*", "The continuous official-field checks have stopped."]
         if sites:
             lines.append("Configured competitions at shutdown:")
-            lines.extend(f"• *{site_def['label']}:* <{url}|official field page>" for _, site_def, url, _ in sites)
+            lines.extend(f"• *{site_def['label']}*" for _, site_def, _, _ in sites)
     return "\n".join(lines)
 
 

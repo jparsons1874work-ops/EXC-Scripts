@@ -261,7 +261,7 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertEqual(reading["field"], ["Alice Player", "Unlinked Golfer", "Jeongeun Lee5"])
         self.assertEqual(reading["alternates"], ["Reserve Person"])
 
-    def test_scanner_status_messages_include_enabled_urls(self) -> None:
+    def test_scanner_status_messages_list_competitions_without_urls(self) -> None:
         sites = [
             (
                 "pgatour",
@@ -275,9 +275,11 @@ class GolfFieldCheckerTests(unittest.TestCase):
         offline = golf.scanner_status_message(False, sites)
 
         self.assertIn("scanner active", active)
-        self.assertIn(self.url, active)
+        self.assertIn("PGA Tour", active)
+        self.assertNotIn(self.url, active)
         self.assertIn("scanner offline", offline)
-        self.assertIn(self.url, offline)
+        self.assertIn("PGA Tour", offline)
+        self.assertNotIn(self.url, offline)
 
     def test_scanner_status_uses_golf_slack_destination(self) -> None:
         sites = [("pgatour", self.site, self.url, "")]
@@ -285,7 +287,8 @@ class GolfFieldCheckerTests(unittest.TestCase):
             sent = golf.announce_scanner_status(True, {"sites": []}, sites)
 
         self.assertTrue(sent)
-        self.assertIn(self.url, send.call_args.args[1])
+        self.assertIn("PGA Tour", send.call_args.args[1])
+        self.assertNotIn(self.url, send.call_args.args[1])
         self.assertEqual(send.call_args.kwargs["timeout"], 5)
 
     def test_scanner_heartbeat_slots_follow_uk_time(self) -> None:
