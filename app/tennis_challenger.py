@@ -434,7 +434,15 @@ def market_type(catalogue: Any) -> str:
 def is_game_market(catalogue: Any) -> bool:
     kind = market_type(catalogue)
     name = str(_object_value(catalogue, "market_name", "") or "").strip()
-    return kind.startswith(GAME_MARKET_PREFIX) or bool(re.search(r"\b(?:set\s*\d+\s+)?game\s*\d+\b", name, re.IGNORECASE))
+    game_name = bool(
+        re.search(
+            r"\b(?:game\s*(?:no\.?\s*)?\d+|\d+(?:st|nd|rd|th)\s+game)\b",
+            name,
+            re.IGNORECASE,
+        )
+    )
+    game_type = kind.startswith(GAME_MARKET_PREFIX) or bool(re.match(r"^GAME_(?:BY_GAME_)?\d", kind))
+    return game_type or game_name
 
 
 def fetch_event_market_catalogues(
@@ -518,11 +526,7 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
             except Exception as exc:
                 catalogue_errors[event_id] = str(exc)
                 continue
-            for catalogue in catalogues:
-                event = _object_value(catalogue, "event", {})
-                catalogue_event_id = str(_object_value(event, "id", "") or "")
-                if catalogue_event_id == event_id:
-                    catalogues_by_event[event_id].append(catalogue)
+            catalogues_by_event[event_id].extend(catalogues)
 
         for row in rows:
             event_id = row.get("betfair_event_id", "")
@@ -537,13 +541,38 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
                     }
                 )
                 continue
-            game_markets = [catalogue for catalogue in catalogues_by_event.get(event_id, []) if is_game_market(catalogue)]
+            event_catalogues = catalogues_by_event.get(event_id, [])
+            if not event_catalogues:
+                row.update(
+                    {
+                        "status": "check_failed",
+                        "game_market_count": None,
+                        "message": "Betfair returned no market catalogue for this event; deletion cannot be confirmed.",
+                    }
+                )
+                continue
+            game_markets = [catalogue for catalogue in event_catalogues if is_game_market(catalogue)]
             names = sorted({str(_object_value(item, "market_name", "") or "") for item in game_markets})
+            observed = sorted(
+                {
+                    f"{str(_object_value(item, 'market_name', '') or '')} [{market_type(item) or 'unknown'}]"
+                    for item in event_catalogues
+                }
+            )
+            logger.info(
+                "tennis_challenger_game_markets_checked event_id=%s catalogues=%s game_markets=%s types=%s",
+                event_id,
+                len(event_catalogues),
+                len(game_markets),
+                sorted({market_type(item) or "unknown" for item in event_catalogues}),
+            )
             row.update(
                 {
                     "status": "needs_action" if game_markets else "clear",
                     "game_market_count": len(game_markets),
                     "market_names": names[:20],
+                    "catalogue_count": len(event_catalogues),
+                    "catalogue_summary": observed[:50],
                     "message": f"{len(game_markets)} game market(s) still present." if game_markets else "Game betting deleted.",
                 }
             )

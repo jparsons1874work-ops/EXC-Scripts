@@ -400,26 +400,33 @@ class TennisChallengerTests(unittest.TestCase):
     def test_game_market_detection_uses_market_type_and_name(self) -> None:
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"), market_name="1st Set Game 1 Winner")))
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SPECIAL"), market_name="2nd Set Game 5")))
+        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="MATCH_ODDS"), market_name="1st Set - 1st Game Winner")))
         self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SET_WINNER"), market_name="Set 1 Winner")))
+        self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="TOTAL_GAMES"), market_name="Total Games 21.5")))
 
     def test_game_betting_check_marks_matches_clear_or_needing_action(self) -> None:
+        def list_market_catalogue(**kwargs):
+            event_id = kwargs["filter"]["eventIds"][0]
+            if event_id == "1":
+                return [
+                    SimpleNamespace(
+                        description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"),
+                        market_name="1st Set Game 1 Winner",
+                    )
+                ]
+            return [
+                SimpleNamespace(
+                    description=SimpleNamespace(market_type="MATCH_ODDS"),
+                    market_name="Match Odds",
+                )
+            ]
+
         betting = SimpleNamespace(
             list_events=lambda **_kwargs: [
                 SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
                 SimpleNamespace(event=SimpleNamespace(id="2", name="C Brady & M Howse v J Doe & A Roe", open_date="2026-08-27T11:00:00Z")),
             ],
-            list_market_catalogue=lambda **_kwargs: [
-                SimpleNamespace(
-                    event=SimpleNamespace(id="1"),
-                    description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"),
-                    market_name="1st Set Game 1 Winner",
-                ),
-                SimpleNamespace(
-                    event=SimpleNamespace(id="2"),
-                    description=SimpleNamespace(market_type="MATCH_ODDS"),
-                    market_name="Match Odds",
-                ),
-            ],
+            list_market_catalogue=list_market_catalogue,
         )
         client = SimpleNamespace(betting=betting, logout=lambda: None)
         matches = [
@@ -477,6 +484,24 @@ class TennisChallengerTests(unittest.TestCase):
         statuses = {row["match_id"]: row["status"] for row in result["rows"]}
         self.assertEqual(statuses, {"a": "check_failed", "b": "clear"})
         self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["summary"], "attention")
+
+    def test_game_betting_check_does_not_mark_an_empty_catalogue_deleted(self) -> None:
+        betting = SimpleNamespace(
+            list_events=lambda **_kwargs: [
+                SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
+            ],
+            list_market_catalogue=lambda **_kwargs: [],
+        )
+        client = SimpleNamespace(betting=betting, logout=lambda: None)
+        matches = [
+            {"id": "a", "status": "scheduled", "player1": "Kopp S.", "player2": "Krumich M.", "betfair_event_id": "1"},
+        ]
+
+        with patch("app.tennis_challenger.betfair_login", return_value=client):
+            result = perform_game_betting_check(matches)
+
+        self.assertEqual(result["rows"][0]["status"], "check_failed")
         self.assertEqual(result["summary"], "attention")
 
     def test_challenger_page_renders_controls_and_match_state(self) -> None:

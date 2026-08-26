@@ -70,7 +70,7 @@
             {% if match.status != "scheduled" %}
             <span class="state-label state-muted">Not applicable</span>
             {% elif match.game_betting.status == "clear" %}
-            <span class="state-label state-ok">✓ Deleted</span>
+            <span class="state-label state-ok" title="{{ match.game_betting.catalogue_summary|join(', ') }}">✓ Deleted · {{ match.game_betting.catalogue_count }} checked</span>
             {% elif match.game_betting.status == "needs_action" %}
             <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
             {% elif match.game_betting.status == "event_not_found" %}
@@ -127,7 +127,7 @@
           <td><span class="state-label state-muted">{{ match.display_status or match.start_time }}</span></td>
           <td>
             {% if match.game_betting.status == "clear" %}
-            <span class="state-label state-ok">✓ Deleted</span>
+            <span class="state-label state-ok" title="{{ match.game_betting.catalogue_summary|join(', ') }}">✓ Deleted · {{ match.game_betting.catalogue_count }} checked</span>
             {% elif match.game_betting.status == "needs_action" %}
             <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
             {% elif match.game_betting.status == "event_not_found" %}
