@@ -26,13 +26,14 @@ from app.tennis_challenger import (
 )
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
+    EVENT_ROW_SELECTOR,
     extract_feed_config,
     extract_fixtures_feed,
     fetch_tournament_feed,
-    first_point_played,
     hydrate_initial_alert_flags,
     load_tournament_rows,
     normalize_scraped_match,
+    overlay_live_rows,
     parse_tournament_feed,
     pending_alerts,
     slack_message,
@@ -244,19 +245,12 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(match["server"], "Kopp S.")
         self.assertIn("toss decided", slack_message("serve_detected", match))
 
-    def test_live_row_with_server_but_no_point_sends_toss_before_match_started(self) -> None:
+    def test_scheduled_server_then_live_row_sends_separate_toss_and_start_alerts(self) -> None:
         scheduled = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
         scheduled["alerts_sent"] = hydrate_initial_alert_flags(scheduled)
 
         toss_decided = normalize_scraped_match(
             raw_match(
-                raw_status="Set 1",
-                row_classes="event__match event__match--live",
-                is_live=True,
-                is_scheduled=False,
-                set_score={"home": "0", "away": "0"},
-                set_parts=[{"home": "0", "away": "0"}],
-                current_points={"home": "0", "away": "0"},
                 server_side="home",
             ),
             AUGSBURG_URL,
@@ -264,11 +258,10 @@ class TennisChallengerTests(unittest.TestCase):
         )
         toss_decided["alerts_sent"] = dict(scheduled["alerts_sent"])
         toss_alerts = pending_alerts(scheduled, toss_decided)
-        self.assertFalse(first_point_played(toss_decided))
         self.assertEqual(toss_alerts, ["serve_detected"])
         apply_sent(toss_decided, toss_alerts)
 
-        first_point = normalize_scraped_match(
+        live = normalize_scraped_match(
             raw_match(
                 raw_status="Set 1",
                 row_classes="event__match event__match--live",
@@ -282,12 +275,11 @@ class TennisChallengerTests(unittest.TestCase):
             AUGSBURG_URL,
             "Augsburg (Singles)",
         )
-        first_point["alerts_sent"] = dict(toss_decided["alerts_sent"])
-        self.assertTrue(first_point_played(first_point))
-        self.assertEqual(pending_alerts(toss_decided, first_point), ["match_started"])
+        live["alerts_sent"] = dict(toss_decided["alerts_sent"])
+        self.assertEqual(pending_alerts(toss_decided, live), ["match_started"])
 
-    def test_new_live_row_without_score_does_not_claim_match_started(self) -> None:
-        waiting_for_first_point = normalize_scraped_match(
+    def test_new_live_row_without_score_sends_match_started(self) -> None:
+        live = normalize_scraped_match(
             raw_match(
                 raw_status="Set 1",
                 row_classes="event__match event__match--live",
@@ -300,8 +292,28 @@ class TennisChallengerTests(unittest.TestCase):
             AUGSBURG_URL,
             "Augsburg (Singles)",
         )
-        waiting_for_first_point["alerts_sent"] = hydrate_initial_alert_flags(waiting_for_first_point)
-        self.assertEqual(pending_alerts(None, waiting_for_first_point), [])
+        live["alerts_sent"] = hydrate_initial_alert_flags(live)
+        self.assertEqual(pending_alerts(None, live), ["match_started"])
+
+    def test_live_page_overlay_preserves_fixture_time_and_replaces_live_fields(self) -> None:
+        base = {
+            "abc123": {
+                **raw_match(),
+                "scheduled_at": "2026-08-27T09:00:00Z",
+            }
+        }
+        live = raw_match(
+            raw_status="Set 1",
+            row_classes="event__match event__match--live",
+            is_live=True,
+            is_scheduled=False,
+            server_side="away",
+        )
+        merged = overlay_live_rows(base, [live])
+        self.assertEqual(EVENT_ROW_SELECTOR, ".event__match[id]")
+        self.assertEqual(merged["abc123"]["scheduled_at"], "2026-08-27T09:00:00Z")
+        self.assertTrue(merged["abc123"]["is_live"])
+        self.assertEqual(merged["abc123"]["server_side"], "away")
 
     def test_slack_alert_includes_the_betfair_event_id(self) -> None:
         match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")

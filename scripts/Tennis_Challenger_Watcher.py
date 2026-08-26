@@ -61,7 +61,7 @@ DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
 BETFAIR_REFRESH_SECONDS = 5 * 60
 FIXTURES_REFRESH_SECONDS = 60
-EVENT_ROW_SELECTOR = '[data-event-row="true"]'
+EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -198,42 +198,14 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
     }
 
 
-def score_value_has_progress(value: Any) -> bool:
-    text = str(value if value is not None else "").strip().upper()
-    if text in {"A", "AD"}:
-        return True
-    try:
-        return float(text) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def first_point_played(match: dict[str, Any]) -> bool:
-    if str(match.get("status", "")) == "finished":
-        return True
-    score_sections = [
-        match.get("set_score", {}),
-        match.get("current_game", {}),
-        match.get("current_points", {}),
-        *(match.get("sets", []) or []),
-    ]
-    return any(
-        score_value_has_progress(value)
-        for section in score_sections
-        if isinstance(section, dict)
-        for value in section.values()
-    )
-
-
 def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
     status = str(match.get("status", ""))
     current_set = int(match.get("current_set_number") or 0)
     completed = status == "finished"
     set_count = len(match.get("sets", []) or [])
-    started = first_point_played(match)
     return {
-        "serve_detected": bool(match.get("server") and not started and not completed),
-        "match_started": started,
+        "serve_detected": bool(status == "scheduled" and match.get("server")),
+        "match_started": status == "live" or completed,
         "set_1_complete": current_set >= 2 or (completed and set_count >= 1),
         "set_2_complete": current_set >= 3 or (completed and set_count >= 2),
         "match_complete": completed,
@@ -248,7 +220,7 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
             return []
         if satisfied["serve_detected"]:
             return ["serve_detected"]
-        if satisfied["match_started"]:
+        if match.get("status") == "live":
             return ["match_started"]
         return []
     if satisfied["match_complete"] and not sent.get(ALERT_FLAG_BY_TYPE["match_complete"]):
@@ -256,6 +228,8 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
     order = ["serve_detected", "match_started", "set_1_complete", "set_2_complete", "match_complete"]
     alerts: list[str] = []
     for alert_type in order:
+        if alert_type == "serve_detected" and match.get("status") != "scheduled":
+            continue
         if satisfied[alert_type] and not sent.get(ALERT_FLAG_BY_TYPE[alert_type]):
             alerts.append(alert_type)
     return alerts
@@ -557,7 +531,7 @@ def load_tournament_rows(page: Any, url: str, label: str = "Tournament") -> list
     # The score data is usable as soon as the rows are attached to the DOM; it
     # does not need to be visually unobscured for extraction.
     log(f"{label}: waiting for match rows to attach")
-    page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=45000)
+    page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=15000)
     attached_count = page.locator(EVENT_ROW_SELECTOR).count()
     log(f"{label}: {attached_count} match row(s) attached; extracting scores")
     rows = extract_page_rows(page)
@@ -565,6 +539,93 @@ def load_tournament_rows(page: Any, url: str, label: str = "Tournament") -> list
         raise RuntimeError(f"Tournament page returned no match rows ({page_diagnostic(page)})")
     log(f"{label}: extracted {len(rows)} match row(s)")
     return rows
+
+
+class FlashscoreLivePageProbe:
+    """Keep live tournament pages open so short DOM transitions are not lost to feed caching."""
+
+    def __init__(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise RuntimeError("Playwright is not installed") from exc
+        self._manager = sync_playwright().start()
+        try:
+            self._browser = self._manager.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage", "--no-sandbox"],
+            )
+            self._context = self._browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=FLASHSCORE_USER_AGENT,
+            )
+        except Exception:
+            browser = getattr(self, "_browser", None)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            self._manager.stop()
+            raise
+        self._pages: dict[str, Any] = {}
+
+    def rows(self, url: str, label: str) -> list[dict[str, Any]]:
+        page = self._pages.get(url)
+        if page is None:
+            page = self._context.new_page()
+            page.set_default_timeout(8000)
+            self._pages[url] = page
+            rows = load_tournament_rows(page, url, f"{label} live page")
+            log(f"{label}: live page connected for toss and start detection")
+            return rows
+        rows = extract_page_rows(page)
+        if not rows:
+            raise RuntimeError(f"Live page returned no rows ({page_diagnostic(page)})")
+        return rows
+
+    def retain(self, urls: set[str]) -> None:
+        for old_url in set(self._pages) - urls:
+            page = self._pages.pop(old_url)
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def discard(self, url: str) -> None:
+        page = self._pages.pop(url, None)
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        for page in self._pages.values():
+            try:
+                page.close()
+            except Exception:
+                pass
+        self._pages.clear()
+        try:
+            self._context.close()
+        finally:
+            try:
+                self._browser.close()
+            finally:
+                self._manager.stop()
+
+
+def overlay_live_rows(
+    base_rows: dict[str, dict[str, Any]],
+    live_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    merged = dict(base_rows)
+    for live_row in live_rows:
+        match_id = str(live_row.get("id", "") or "")
+        if match_id in merged:
+            merged[match_id] = {**merged[match_id], **live_row}
+    return merged
 
 
 def _handle_stop(_signum: int, _frame: Any) -> None:
@@ -818,9 +879,17 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     betfair_client: Any = None
     session = requests.Session()
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
+    live_probe: FlashscoreLivePageProbe | None = None
+    live_probe_errors: dict[str, str] = {}
+    live_probe_retry_at: dict[str, float] = {}
 
     log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
-    log("Browser rendering bypassed; reading the tournament data feed directly")
+    log("Reading the tournament feed with a live-page overlay for toss and start transitions")
+    try:
+        live_probe = FlashscoreLivePageProbe()
+        log("Live-page browser launched")
+    except Exception as exc:
+        log(f"Live-page overlay unavailable; feed monitoring will continue: {exc}")
     write_runtime_state(matches, alerts, [], last_error="", phase="Starting first feed scan")
 
     sweep_number = 0
@@ -880,6 +949,10 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 feed_configs.pop(old_url, None)
                 fixture_rows.pop(old_url, None)
                 fixtures_loaded_at.pop(old_url, None)
+                live_probe_errors.pop(old_url, None)
+                live_probe_retry_at.pop(old_url, None)
+            if live_probe is not None:
+                live_probe.retain(set(links))
 
             for url in links:
                 tournament = tournament_label_from_url(url)
@@ -931,6 +1004,21 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         if item.get("id")
                     }
                 )
+                if live_probe is not None and time.monotonic() >= live_probe_retry_at.get(url, 0.0):
+                    try:
+                        live_rows = live_probe.rows(url, tournament)
+                        combined_matches = overlay_live_rows(combined_matches, live_rows)
+                        live_probe_retry_at.pop(url, None)
+                        if url in live_probe_errors:
+                            log(f"{tournament}: live-page overlay recovered")
+                            live_probe_errors.pop(url, None)
+                    except Exception as exc:
+                        error_text = str(exc)
+                        if live_probe_errors.get(url) != error_text:
+                            log(f"{tournament}: live-page overlay failed; using feed data: {error_text}")
+                        live_probe_errors[url] = error_text
+                        live_probe_retry_at[url] = time.monotonic() + 60
+                        live_probe.discard(url)
                 raw_matches = list(combined_matches.values())
 
                 now = utc_timestamp()
@@ -1040,6 +1128,11 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
     finally:
         session.close()
+        if live_probe is not None:
+            try:
+                live_probe.close()
+            except Exception as exc:
+                log(f"Live-page browser cleanup failed: {exc}")
         if betfair_client is not None:
             try:
                 betfair_client.logout()
