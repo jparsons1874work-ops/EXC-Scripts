@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -56,6 +57,11 @@ DEFAULT_POLL_SECONDS = 3.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
 EVENT_ROW_SELECTOR = '[data-event-row="true"]'
+UK_TIMEZONE = ZoneInfo("Europe/London")
+FLASHSCORE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome Safari/537.36"
+)
 
 
 ROW_EXTRACTOR = r"""
@@ -293,6 +299,143 @@ def configured_links() -> list[str]:
     return list(dict.fromkeys(links))
 
 
+def extract_feed_config(html: str, source_url: str) -> dict[str, str]:
+    country_match = re.search(r"country_id\s*=\s*(\d+)", html)
+    tournament_match = re.search(r'tournament_id\s*=\s*"([A-Za-z0-9]+)"', html)
+    sport_match = re.search(r"sport_id\s*:\s*(\d+)", html)
+    feed_sign_match = re.search(r'feed_sign\\?"\s*:\s*\\?"([^"\\]+)', html)
+    if not country_match or not tournament_match or not feed_sign_match:
+        raise RuntimeError("Flashscore page did not expose its tournament feed configuration")
+    offset = datetime.now(UK_TIMEZONE).utcoffset()
+    timezone_hour = int((offset.total_seconds() if offset else 0) // 3600)
+    sport_id = sport_match.group(1) if sport_match else "2"
+    tournament_id = tournament_match.group(1)
+    country_id = country_match.group(1)
+    feed_name = f"t_{sport_id}_{country_id}_{tournament_id}_{timezone_hour}_en_1"
+    return {
+        "source_url": source_url,
+        "feed_url": f"https://global.flashscore.ninja/2/x/feed/{feed_name}",
+        "feed_sign": feed_sign_match.group(1),
+        "tournament_id": tournament_id,
+        "country_id": country_id,
+    }
+
+
+def load_feed_config(session: requests.Session, source_url: str, label: str) -> dict[str, str]:
+    log(f"{label}: loading tournament feed configuration")
+    response = session.get(source_url, timeout=25)
+    response.raise_for_status()
+    config = extract_feed_config(response.text, source_url)
+    log(
+        f"{label}: feed configured (tournament {config['tournament_id']}, "
+        f"country {config['country_id']})"
+    )
+    return config
+
+
+def feed_fields(chunk: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for item in chunk.split("¬"):
+        key, separator, value = item.partition("÷")
+        if separator and key and key not in fields:
+            fields[key] = value
+    return fields
+
+
+def feed_start_time(value: str) -> str:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return "Scheduled"
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(UK_TIMEZONE).strftime("%d.%m. %H:%M")
+
+
+def parse_tournament_feed(payload: str, source_url: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for chunk in str(payload or "").split("¬~"):
+        if not chunk.startswith("AA÷"):
+            continue
+        fields = feed_fields(chunk)
+        match_id = fields.get("AA", "").strip()
+        player1 = (fields.get("AE") or fields.get("CX") or "").strip()
+        player2 = (fields.get("AF") or "").strip()
+        if not match_id or not player1 or not player2:
+            continue
+
+        status_code = fields.get("AB", "")
+        if status_code == "2":
+            status = "live"
+        elif status_code == "3":
+            status = "finished"
+        else:
+            status = "scheduled"
+        set_score = {
+            "home": clean_score_value(fields.get("AG")),
+            "away": clean_score_value(fields.get("AH")),
+        }
+        completed_sets = int(set_score["home"] or 0) + int(set_score["away"] or 0)
+        raw_status = (
+            f"Set {completed_sets + 1}"
+            if status == "live"
+            else "Finished"
+            if status == "finished"
+            else feed_start_time(fields.get("AD", ""))
+        )
+        set_keys = [("BA", "BB"), ("BC", "BD"), ("BE", "BF"), ("BG", "BH"), ("BI", "BJ")]
+        set_parts = [
+            {"home": fields.get(home_key, ""), "away": fields.get(away_key, "")}
+            for home_key, away_key in set_keys
+        ]
+        server_side = "home" if fields.get("AI") == "y" else "away" if fields.get("AJ") == "y" else ""
+        rows.append(
+            {
+                "id": match_id,
+                "url": f"https://www.flashscore.com/match/tennis/{match_id}/",
+                "player1": player1,
+                "player2": player2,
+                "raw_status": raw_status,
+                "row_classes": f"event__match event__match--{status}",
+                "set_score": set_score,
+                "set_parts": set_parts,
+                "current_points": {
+                    "home": fields.get("WA", ""),
+                    "away": fields.get("WB", ""),
+                },
+                "server_side": server_side,
+                "is_live": status == "live",
+                "is_scheduled": status == "scheduled",
+            }
+        )
+    return rows
+
+
+def fetch_tournament_feed(
+    session: requests.Session,
+    config: dict[str, str],
+    label: str,
+) -> list[dict[str, Any]]:
+    response = session.get(
+        config["feed_url"],
+        headers={
+            "x-fsign": config["feed_sign"],
+            "Referer": config["source_url"],
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    rows = parse_tournament_feed(response.text, config["source_url"])
+    if not rows:
+        raise RuntimeError(
+            f"Flashscore feed returned no matches (HTTP {response.status_code}, "
+            f"{len(response.text)} characters)"
+        )
+    age = response.headers.get("Age", "unknown")
+    log(f"{label}: feed returned {len(rows)} match(es), cache age {age}s")
+    return rows
+
+
 def extract_page_rows(page: Any) -> list[dict[str, Any]]:
     rows = page.eval_on_selector_all(EVENT_ROW_SELECTOR, ROW_EXTRACTOR)
     return [row for row in rows or [] if isinstance(row, dict)]
@@ -372,7 +515,7 @@ def write_runtime_state(
     )
 
 
-def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
+def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
     webhook = slack_webhook_url()
     if not webhook:
         raise RuntimeError(
@@ -571,6 +714,164 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
     write_runtime_state(matches, alerts, [], last_error="")
     log("Watcher stopped cleanly.")
+    return 0
+
+
+def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
+    webhook = slack_webhook_url()
+    if not webhook:
+        raise RuntimeError("Slack is not configured. Set Webhook_Challenger in the Hub environment.")
+    links = configured_links()
+    if not links:
+        raise RuntimeError("No ATP Challenger tournament links are saved in the Hub.")
+
+    prior = read_state()
+    matches = {
+        str(item.get("id", "")): item
+        for item in prior.get("matches", []) or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
+    feed_configs: dict[str, dict[str, Any]] = {}
+    session = requests.Session()
+    session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
+
+    log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
+    log("Browser rendering bypassed; reading the tournament data feed directly")
+    write_runtime_state(matches, alerts, [], last_error="", phase="Starting first feed scan")
+
+    sweep_number = 0
+    try:
+        while not STOP_EVENT.is_set():
+            sweep_number += 1
+            sweep_started = time.monotonic()
+            links = configured_links()
+            source_errors: dict[str, str] = {}
+            if sweep_number == 1 or sweep_number % 10 == 0:
+                log(
+                    f"Feed sweep {sweep_number} started: {len(links)} tournament(s), "
+                    f"{len(matches)} known match(es)"
+                )
+
+            if not links:
+                write_runtime_state(
+                    matches,
+                    alerts,
+                    [],
+                    last_error="No tournament links are configured.",
+                    phase="Waiting for tournament links",
+                )
+                STOP_EVENT.wait(max(1.0, poll_seconds))
+                continue
+
+            for old_url in set(feed_configs) - set(links):
+                feed_configs.pop(old_url, None)
+
+            for url in links:
+                tournament = tournament_label_from_url(url)
+                config = feed_configs.get(url)
+                needs_reload = (
+                    config is None
+                    or time.monotonic() - float(config.get("loaded_at", 0)) >= reload_minutes * 60
+                )
+                try:
+                    if needs_reload:
+                        write_runtime_state(
+                            matches,
+                            alerts,
+                            [],
+                            last_error="",
+                            phase=f"Configuring {tournament}",
+                        )
+                        config = load_feed_config(session, url, tournament)
+                        config["loaded_at"] = time.monotonic()
+                        feed_configs[url] = config
+                    raw_matches = fetch_tournament_feed(session, config, tournament)
+                    source_errors.pop(url, None)
+                except Exception as exc:
+                    source_errors[url] = str(exc)
+                    feed_configs.pop(url, None)
+                    log(f"Tournament feed failed for {tournament}: {exc}")
+                    continue
+
+                now = utc_timestamp()
+                for raw in raw_matches:
+                    scraped = normalize_scraped_match(raw, url, tournament)
+                    match_id = scraped["id"]
+                    previous = matches.get(match_id)
+                    next_match = {
+                        **(previous or {}),
+                        **scraped,
+                        "first_seen_at": (previous or {}).get("first_seen_at", now),
+                        "last_checked_at": now,
+                        "last_error": "",
+                    }
+                    if previous is None:
+                        next_match["alerts_sent"] = hydrate_initial_alert_flags(next_match)
+                    else:
+                        next_match["alerts_sent"] = dict(previous.get("alerts_sent", {}) or {})
+
+                    for alert_type in pending_alerts(previous, next_match):
+                        try:
+                            message = slack_message(alert_type, next_match)
+                            send_slack(webhook, message)
+                        except Exception as exc:
+                            next_match["last_error"] = f"Slack alert failed: {exc}"
+                            log(f"Slack alert failed for {next_match['player1']} v {next_match['player2']}: {exc}")
+                            continue
+                        next_match["alerts_sent"][ALERT_FLAG_BY_TYPE[alert_type]] = True
+                        alert = {
+                            "timestamp": now,
+                            "type": alert_type,
+                            "match_id": match_id,
+                            "match": f"{next_match['player1']} v {next_match['player2']}",
+                            "tournament": tournament,
+                            "message": message,
+                        }
+                        alerts.append(alert)
+                        next_match["last_alert_at"] = now
+                        log(f"Slack alert sent: {alert_type} — {alert['match']}")
+                    matches[match_id] = next_match
+
+            active_urls = set(links)
+            matches = {
+                key: value
+                for key, value in matches.items()
+                if value.get("source_url") in active_urls
+            }
+            sources = [
+                {
+                    "url": url,
+                    "label": tournament_label_from_url(url),
+                    "status": "error" if url in source_errors else "ok",
+                    "error": source_errors.get(url, ""),
+                }
+                for url in links
+            ]
+            error_message = "; ".join(
+                f"{tournament_label_from_url(url)}: {error}"
+                for url, error in source_errors.items()
+            )
+            phase = (
+                f"Watching {len(links)} tournament feed(s)"
+                if not error_message
+                else f"Feed scan completed with {len(source_errors)} source error(s)"
+            )
+            write_runtime_state(matches, alerts, sources, last_error=error_message, phase=phase)
+            if sweep_number == 1 or sweep_number % 10 == 0 or error_message:
+                live_count = sum(item.get("status") == "live" for item in matches.values())
+                scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
+                log(
+                    f"Feed sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
+                    f"{len(matches)} match(es), {scheduled_count} scheduled, {live_count} live, "
+                    f"{len(source_errors)} source error(s)"
+                )
+            STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
+    finally:
+        session.close()
+
+    write_runtime_state(matches, alerts, [], last_error="", phase="Stopped")
+    log("Direct feed watcher stopped cleanly.")
     return 0
 
 

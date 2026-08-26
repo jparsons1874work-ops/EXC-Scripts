@@ -23,9 +23,11 @@ from app.tennis_challenger import (
 )
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
+    extract_feed_config,
     hydrate_initial_alert_flags,
     load_tournament_rows,
     normalize_scraped_match,
+    parse_tournament_feed,
     pending_alerts,
     slack_message,
     slack_webhook_url,
@@ -94,6 +96,36 @@ class TennisChallengerTests(unittest.TestCase):
         rows = load_tournament_rows(page, AUGSBURG_URL)
         self.assertEqual(len(rows), 1)
         self.assertEqual(page.wait_options["state"], "attached")
+
+    def test_flashscore_feed_config_is_read_from_tournament_html(self) -> None:
+        html = (
+            'sport_id":2; country_id = 5729;tournament_id = "SUQ1VjQ1"; '
+            '"feed_sign":"SW9D1eZo"'
+        )
+        config = extract_feed_config(html, AUGSBURG_URL)
+        self.assertEqual(config["tournament_id"], "SUQ1VjQ1")
+        self.assertEqual(config["country_id"], "5729")
+        self.assertEqual(config["feed_sign"], "SW9D1eZo")
+        self.assertIn("/2/x/feed/t_2_5729_SUQ1VjQ1_", config["feed_url"])
+
+    def test_flashscore_feed_parser_reads_status_scores_and_server(self) -> None:
+        payload = (
+            "SA÷2¬~"
+            "AA÷live123¬AD÷1787757600¬AB÷2¬AC÷47¬AE÷Basing M.¬AF÷Deckers A."
+            "¬AG÷0¬AH÷0¬BA÷6¬BB÷6¬WA÷5¬WB÷3¬AI÷y¬~"
+            "AA÷scheduled456¬AD÷1787821200¬AB÷1¬AE÷Monday J.¬AF÷Ribecai M.¬~"
+            "AA÷finished789¬AD÷1787739000¬AB÷3¬AE÷Ivanov I.¬AF÷Loffhagen G."
+            "¬AG÷0¬AH÷2¬BA÷3¬BB÷6¬BC÷0¬BD÷6¬~"
+        )
+        rows = parse_tournament_feed(payload, AUGSBURG_URL)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["raw_status"], "Set 1")
+        self.assertTrue(rows[0]["is_live"])
+        self.assertEqual(rows[0]["server_side"], "home")
+        self.assertEqual(rows[0]["set_parts"][0], {"home": "6", "away": "6"})
+        self.assertTrue(rows[1]["is_scheduled"])
+        self.assertEqual(rows[2]["raw_status"], "Finished")
+        self.assertEqual(rows[2]["set_score"], {"home": 0, "away": 2})
 
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
