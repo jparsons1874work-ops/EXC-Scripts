@@ -385,6 +385,17 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertGreaterEqual(score, 95)
         self.assertEqual(reason, "Matched")
         self.assertGreaterEqual(participant_match_score("Brady C. / Howse M.", "C Brady & M Howse"), 95)
+        self.assertEqual(participant_match_score("Monday J.", "Maxted/Monday"), 0)
+
+        singles, _, _ = match_betfair_event(
+            {"player1": "Monday J.", "player2": "Ribecai M."},
+            [
+                BetfairTennisEvent("singles", "J Monday v M Ribecai", None),
+                BetfairTennisEvent("doubles", "Maxted/Monday v Andaloro/Ribecai", None),
+            ],
+        )
+        self.assertIsNotNone(singles)
+        self.assertEqual(singles.event_id, "singles")
 
     def test_game_market_detection_uses_market_type_and_name(self) -> None:
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"), market_name="1st Set Game 1 Winner")))
@@ -430,6 +441,43 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(statuses, {"a": "needs_action", "b": "clear"})
         self.assertEqual(result["needs_action_count"], 1)
         self.assertEqual(result["summary"], "needs_action")
+
+    def test_game_betting_check_isolates_a_betfair_500_to_one_event(self) -> None:
+        def list_market_catalogue(**kwargs):
+            event_id = kwargs["filter"]["eventIds"][0]
+            if event_id == "1":
+                raise RuntimeError("Status code error: 500")
+            return [
+                SimpleNamespace(
+                    event=SimpleNamespace(id="2"),
+                    description=SimpleNamespace(market_type="MATCH_ODDS"),
+                    market_name="Match Odds",
+                )
+            ]
+
+        betting = SimpleNamespace(
+            list_events=lambda **_kwargs: [
+                SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
+                SimpleNamespace(event=SimpleNamespace(id="2", name="C Brady v M Howse", open_date="2026-08-27T11:00:00Z")),
+            ],
+            list_market_catalogue=list_market_catalogue,
+        )
+        client = SimpleNamespace(betting=betting, logout=lambda: None)
+        matches = [
+            {"id": "a", "status": "scheduled", "player1": "Kopp S.", "player2": "Krumich M.", "betfair_event_id": "1"},
+            {"id": "b", "status": "scheduled", "player1": "Brady C.", "player2": "Howse M.", "betfair_event_id": "2"},
+        ]
+
+        with (
+            patch("app.tennis_challenger.betfair_login", return_value=client),
+            patch("app.tennis_challenger.time.sleep"),
+        ):
+            result = perform_game_betting_check(matches)
+
+        statuses = {row["match_id"]: row["status"] for row in result["rows"]}
+        self.assertEqual(statuses, {"a": "check_failed", "b": "clear"})
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["summary"], "attention")
 
     def test_challenger_page_renders_controls_and_match_state(self) -> None:
         request = Request(
@@ -531,7 +579,7 @@ class TennisChallengerTests(unittest.TestCase):
                     ],
                 }
             ],
-            "game_check": {"status": "complete", "completed_at_label": "26 Aug 2026 10:01:00", "error": ""},
+            "game_check": {"status": "running", "completed_at_label": "", "error": ""},
             "last_sweep_label": "26 Aug 2026 10:00:03",
             "watcher": {"last_error": "", "sources": []},
             "counts": {"total": 1, "scheduled": 1, "live": 0, "finished": 0},
@@ -548,6 +596,9 @@ class TennisChallengerTests(unittest.TestCase):
         html = hub.templates.get_template("tennis_challenger.html").render(context)
         self.assertIn("Start watcher", html)
         self.assertIn("Check game betting", html)
+        button_text = html.index(">Check game betting</button>")
+        button_tag = html[html.rfind("<button", 0, button_text) : button_text]
+        self.assertNotIn("disabled", button_tag)
         self.assertIn("Kopp S. v Krumich M.", html)
         self.assertIn("Action needed", html)
         self.assertIn("Tomorrow and future matches", html)

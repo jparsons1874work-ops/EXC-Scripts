@@ -48,7 +48,7 @@
         <button class="button button-danger" type="submit" {% if state.status not in ["running", "stopping"] %}disabled{% endif %}>Stop watcher</button>
       </form>
       <form method="post" action="/scripts/{{ spec.id }}/check-game-betting">
-        <button class="button button-ghost button-wide" type="submit" {% if not tennis_challenger.matches or tennis_challenger.game_check.status == "running" %}disabled{% endif %}>Check game betting</button>
+        <button class="button button-ghost button-wide" type="submit" {% if not tennis_challenger.matches %}disabled{% endif %}>Check game betting</button>
       </form>
     </div>
     <div class="message compact-message">

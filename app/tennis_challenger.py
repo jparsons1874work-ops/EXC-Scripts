@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -304,8 +305,9 @@ def split_betfair_players(value: str) -> tuple[str, str] | None:
 
 def participant_match_score(flashscore_name: str, betfair_name: str) -> float:
     source_surnames = participant_surnames(flashscore_name)
+    target_surnames = participant_surnames(betfair_name)
     target = normalize_name(betfair_name)
-    if not source_surnames or not target:
+    if not source_surnames or not target_surnames or len(source_surnames) != len(target_surnames) or not target:
         return 0.0
     token_scores = []
     for surname in source_surnames:
@@ -365,21 +367,35 @@ def create_betfair_client() -> betfairlightweight.APIClient:
 
 def fetch_upcoming_betfair_tennis_events(
     client: betfairlightweight.APIClient | None = None,
+    attempts: int = 3,
 ) -> list[BetfairTennisEvent]:
     owns_client = client is None
     active_client = client or create_betfair_client()
     try:
         now = datetime.now(timezone.utc)
-        results = active_client.betting.list_events(
-            filter=market_filter(
-                event_type_ids=[TENNIS_EVENT_TYPE_ID],
-                market_start_time={
-                    "from": (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "to": (now + timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                },
-            )
+        event_filter = market_filter(
+            event_type_ids=[TENNIS_EVENT_TYPE_ID],
+            market_start_time={
+                "from": (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to": (now + timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
         )
-        return parse_betfair_events(results)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return parse_betfair_events(active_client.betting.list_events(filter=event_filter))
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "tennis_challenger_event_list_retry attempt=%s/%s error=%s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt < attempts:
+                    time.sleep(0.5 * attempt)
+        assert last_error is not None
+        raise last_error
     finally:
         if owns_client:
             try:
@@ -421,6 +437,38 @@ def is_game_market(catalogue: Any) -> bool:
     return kind.startswith(GAME_MARKET_PREFIX) or bool(re.search(r"\b(?:set\s*\d+\s+)?game\s*\d+\b", name, re.IGNORECASE))
 
 
+def fetch_event_market_catalogues(
+    client: betfairlightweight.APIClient,
+    event_id: str,
+    attempts: int = 3,
+) -> list[Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return list(
+                client.betting.list_market_catalogue(
+                    filter=market_filter(event_ids=[event_id]),
+                    market_projection=["EVENT", "MARKET_DESCRIPTION", "MARKET_START_TIME"],
+                    max_results=1000,
+                    sort="FIRST_TO_START",
+                )
+                or []
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "tennis_challenger_market_catalogue_retry event_id=%s attempt=%s/%s error=%s",
+                event_id,
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(0.5 * attempt)
+    assert last_error is not None
+    raise last_error
+
+
 def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
     started_at = utc_timestamp()
     scheduled = [match for match in matches if str(match.get("status", "")) == "scheduled"]
@@ -437,17 +485,7 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
     environment = child_environment()
     client = betfair_login(environment)
     try:
-        now = datetime.now(timezone.utc)
-        event_results = client.betting.list_events(
-            filter=market_filter(
-                event_type_ids=[TENNIS_EVENT_TYPE_ID],
-                market_start_time={
-                    "from": (now - timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "to": (now + timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                },
-            )
-        )
-        events = parse_betfair_events(event_results)
+        events = fetch_upcoming_betfair_tennis_events(client)
         events_by_id = {event.event_id: event for event in events}
         rows: list[dict[str, Any]] = []
         event_matches: dict[str, BetfairTennisEvent] = {}
@@ -473,24 +511,31 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
                 rows.append({**base, "status": "pending", "game_market_count": None, "message": "Checking markets."})
 
         catalogues_by_event: dict[str, list[Any]] = {event_id: [] for event_id in event_matches}
-        event_ids = list(event_matches)
-        for index in range(0, len(event_ids), 10):
-            chunk = event_ids[index : index + 10]
-            catalogues = client.betting.list_market_catalogue(
-                filter=market_filter(event_ids=chunk),
-                market_projection=["EVENT", "MARKET_DESCRIPTION", "MARKET_START_TIME"],
-                max_results=1000,
-                sort="FIRST_TO_START",
-            )
-            for catalogue in catalogues or []:
+        catalogue_errors: dict[str, str] = {}
+        for event_id in event_matches:
+            try:
+                catalogues = fetch_event_market_catalogues(client, event_id)
+            except Exception as exc:
+                catalogue_errors[event_id] = str(exc)
+                continue
+            for catalogue in catalogues:
                 event = _object_value(catalogue, "event", {})
-                event_id = str(_object_value(event, "id", "") or "")
-                if event_id in catalogues_by_event:
+                catalogue_event_id = str(_object_value(event, "id", "") or "")
+                if catalogue_event_id == event_id:
                     catalogues_by_event[event_id].append(catalogue)
 
         for row in rows:
             event_id = row.get("betfair_event_id", "")
             if not event_id:
+                continue
+            if event_id in catalogue_errors:
+                row.update(
+                    {
+                        "status": "check_failed",
+                        "game_market_count": None,
+                        "message": f"Betfair market check failed: {catalogue_errors[event_id]}",
+                    }
+                )
                 continue
             game_markets = [catalogue for catalogue in catalogues_by_event.get(event_id, []) if is_game_market(catalogue)]
             names = sorted({str(_object_value(item, "market_name", "") or "") for item in game_markets})
@@ -509,7 +554,7 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
             logger.warning("tennis_challenger_betfair_logout_failed", exc_info=True)
 
     needs_action = sum(row.get("status") == "needs_action" for row in rows)
-    unresolved = sum(row.get("status") == "event_not_found" for row in rows)
+    unresolved = sum(row.get("status") in {"event_not_found", "check_failed"} for row in rows)
     return {
         "status": "complete",
         "started_at": started_at,

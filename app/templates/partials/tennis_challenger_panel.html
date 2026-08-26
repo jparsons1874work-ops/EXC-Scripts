@@ -75,6 +75,8 @@
             <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
             {% elif match.game_betting.status == "event_not_found" %}
             <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
+            {% elif match.game_betting.status == "check_failed" %}
+            <span class="state-label state-warn" title="{{ match.game_betting.message }}">? Check failed</span>
             {% else %}
             <span class="state-label state-muted">Not checked</span>
             {% endif %}
@@ -130,6 +132,8 @@
             <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
             {% elif match.game_betting.status == "event_not_found" %}
             <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
+            {% elif match.game_betting.status == "check_failed" %}
+            <span class="state-label state-warn" title="{{ match.game_betting.message }}">? Check failed</span>
             {% else %}
             <span class="state-label state-muted">Not checked</span>
             {% endif %}
