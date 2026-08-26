@@ -231,7 +231,10 @@ def watcher_context() -> dict[str, Any]:
         item = dict(raw)
         item["score_label"] = current_score_label(item)
         item["last_checked_label"] = uk_time_label(item.get("last_checked_at"))
-        item["game_betting"] = check_rows.get(str(item.get("id", "")), {})
+        game_betting = check_rows.get(str(item.get("id", "")), {})
+        if str(game_betting.get("betfair_event_id", "")) != str(item.get("betfair_event_id", "")):
+            game_betting = {}
+        item["game_betting"] = game_betting
         matches.append(item)
     status_order = {"live": 0, "scheduled": 1, "suspended": 2, "error": 3, "finished": 4}
     matches.sort(
@@ -434,14 +437,8 @@ def market_type(catalogue: Any) -> str:
 def is_game_market(catalogue: Any) -> bool:
     kind = market_type(catalogue)
     name = str(_object_value(catalogue, "market_name", "") or "").strip()
-    game_name = bool(
-        re.search(
-            r"\b(?:game\s*(?:no\.?\s*)?\d+|\d+(?:st|nd|rd|th)\s+game)\b",
-            name,
-            re.IGNORECASE,
-        )
-    )
-    game_type = kind.startswith(GAME_MARKET_PREFIX) or bool(re.match(r"^GAME_(?:BY_GAME_)?\d", kind))
+    game_name = bool(re.search(r"\bgame\b", name, re.IGNORECASE))
+    game_type = kind == "GAME" or kind.startswith("GAME_")
     return game_type or game_name
 
 
@@ -494,16 +491,10 @@ def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
     client = betfair_login(environment)
     try:
         events = fetch_upcoming_betfair_tennis_events(client)
-        events_by_id = {event.event_id: event for event in events}
         rows: list[dict[str, Any]] = []
         event_matches: dict[str, BetfairTennisEvent] = {}
         for match in scheduled:
-            known_event_id = str(match.get("betfair_event_id", "") or "")
-            event = events_by_id.get(known_event_id)
-            if event is not None:
-                score, reason = 100.0, "Matched by watcher"
-            else:
-                event, score, reason = match_betfair_event(match, events)
+            event, score, reason = match_betfair_event(match, events)
             base = {
                 "match_id": str(match.get("id", "")),
                 "match": f"{match.get('player1', '?')} v {match.get('player2', '?')}",

@@ -919,7 +919,11 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         "last_checked_at": now,
                         "last_error": "",
                     }
-                    if betfair_events and not next_match.get("betfair_event_id"):
+                    should_recheck_betfair = (
+                        next_match.get("status") == "scheduled"
+                        or not next_match.get("betfair_event_id")
+                    )
+                    if betfair_events and should_recheck_betfair:
                         betfair_event, betfair_score, betfair_reason = match_betfair_event(
                             next_match,
                             betfair_events,

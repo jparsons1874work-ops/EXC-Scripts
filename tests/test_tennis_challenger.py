@@ -401,6 +401,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"), market_name="1st Set Game 1 Winner")))
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SPECIAL"), market_name="2nd Set Game 5")))
         self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="MATCH_ODDS"), market_name="1st Set - 1st Game Winner")))
+        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SPECIAL"), market_name="Game Betting")))
         self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SET_WINNER"), market_name="Set 1 Winner")))
         self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="TOTAL_GAMES"), market_name="Total Games 21.5")))
 
@@ -436,7 +437,7 @@ class TennisChallengerTests(unittest.TestCase):
                 "player1": "Kopp S.",
                 "player2": "Krumich M.",
                 "tournament": "Augsburg",
-                "betfair_event_id": "1",
+                "betfair_event_id": "stale-event-id",
             },
             {"id": "b", "status": "scheduled", "player1": "Brady C. / Howse M.", "player2": "Doe J. / Roe A.", "tournament": "Augsburg Doubles"},
         ]
@@ -446,6 +447,8 @@ class TennisChallengerTests(unittest.TestCase):
 
         statuses = {row["match_id"]: row["status"] for row in result["rows"]}
         self.assertEqual(statuses, {"a": "needs_action", "b": "clear"})
+        event_ids = {row["match_id"]: row["betfair_event_id"] for row in result["rows"]}
+        self.assertEqual(event_ids, {"a": "1", "b": "2"})
         self.assertEqual(result["needs_action_count"], 1)
         self.assertEqual(result["summary"], "needs_action")
 
