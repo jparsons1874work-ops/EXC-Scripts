@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,6 +32,7 @@ from scripts.Tennis_Challenger_Watcher import (
 
 
 AUGSBURG_URL = "https://www.flashscore.com/tennis/challenger-men-singles/augsburg/"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def raw_match(**updates):
@@ -56,6 +60,18 @@ def apply_sent(match, alert_types):
 
 
 class TennisChallengerTests(unittest.TestCase):
+    def test_watcher_can_start_from_its_script_path(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "Tennis_Challenger_Watcher.py"), "--help"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Monitor configured Flashscore ATP Challenger tournaments", completed.stdout)
+
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
         self.assertTrue(spec.long_running)

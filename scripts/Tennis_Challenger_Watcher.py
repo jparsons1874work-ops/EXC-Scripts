@@ -18,6 +18,10 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from app.tennis_challenger import (
     CONFIG_PATH,
     STATE_PATH,
@@ -37,7 +41,6 @@ except AttributeError:
     pass
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 STOP_EVENT = threading.Event()
