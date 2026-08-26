@@ -259,7 +259,7 @@ th { color: var(--accent); font-size: 0.82rem; text-transform: uppercase; }
 .match-row-scheduled { background: rgba(246, 195, 67, 0.025); }
 .challenger-console-panel { margin-bottom: 18px; }
 .challenger-console-panel summary { cursor: pointer; color: var(--accent); font-weight: 800; }
-.challenger-console { min-height: 180px; max-height: 360px; margin-top: 14px; }
+.challenger-console-panel .console { min-height: 180px; max-height: 360px; margin-top: 14px; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }

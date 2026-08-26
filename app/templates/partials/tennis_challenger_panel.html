@@ -1,7 +1,10 @@
 <section class="panel challenger-overview">
   <div class="panel-header">
     <h2>Scanner overview</h2>
-    <span class="meta">{% if tennis_challenger.last_sweep_label %}Last scan {{ tennis_challenger.last_sweep_label }}{% else %}Not scanned yet{% endif %}</span>
+    <span class="meta">
+      {% if tennis_challenger.watcher.phase %}{{ tennis_challenger.watcher.phase }} · {% endif %}
+      {% if tennis_challenger.last_sweep_label %}Last update {{ tennis_challenger.last_sweep_label }}{% else %}Not scanned yet{% endif %}
+    </span>
   </div>
   <div class="metric-row challenger-metrics">
     <div class="metric"><span class="metric-label">In scope</span><span class="metric-value">{{ tennis_challenger.counts.total }}</span></div>

@@ -76,6 +76,7 @@ class TennisChallengerTests(unittest.TestCase):
     def test_tournament_loader_waits_for_attached_not_visible_rows(self) -> None:
         class FakePage:
             wait_options = None
+            url = AUGSBURG_URL
 
             def goto(self, *_args, **_kwargs):
                 return None
@@ -85,6 +86,9 @@ class TennisChallengerTests(unittest.TestCase):
 
             def eval_on_selector_all(self, _selector, _extractor):
                 return [raw_match()]
+
+            def locator(self, _selector):
+                return SimpleNamespace(count=lambda: 1)
 
         page = FakePage()
         rows = load_tournament_rows(page, AUGSBURG_URL)

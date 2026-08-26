@@ -64,6 +64,8 @@
 
 <details class="panel challenger-console-panel">
   <summary>Watcher log</summary>
-  <div class="console challenger-console">{{ state.output_lines[-300:]|join('\n') if state.output_lines else 'No output yet.' }}</div>
+  <div id="challenger-output" hx-get="/scripts/{{ spec.id }}/output" hx-trigger="every 2s" hx-swap="innerHTML">
+    {% include "partials/output_console.html" %}
+  </div>
 </details>
 {% endblock %}

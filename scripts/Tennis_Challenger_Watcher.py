@@ -317,15 +317,32 @@ def page_diagnostic(page: Any) -> str:
     return "; ".join(details) or "page diagnostics unavailable"
 
 
-def load_tournament_rows(page: Any, url: str) -> list[dict[str, Any]]:
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+def load_tournament_rows(page: Any, url: str, label: str = "Tournament") -> list[dict[str, Any]]:
+    log(f"{label}: requesting page (wait mode: commit)")
+    try:
+        response = page.goto(url, wait_until="commit", timeout=30000)
+        response_status = getattr(response, "status", None)
+        log(
+            f"{label}: navigation committed"
+            + (f" with HTTP {response_status}" if response_status is not None else "")
+            + f"; current URL {page.url}"
+        )
+    except Exception as exc:
+        # Some Flashscore pages keep navigation open while their live-data
+        # requests continue. The useful DOM may still arrive, so do not abandon
+        # the page solely because the navigation promise timed out.
+        log(f"{label}: navigation did not commit cleanly ({exc}); checking the DOM anyway")
     # Fresh server profiles can leave the event list behind a first-visit layer.
     # The score data is usable as soon as the rows are attached to the DOM; it
     # does not need to be visually unobscured for extraction.
-    page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=30000)
+    log(f"{label}: waiting for match rows to attach")
+    page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=45000)
+    attached_count = page.locator(EVENT_ROW_SELECTOR).count()
+    log(f"{label}: {attached_count} match row(s) attached; extracting scores")
     rows = extract_page_rows(page)
     if not rows:
         raise RuntimeError(f"Tournament page returned no match rows ({page_diagnostic(page)})")
+    log(f"{label}: extracted {len(rows)} match row(s)")
     return rows
 
 
@@ -339,6 +356,7 @@ def write_runtime_state(
     sources: list[dict[str, Any]],
     *,
     last_error: str = "",
+    phase: str = "",
 ) -> None:
     atomic_write_json(
         STATE_PATH,
@@ -346,6 +364,7 @@ def write_runtime_state(
             "status": "running" if not STOP_EVENT.is_set() else "stopped",
             "last_sweep_at": utc_timestamp(),
             "last_error": last_error,
+            "phase": phase,
             "sources": sources,
             "matches": list(matches.values()),
             "alerts": alerts[-MAX_ALERT_HISTORY:],
@@ -378,6 +397,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     loaded_at: dict[str, float] = {}
     source_errors: dict[str, str] = {}
 
+    log(f"Starting browser for {len(configured_links())} configured tournament(s)")
     with sync_playwright() as playwright:
         launch_options: dict[str, Any] = {
             "headless": True,
@@ -386,7 +406,12 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
         chrome_binary = os.getenv("CHROME_BINARY", "").strip()
         if chrome_binary and Path(chrome_binary).is_file():
             launch_options["executable_path"] = chrome_binary
+        if chrome_binary and Path(chrome_binary).is_file():
+            log(f"Using configured Chrome binary: {chrome_binary}")
+        else:
+            log("Using Playwright Chromium")
         browser = playwright.chromium.launch(**launch_options)
+        log("Browser process launched")
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},
             locale="en-GB",
@@ -403,14 +428,27 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             else route.continue_(),
         )
         log(f"Watcher started. Config: {CONFIG_PATH}. State: {STATE_PATH}.")
-        write_runtime_state(matches, alerts, [], last_error="")
+        write_runtime_state(matches, alerts, [], last_error="", phase="Starting first scan")
 
         try:
+            sweep_number = 0
             while not STOP_EVENT.is_set():
+                sweep_number += 1
                 sweep_started = time.monotonic()
                 links = configured_links()
+                if sweep_number == 1 or sweep_number % 10 == 0:
+                    log(
+                        f"Sweep {sweep_number} started: {len(links)} tournament(s), "
+                        f"{len(matches)} known match(es)"
+                    )
                 if not links:
-                    write_runtime_state(matches, alerts, [], last_error="No tournament links are configured.")
+                    write_runtime_state(
+                        matches,
+                        alerts,
+                        [],
+                        last_error="No tournament links are configured.",
+                        phase="Waiting for tournament links",
+                    )
                     STOP_EVENT.wait(max(1.0, poll_seconds))
                     continue
 
@@ -420,16 +458,25 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                     source_errors.pop(old_url, None)
 
                 for url in links:
+                    tournament = tournament_label_from_url(url)
                     page = pages.get(url)
                     needs_reload = page is None or time.monotonic() - loaded_at.get(url, 0) >= reload_minutes * 60
                     try:
                         if page is None:
+                            log(f"{tournament}: creating browser page")
                             page = context.new_page()
                             page.set_default_timeout(15000)
                             pages[url] = page
                         if needs_reload:
-                            log(f"Loading {tournament_label_from_url(url)}")
-                            raw_matches = load_tournament_rows(page, url)
+                            log(f"Loading {tournament}")
+                            write_runtime_state(
+                                matches,
+                                alerts,
+                                [],
+                                last_error="",
+                                phase=f"Loading {tournament}",
+                            )
+                            raw_matches = load_tournament_rows(page, url, tournament)
                             loaded_at[url] = time.monotonic()
                         else:
                             raw_matches = extract_page_rows(page)
@@ -440,12 +487,13 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         source_errors.pop(url, None)
                     except Exception as exc:
                         diagnostic = page_diagnostic(page) if page is not None else "page was not created"
-                        source_errors[url] = f"{exc} [{diagnostic}]"
+                        detailed_error = f"{exc} [{diagnostic}]"
+                        source_errors[url] = detailed_error
                         loaded_at[url] = 0
-                        log(f"Tournament read failed for {tournament_label_from_url(url)}: {exc}")
+                        log(f"Tournament read failed for {tournament}: {detailed_error}")
                         continue
 
-                    tournament = tournament_label_from_url(url)
+                    log(f"{tournament}: processing {len(raw_matches)} row(s)")
                     for raw in raw_matches:
                         scraped = normalize_scraped_match(raw, url, tournament)
                         match_id = scraped["id"]
@@ -502,7 +550,20 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                     for url in links
                 ]
                 error_message = "; ".join(f"{tournament_label_from_url(url)}: {error}" for url, error in source_errors.items())
-                write_runtime_state(matches, alerts, sources, last_error=error_message)
+                phase = (
+                    f"Watching {len(links)} tournament(s)"
+                    if not error_message
+                    else f"Scan completed with {len(source_errors)} source error(s)"
+                )
+                write_runtime_state(matches, alerts, sources, last_error=error_message, phase=phase)
+                if sweep_number == 1 or sweep_number % 10 == 0 or error_message:
+                    live_count = sum(item.get("status") == "live" for item in matches.values())
+                    scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
+                    log(
+                        f"Sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
+                        f"{len(matches)} match(es), {scheduled_count} scheduled, {live_count} live, "
+                        f"{len(source_errors)} source error(s)"
+                    )
                 elapsed = time.monotonic() - sweep_started
                 STOP_EVENT.wait(max(0.25, poll_seconds - elapsed))
         finally:
