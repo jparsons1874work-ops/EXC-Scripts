@@ -33,6 +33,7 @@ from scripts.Tennis_Challenger_Watcher import (
     fetch_tournament_feed,
     hydrate_initial_alert_flags,
     load_tournament_rows,
+    match_scan_log_line,
     normalize_scraped_match,
     overlay_live_rows,
     parse_tournament_feed,
@@ -203,6 +204,40 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertIsInstance(session.call[1]["params"]["_"], int)
         self.assertEqual(session.call[1]["headers"]["Cache-Control"], "no-cache")
         self.assertEqual(session.call[1]["headers"]["Origin"], "https://www.flashscore.com")
+        self.assertEqual(len(rows[0]["_feed_payload_hash"]), 12)
+
+    def test_match_scan_log_shows_every_score_component_and_source(self) -> None:
+        match = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 2",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "3", "away": "2"}],
+                current_points={"home": "15", "away": "0"},
+                server_side="home",
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        match.update(
+            {
+                "score_source": "flashscore_live_push_page",
+                "score_age_seconds": 0.4,
+                "source_payload_hash": "abcdef123456",
+            }
+        )
+
+        line = match_scan_log_line(match, "changed")
+
+        self.assertIn("Kopp S. v Krumich M. (abc123) -> live", line)
+        self.assertIn("sets 1-0 [6-4,3-2]", line)
+        self.assertIn("game 3-2", line)
+        self.assertIn("points 15-0", line)
+        self.assertIn("server home", line)
+        self.assertIn("source flashscore_live_push_page age 0.4s", line)
+        self.assertIn("payload abcdef123456 | changed", line)
 
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]

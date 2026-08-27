@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -65,8 +67,9 @@ BETFAIR_UNMATCHED_REFRESH_SECONDS = BETFAIR_REFRESH_SECONDS
 TOURNAMENT_DISCOVERY_REFRESH_SECONDS = 10 * 60
 FIXTURES_REFRESH_SECONDS = TOURNAMENT_DISCOVERY_REFRESH_SECONDS
 FINISHED_RETENTION_SECONDS = 60 * 60
-LIVE_PAGE_POLL_SECONDS = 10
-LIVE_PAGE_MAX_AGE_SECONDS = 30
+LIVE_PAGE_POLL_SECONDS = 1.0
+LIVE_PAGE_MAX_AGE_SECONDS = 20
+LIVE_PAGE_RECYCLE_SECONDS = 5 * 60
 DETAIL_PAGE_POLL_SECONDS = 0.25
 DETAIL_PAGE_MAX_AGE_SECONDS = 60
 DETAIL_PREMATCH_WINDOW_SECONDS = 12 * 60 * 60
@@ -434,6 +437,30 @@ def live_state_fingerprint(match: dict[str, Any] | None) -> str:
     )
 
 
+def match_scan_log_line(match: dict[str, Any], change: str = "same") -> str:
+    sets = ",".join(
+        f"{item.get('home', '')}-{item.get('away', '')}"
+        for item in match.get("sets", []) or []
+    ) or "-"
+    aggregate = match.get("set_score", {}) or {}
+    current_game = match.get("current_game", {}) or {}
+    points = match.get("current_points", {}) or {}
+    source = str(match.get("score_source", "unknown") or "unknown")
+    age = match.get("score_age_seconds")
+    age_text = f"{float(age):.1f}s" if isinstance(age, (int, float)) else "-"
+    payload_hash = str(match.get("source_payload_hash", "") or "-")
+    return (
+        f"Match processed [{match.get('tournament', 'ATP Challenger')}] "
+        f"{match.get('player1', '?')} v {match.get('player2', '?')} "
+        f"({match.get('id', '-')}) -> {match.get('status', 'unknown')} | "
+        f"sets {aggregate.get('home', '')}-{aggregate.get('away', '')} "
+        f"[{sets}] | game {current_game.get('home', '')}-{current_game.get('away', '')} | "
+        f"points {points.get('home', '')}-{points.get('away', '')} | "
+        f"server {match.get('server_side') or '-'} | source {source} age {age_text} "
+        f"payload {payload_hash} | {change}"
+    )
+
+
 def slack_message(alert_type: str, match: dict[str, Any]) -> str:
     players = f"{match.get('player1', '?')} v {match.get('player2', '?')}"
     tournament = str(match.get("tournament", "ATP Challenger"))
@@ -632,6 +659,11 @@ def fetch_tournament_feed(
             f"Flashscore feed returned no matches (HTTP {response.status_code}, "
             f"{len(response.text)} characters)"
         )
+    payload_hash = hashlib.sha256(response.text.encode("utf-8", errors="replace")).hexdigest()[:12]
+    response_date = str(response.headers.get("Date", "") or "")
+    for row in rows:
+        row["_feed_payload_hash"] = payload_hash
+        row["_feed_response_date"] = response_date
     return rows
 
 
@@ -733,7 +765,29 @@ class FlashscoreLivePageProbe:
             self._context = self._browser.new_context(
                 viewport={"width": 1280, "height": 900},
                 user_agent=FLASHSCORE_USER_AGENT,
+                service_workers="block",
+                extra_http_headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
             )
+
+            def trim_heavy_resources(route: Any) -> None:
+                request = route.request
+                hostname = (urlparse(request.url).hostname or "").casefold()
+                allowed_host = any(
+                    hostname == suffix or hostname.endswith(f".{suffix}")
+                    for suffix in (
+                        "flashscore.com",
+                        "flashscore.ninja",
+                        "fsdatacentre.com",
+                        "livesport.services",
+                        "lsapp.eu",
+                    )
+                )
+                if request.resource_type in {"image", "media", "font", "stylesheet"} or not allowed_host:
+                    route.abort()
+                else:
+                    route.continue_()
+
+            self._context.route("**/*", trim_heavy_resources)
         except Exception:
             browser = getattr(self, "_browser", None)
             if browser is not None:
@@ -744,15 +798,36 @@ class FlashscoreLivePageProbe:
             self._manager.stop()
             raise
         self._pages: dict[str, Any] = {}
+        self._opened_at: dict[str, float] = {}
+
+    def _clear_page_cache(self, page: Any) -> None:
+        session = None
+        try:
+            session = self._context.new_cdp_session(page)
+            session.send("Network.clearBrowserCache")
+        except Exception:
+            pass
+        finally:
+            if session is not None:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
 
     def rows(self, url: str, label: str) -> list[dict[str, Any]]:
         page = self._pages.get(url)
+        opened_at = self._opened_at.get(url, 0.0)
+        if page is not None and time.monotonic() - opened_at >= LIVE_PAGE_RECYCLE_SECONDS:
+            log(f"{label}: recycling live push page after five minutes")
+            self.discard(url)
+            page = None
         if page is None:
             page = self._context.new_page()
             page.set_default_timeout(8000)
             self._pages[url] = page
+            self._opened_at[url] = time.monotonic()
             rows = load_tournament_rows(page, url, f"{label} live page")
-            log(f"{label}: live page connected for toss and start detection")
+            log(f"{label}: live push page connected for current scores, toss and start detection")
             return rows
         rows = extract_page_rows(page)
         if not rows:
@@ -761,27 +836,21 @@ class FlashscoreLivePageProbe:
 
     def retain(self, urls: set[str]) -> None:
         for old_url in set(self._pages) - urls:
-            page = self._pages.pop(old_url)
-            try:
-                page.close()
-            except Exception:
-                pass
+            self.discard(old_url)
 
     def discard(self, url: str) -> None:
         page = self._pages.pop(url, None)
+        self._opened_at.pop(url, None)
         if page is not None:
+            self._clear_page_cache(page)
             try:
                 page.close()
             except Exception:
                 pass
 
     def close(self) -> None:
-        for page in self._pages.values():
-            try:
-                page.close()
-            except Exception:
-                pass
-        self._pages.clear()
+        for url in list(self._pages):
+            self.discard(url)
         try:
             self._context.close()
         finally:
@@ -812,6 +881,7 @@ class FlashscoreLivePageMonitor:
         self._detail_rows: dict[str, dict[str, Any]] = {}
         self._detail_updated_at: dict[str, float] = {}
         self._detail_errors: dict[str, str] = {}
+        self._fatal_error = ""
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = threading.Thread(
@@ -870,7 +940,30 @@ class FlashscoreLivePageMonitor:
                     detail_rows,
                 ).values())
                 age = min([value for value in [age, *detail_ages] if value is not None])
-            return rows, self._errors.get(url, ""), age
+            return rows, self._errors.get(url, "") or getattr(self, "_fatal_error", ""), age
+
+    def snapshot_after(
+        self,
+        url: str,
+        observed_after: float,
+        timeout: float = 3.0,
+    ) -> tuple[list[dict[str, Any]], str, float | None]:
+        """Wait briefly for this sweep's live DOM read, then return the latest safe snapshot."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        self._wake.set()
+        while not self._stop.is_set():
+            with self._lock:
+                updated_at = self._updated_at.get(url)
+                error = self._errors.get(url, "") or getattr(self, "_fatal_error", "")
+            if updated_at is not None and updated_at >= observed_after:
+                break
+            if error and updated_at is None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._stop.wait(min(0.05, remaining))
+        return self.snapshot(url)
 
     def set_detail_targets(self, source_url: str, rows: list[dict[str, Any]]) -> None:
         """Seed the sequential match-page queue from the successful feed scan."""
@@ -904,13 +997,15 @@ class FlashscoreLivePageMonitor:
         try:
             asyncio.run(self._run_async())
         except Exception as exc:
+            with self._lock:
+                self._fatal_error = str(exc) or type(exc).__name__
             log(f"Live-page overlay unavailable; feed monitoring continues: {exc}")
 
     def _run_test_probe(self) -> None:
         probe: FlashscoreLivePageProbe | None = None
         try:
             probe = self._probe_factory()
-            log("Live-page browser launched in independent monitor")
+            log("Lightweight live push-page browser launched")
             while not self._stop.is_set():
                 self._wake.clear()
                 with self._lock:
@@ -939,6 +1034,8 @@ class FlashscoreLivePageMonitor:
                 self._wake.wait(self._poll_seconds)
                 self._wake.clear()
         except Exception as exc:
+            with self._lock:
+                self._fatal_error = str(exc) or type(exc).__name__
             log(f"Live-page overlay unavailable; feed monitoring continues: {exc}")
         finally:
             if probe is not None:
@@ -1547,11 +1644,19 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     fixture_monitor.set_targets(
         {url: tournament_label_from_url(url) for url in links}
     )
+    live_page_monitor = FlashscoreLivePageMonitor(
+        probe_factory=FlashscoreLivePageProbe,
+        poll_seconds=LIVE_PAGE_POLL_SECONDS,
+        max_age_seconds=LIVE_PAGE_MAX_AGE_SECONDS,
+    )
+    live_page_monitor.set_targets(
+        {url: tournament_label_from_url(url) for url in links}
+    )
 
-    log(f"Starting low-latency Flashscore feed watcher for {len(links)} configured tournament(s)")
+    log(f"Starting Flashscore push-backed watcher for {len(links)} configured tournament(s)")
     log(
-        f"Polling Flashscore's fresh score feed every {poll_seconds:g} seconds; "
-        "refreshing future fixtures and Betfair matching every 10 minutes"
+        f"Every {poll_seconds:g} seconds: read each live push page, publish the hub state, then wait; "
+        "refreshing tournament discovery and Betfair matching every 10 minutes"
     )
     write_runtime_state(
         matches,
@@ -1570,8 +1675,10 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             links = configured_links()
             source_errors: dict[str, str] = {}
             fresh_feed_urls: set[str] = set()
+            fresh_live_page_urls: set[str] = set()
             changed_match_count = 0
             authoritative_match_ids: dict[str, set[str]] = {}
+            match_scan_lines: list[str] = []
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
                     f"State sweep {sweep_number} started: {len(links)} tournament(s), "
@@ -1623,6 +1730,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 feed_failures.pop(old_url, None)
             monitor_targets = {url: tournament_label_from_url(url) for url in links}
             fixture_monitor.set_targets(monitor_targets)
+            live_page_monitor.set_targets(monitor_targets)
 
             for url in links:
                 tournament = tournament_label_from_url(url)
@@ -1661,6 +1769,10 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                     continue
 
                 future_rows, _fixture_error = fixture_monitor.snapshot(url)
+                future_rows = [
+                    {**item, "_score_source": "flashscore_fixture_page"}
+                    for item in future_rows
+                ]
 
                 combined_matches = {
                     str(item.get("id", "")): item
@@ -1674,6 +1786,28 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         if item.get("id")
                     }
                 )
+                live_rows, _live_page_error, live_page_age = live_page_monitor.snapshot_after(
+                    url,
+                    sweep_started,
+                    timeout=min(3.0, max(1.0, poll_seconds / 2)),
+                )
+                if live_rows:
+                    fresh_live_page_urls.add(url)
+                    relevant_live_rows: list[dict[str, Any]] = []
+                    for live_row in live_rows:
+                        live_match_id = str(live_row.get("id", "") or "")
+                        live_status = status_from_raw_match(live_row)
+                        is_toss_row = live_status == "scheduled" and bool(live_row.get("server_side"))
+                        if live_match_id not in combined_matches and live_status != "live" and not is_toss_row:
+                            continue
+                        relevant_live_rows.append(
+                            {
+                                **live_row,
+                                "_score_source": "flashscore_live_push_page",
+                                "_score_age_seconds": float(live_page_age or 0.0),
+                            }
+                        )
+                    combined_matches = overlay_live_rows(combined_matches, relevant_live_rows)
                 authoritative_match_ids[url] = set(combined_matches)
                 raw_matches = list(combined_matches.values())
 
@@ -1687,11 +1821,19 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         **scraped,
                         "first_seen_at": (previous or {}).get("first_seen_at", now),
                         "last_checked_at": now,
-                        "score_source": "flashscore_live_feed",
-                        "score_age_seconds": 0.0,
+                        "score_source": str(
+                            raw.get("_score_source", "") or "flashscore_snapshot"
+                        ),
+                        "score_age_seconds": float(raw.get("_score_age_seconds", 0.0) or 0.0),
+                        "source_payload_hash": str(raw.get("_feed_payload_hash", "") or ""),
+                        "source_response_date": str(raw.get("_feed_response_date", "") or ""),
                         "last_error": "",
                     }
-                    if previous is not None and live_state_fingerprint(previous) != live_state_fingerprint(next_match):
+                    state_changed = (
+                        previous is not None
+                        and live_state_fingerprint(previous) != live_state_fingerprint(next_match)
+                    )
+                    if state_changed:
                         changed_match_count += 1
                     if next_match.get("status") == "finished":
                         if match_id in expired_finished_matches:
@@ -1763,6 +1905,12 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         log(f"Slack alert sent: {alert_type} — {alert['match']}")
                     matches[match_id] = next_match
                     prior_matches[match_id] = next_match
+                    match_scan_lines.append(
+                        match_scan_log_line(
+                            next_match,
+                            "new" if previous is None else "changed" if state_changed else "same",
+                        )
+                    )
 
             active_urls = set(links)
             matches = {
@@ -1797,8 +1945,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for url, error in source_errors.items()
             )
             overlay_status = (
-                f"fresh score feed {len(fresh_feed_urls)}/{len(links)} · "
-                "future fixtures/Betfair every 10m"
+                f"live push page {len(fresh_live_page_urls)}/{len(links)} · "
+                f"snapshot feed {len(fresh_feed_urls)}/{len(links)} · "
+                "discovery/Betfair every 10m"
             )
             phase = (
                 f"Watching {len(links)} tournament(s) · {overlay_status}"
@@ -1816,17 +1965,22 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 last_error=error_message,
                 phase=phase,
             )
+            for match_line in match_scan_lines:
+                log(match_line)
             live_count = sum(item.get("status") == "live" for item in matches.values())
             scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
             log(
-                f"Fresh feed sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
+                f"Published sweep {sweep_number} to the hub in {time.monotonic() - sweep_started:.1f}s: "
+                f"{len(fresh_live_page_urls)}/{len(links)} live push page(s), "
                 f"{len(fresh_feed_urls)}/{len(links)} feed(s), {len(matches)} match(es), "
                 f"{scheduled_count} scheduled, {live_count} live, "
                 f"{changed_match_count} changed, {len(source_errors)} error(s)"
             )
-            STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
+            STOP_EVENT.wait(max(0.5, poll_seconds))
     finally:
         session.close()
+        if not live_page_monitor.close(10):
+            log("Live push-page monitor is still stopping; watcher shutdown will clean up its thread")
         if not fixture_monitor.close():
             log("Future-fixture monitor is still stopping; watcher shutdown will clean up its thread")
         if betfair_client is not None:
