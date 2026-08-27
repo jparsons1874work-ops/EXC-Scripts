@@ -61,6 +61,7 @@ DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
 BETFAIR_REFRESH_SECONDS = 5 * 60
 FIXTURES_REFRESH_SECONDS = 60
+FINISHED_RETENTION_SECONDS = 60 * 60
 EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -182,6 +183,7 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
         "display_status": str(raw.get("raw_status", "") or status.title()),
         "start_time": str(raw.get("raw_status", "") or "") if status == "scheduled" else "",
         "scheduled_at": str(raw.get("scheduled_at", "") or ""),
+        "finished_at": str(raw.get("finished_at", "") or "") if status == "finished" else "",
         "set_score": {
             "home": clean_score_value((raw.get("set_score") or {}).get("home")),
             "away": clean_score_value((raw.get("set_score") or {}).get("away")),
@@ -628,6 +630,43 @@ def overlay_live_rows(
     return merged
 
 
+def timestamp_is_at_least_seconds_old(
+    value: Any,
+    seconds: float,
+    now: datetime | None = None,
+) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    return (reference.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() >= seconds
+
+
+def prune_expired_finished_matches(
+    matches: dict[str, dict[str, Any]],
+    expired_finished_matches: dict[str, str],
+    now: datetime | None = None,
+) -> list[str]:
+    removed: list[str] = []
+    for match_id, match in list(matches.items()):
+        if str(match.get("status", "")) != "finished":
+            continue
+        finished_at = str(match.get("finished_at", "") or "")
+        if timestamp_is_at_least_seconds_old(finished_at, FINISHED_RETENTION_SECONDS, now):
+            expired_finished_matches[match_id] = finished_at
+            matches.pop(match_id, None)
+            removed.append(match_id)
+    return removed
+
+
 def _handle_stop(_signum: int, _frame: Any) -> None:
     STOP_EVENT.set()
 
@@ -637,6 +676,7 @@ def write_runtime_state(
     alerts: list[dict[str, Any]],
     sources: list[dict[str, Any]],
     *,
+    expired_finished_matches: dict[str, str] | None = None,
     last_error: str = "",
     phase: str = "",
 ) -> None:
@@ -649,6 +689,7 @@ def write_runtime_state(
             "phase": phase,
             "sources": sources,
             "matches": list(matches.values()),
+            "expired_finished_matches": dict(expired_finished_matches or {}),
             "alerts": alerts[-MAX_ALERT_HISTORY:],
         },
     )
@@ -871,6 +912,18 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
         if isinstance(item, dict) and item.get("id")
     }
     alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
+    expired_finished_matches = {
+        str(match_id): str(finished_at)
+        for match_id, finished_at in dict(prior.get("expired_finished_matches", {}) or {}).items()
+        if match_id and finished_at
+    }
+    for prior_match in matches.values():
+        if prior_match.get("status") == "finished" and not prior_match.get("finished_at"):
+            prior_match["finished_at"] = (
+                prior_match.get("last_alert_at")
+                or prior_match.get("last_checked_at")
+                or utc_timestamp()
+            )
     feed_configs: dict[str, dict[str, Any]] = {}
     fixture_rows: dict[str, list[dict[str, Any]]] = {}
     fixtures_loaded_at: dict[str, float] = {}
@@ -890,7 +943,14 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
         log("Live-page browser launched")
     except Exception as exc:
         log(f"Live-page overlay unavailable; feed monitoring will continue: {exc}")
-    write_runtime_state(matches, alerts, [], last_error="", phase="Starting first feed scan")
+    write_runtime_state(
+        matches,
+        alerts,
+        [],
+        expired_finished_matches=expired_finished_matches,
+        last_error="",
+        phase="Starting first feed scan",
+    )
 
     sweep_number = 0
     try:
@@ -910,6 +970,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                     matches,
                     alerts,
                     [],
+                    expired_finished_matches=expired_finished_matches,
                     last_error="No tournament links are configured.",
                     phase="Waiting for tournament links",
                 )
@@ -967,6 +1028,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                             matches,
                             alerts,
                             [],
+                            expired_finished_matches=expired_finished_matches,
                             last_error="",
                             phase=f"Configuring {tournament}",
                         )
@@ -1033,6 +1095,17 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         "last_checked_at": now,
                         "last_error": "",
                     }
+                    if next_match.get("status") == "finished":
+                        if match_id in expired_finished_matches:
+                            matches.pop(match_id, None)
+                            continue
+                        next_match["finished_at"] = (
+                            str((previous or {}).get("finished_at", "") or "")
+                            or now
+                        )
+                    else:
+                        next_match.pop("finished_at", None)
+                        expired_finished_matches.pop(match_id, None)
                     should_recheck_betfair = (
                         next_match.get("status") == "scheduled"
                         or not next_match.get("betfair_event_id")
@@ -1098,6 +1171,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for key, value in matches.items()
                 if value.get("source_url") in active_urls
             }
+            removed_finished = prune_expired_finished_matches(matches, expired_finished_matches)
+            if removed_finished:
+                log(f"Cleared {len(removed_finished)} match(es) finished for at least one hour")
             sources = [
                 {
                     "url": url,
@@ -1116,7 +1192,14 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 if not error_message
                 else f"Feed scan completed with {len(source_errors)} source error(s)"
             )
-            write_runtime_state(matches, alerts, sources, last_error=error_message, phase=phase)
+            write_runtime_state(
+                matches,
+                alerts,
+                sources,
+                expired_finished_matches=expired_finished_matches,
+                last_error=error_message,
+                phase=phase,
+            )
             if sweep_number == 1 or sweep_number % 10 == 0 or error_message:
                 live_count = sum(item.get("status") == "live" for item in matches.values())
                 scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
@@ -1139,7 +1222,14 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             except Exception:
                 log("Betfair logout failed while stopping watcher")
 
-    write_runtime_state(matches, alerts, [], last_error="", phase="Stopped")
+    write_runtime_state(
+        matches,
+        alerts,
+        [],
+        expired_finished_matches=expired_finished_matches,
+        last_error="",
+        phase="Stopped",
+    )
     log("Direct feed watcher stopped cleanly.")
     return 0
 

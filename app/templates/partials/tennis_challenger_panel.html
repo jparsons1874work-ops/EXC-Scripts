@@ -27,15 +27,7 @@
 <section class="panel challenger-match-panel">
   <div class="panel-header">
     <h2>Matches in scope</h2>
-    {% if tennis_challenger.game_check.status == "running" %}
-    <span class="state-label">Checking Betfair…</span>
-    {% elif tennis_challenger.game_check.status == "failed" %}
-    <span class="state-label state-warn">Game check failed</span>
-    {% elif tennis_challenger.game_check.completed_at_label %}
-    <span class="meta">Game betting checked {{ tennis_challenger.game_check.completed_at_label }}</span>
-    {% endif %}
   </div>
-  {% if tennis_challenger.game_check.error %}<div class="error">{{ tennis_challenger.game_check.error }}</div>{% endif %}
   {% if tennis_challenger.today_matches %}
   <div class="table-wrap">
     <table class="challenger-table">
@@ -46,12 +38,11 @@
           <th>Status</th>
           <th>Score</th>
           <th>Serving</th>
-          <th>Game betting</th>
         </tr>
       </thead>
       {% for group in tennis_challenger.today_match_groups %}
       <tbody>
-        <tr><th colspan="6">{{ group.tournament }}</th></tr>
+        <tr><th colspan="5">{{ group.tournament }}</th></tr>
         {% for match in group.matches %}
         <tr class="match-row match-row-{{ match.status }}">
           <td>{{ match.tournament }}</td>
@@ -66,21 +57,6 @@
           </td>
           <td class="score-cell">{{ match.score_label }}</td>
           <td>{% if match.server %}🎾 {{ match.server }}{% else %}-{% endif %}</td>
-          <td>
-            {% if match.status != "scheduled" %}
-            <span class="state-label state-muted">Not applicable</span>
-            {% elif match.game_betting.status == "clear" %}
-            <span class="state-label state-ok" title="{{ match.game_betting.catalogue_summary|join(', ') }}">✓ Deleted · {{ match.game_betting.catalogue_count }} checked</span>
-            {% elif match.game_betting.status == "needs_action" %}
-            <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
-            {% elif match.game_betting.status == "event_not_found" %}
-            <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
-            {% elif match.game_betting.status == "check_failed" %}
-            <span class="state-label state-warn" title="{{ match.game_betting.message }}">? Check failed</span>
-            {% else %}
-            <span class="state-label state-muted">Not checked</span>
-            {% endif %}
-          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -95,11 +71,6 @@
 <section class="panel challenger-match-panel">
   <div class="panel-header">
     <h2>Tomorrow and future matches</h2>
-    {% if tennis_challenger.game_check.status == "running" %}
-    <span class="state-label">Checking Betfair…</span>
-    {% elif tennis_challenger.game_check.completed_at_label %}
-    <span class="meta">Game betting checked {{ tennis_challenger.game_check.completed_at_label }}</span>
-    {% endif %}
   </div>
   {% if tennis_challenger.future_matches %}
   <div class="table-wrap">
@@ -109,12 +80,11 @@
           <th>Tournament</th>
           <th>Match</th>
           <th>Scheduled</th>
-          <th>Game betting</th>
         </tr>
       </thead>
       {% for group in tennis_challenger.future_match_groups %}
       <tbody>
-        <tr><th colspan="4">{{ group.tournament }}</th></tr>
+        <tr><th colspan="3">{{ group.tournament }}</th></tr>
         {% for match in group.matches %}
         <tr class="match-row match-row-scheduled">
           <td>{{ match.tournament }}</td>
@@ -125,19 +95,6 @@
             </div>
           </td>
           <td><span class="state-label state-muted">{{ match.display_status or match.start_time }}</span></td>
-          <td>
-            {% if match.game_betting.status == "clear" %}
-            <span class="state-label state-ok" title="{{ match.game_betting.catalogue_summary|join(', ') }}">✓ Deleted · {{ match.game_betting.catalogue_count }} checked</span>
-            {% elif match.game_betting.status == "needs_action" %}
-            <span class="state-label state-warn" title="{{ match.game_betting.market_names|join(', ') }}">✕ Action needed · {{ match.game_betting.game_market_count }}</span>
-            {% elif match.game_betting.status == "event_not_found" %}
-            <span class="state-label state-attention" title="{{ match.game_betting.message }}">? Event not matched</span>
-            {% elif match.game_betting.status == "check_failed" %}
-            <span class="state-label state-warn" title="{{ match.game_betting.message }}">? Check failed</span>
-            {% else %}
-            <span class="state-label state-muted">Not checked</span>
-            {% endif %}
-          </td>
         </tr>
         {% endfor %}
       </tbody>

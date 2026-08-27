@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -27,9 +26,7 @@ TENNIS_EVENT_TYPE_ID = "2"
 SCRIPT_ID = "tennis-challenger-watcher"
 CONFIG_PATH = CONFIG_DIR / "tennis_challenger_watcher.json"
 STATE_PATH = OUTPUT_DIR / "tennis_challenger_watcher_state.json"
-GAME_BETTING_PATH = OUTPUT_DIR / "tennis_challenger_game_betting.json"
 ALLOWED_CATEGORY_SEGMENTS = {"challenger-men-singles", "challenger-men-doubles"}
-GAME_MARKET_PREFIX = "GAME_BY_GAME_"
 
 
 def utc_timestamp(value: datetime | None = None) -> str:
@@ -106,11 +103,6 @@ def save_config(links: list[str]) -> dict[str, Any]:
 
 def read_state() -> dict[str, Any]:
     data = read_json(STATE_PATH, {})
-    return data if isinstance(data, dict) else {}
-
-
-def read_game_betting() -> dict[str, Any]:
-    data = read_json(GAME_BETTING_PATH, {})
     return data if isinstance(data, dict) else {}
 
 
@@ -217,13 +209,6 @@ def group_matches_by_tournament(matches: list[dict[str, Any]]) -> list[dict[str,
 def watcher_context() -> dict[str, Any]:
     config = read_config()
     state = read_state()
-    service = globals().get("game_betting_check_service")
-    game_check = service.snapshot() if service is not None else read_game_betting()
-    check_rows = {
-        str(row.get("match_id", "")): row
-        for row in game_check.get("rows", [])
-        if isinstance(row, dict) and row.get("match_id")
-    }
     matches: list[dict[str, Any]] = []
     for raw in state.get("matches", []) or []:
         if not isinstance(raw, dict):
@@ -231,10 +216,6 @@ def watcher_context() -> dict[str, Any]:
         item = dict(raw)
         item["score_label"] = current_score_label(item)
         item["last_checked_label"] = uk_time_label(item.get("last_checked_at"))
-        game_betting = check_rows.get(str(item.get("id", "")), {})
-        if str(game_betting.get("betfair_event_id", "")) != str(item.get("betfair_event_id", "")):
-            game_betting = {}
-        item["game_betting"] = game_betting
         matches.append(item)
     status_order = {"live": 0, "scheduled": 1, "suspended": 2, "error": 3, "finished": 4}
     matches.sort(
@@ -273,11 +254,6 @@ def watcher_context() -> dict[str, Any]:
             "errors": sum(item.get("status") == "error" for item in matches),
         },
         "last_sweep_label": uk_time_label(state.get("last_sweep_at")),
-        "game_check": {
-            **game_check,
-            "started_at_label": uk_time_label(game_check.get("started_at")),
-            "completed_at_label": uk_time_label(game_check.get("completed_at")),
-        },
     }
 
 
@@ -427,213 +403,3 @@ def match_betfair_event(match: dict[str, Any], events: Iterable[BetfairTennisEve
     if len(scored) > 1 and scored[1][0] >= best_score - 4:
         return None, best_score, f"Betfair event match is ambiguous (best score {best_score:.0f})."
     return best, best_score, "Matched"
-
-
-def market_type(catalogue: Any) -> str:
-    description = _object_value(catalogue, "description", {})
-    return str(_object_value(description, "market_type", "") or _object_value(description, "marketType", "") or "").strip().upper()
-
-
-def is_game_market(catalogue: Any) -> bool:
-    kind = market_type(catalogue)
-    name = str(_object_value(catalogue, "market_name", "") or "").strip()
-    game_name = bool(re.search(r"\bgame\b", name, re.IGNORECASE))
-    game_type = kind == "GAME" or kind.startswith("GAME_")
-    return game_type or game_name
-
-
-def fetch_event_market_catalogues(
-    client: betfairlightweight.APIClient,
-    event_id: str,
-    attempts: int = 3,
-) -> list[Any]:
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return list(
-                client.betting.list_market_catalogue(
-                    filter=market_filter(event_ids=[event_id]),
-                    market_projection=["EVENT", "MARKET_DESCRIPTION", "MARKET_START_TIME"],
-                    max_results=1000,
-                    sort="FIRST_TO_START",
-                )
-                or []
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "tennis_challenger_market_catalogue_retry event_id=%s attempt=%s/%s error=%s",
-                event_id,
-                attempt,
-                attempts,
-                exc,
-            )
-            if attempt < attempts:
-                time.sleep(0.5 * attempt)
-    assert last_error is not None
-    raise last_error
-
-
-def perform_game_betting_check(matches: list[dict[str, Any]]) -> dict[str, Any]:
-    started_at = utc_timestamp()
-    scheduled = [match for match in matches if str(match.get("status", "")) == "scheduled"]
-    if not scheduled:
-        return {
-            "status": "complete",
-            "started_at": started_at,
-            "completed_at": utc_timestamp(),
-            "rows": [],
-            "summary": "clear",
-            "message": "There are no scheduled matches in scope.",
-        }
-
-    environment = child_environment()
-    client = betfair_login(environment)
-    try:
-        events = fetch_upcoming_betfair_tennis_events(client)
-        rows: list[dict[str, Any]] = []
-        event_matches: dict[str, BetfairTennisEvent] = {}
-        for match in scheduled:
-            event, score, reason = match_betfair_event(match, events)
-            base = {
-                "match_id": str(match.get("id", "")),
-                "match": f"{match.get('player1', '?')} v {match.get('player2', '?')}",
-                "tournament": str(match.get("tournament", "")),
-                "betfair_event_id": event.event_id if event else "",
-                "betfair_event_name": event.event_name if event else "",
-                "match_score": round(score, 1),
-            }
-            if event is None:
-                rows.append({**base, "status": "event_not_found", "game_market_count": None, "message": reason})
-            else:
-                event_matches[event.event_id] = event
-                rows.append({**base, "status": "pending", "game_market_count": None, "message": "Checking markets."})
-
-        catalogues_by_event: dict[str, list[Any]] = {event_id: [] for event_id in event_matches}
-        catalogue_errors: dict[str, str] = {}
-        for event_id in event_matches:
-            try:
-                catalogues = fetch_event_market_catalogues(client, event_id)
-            except Exception as exc:
-                catalogue_errors[event_id] = str(exc)
-                continue
-            catalogues_by_event[event_id].extend(catalogues)
-
-        for row in rows:
-            event_id = row.get("betfair_event_id", "")
-            if not event_id:
-                continue
-            if event_id in catalogue_errors:
-                row.update(
-                    {
-                        "status": "check_failed",
-                        "game_market_count": None,
-                        "message": f"Betfair market check failed: {catalogue_errors[event_id]}",
-                    }
-                )
-                continue
-            event_catalogues = catalogues_by_event.get(event_id, [])
-            if not event_catalogues:
-                row.update(
-                    {
-                        "status": "check_failed",
-                        "game_market_count": None,
-                        "message": "Betfair returned no market catalogue for this event; deletion cannot be confirmed.",
-                    }
-                )
-                continue
-            game_markets = [catalogue for catalogue in event_catalogues if is_game_market(catalogue)]
-            names = sorted({str(_object_value(item, "market_name", "") or "") for item in game_markets})
-            observed = sorted(
-                {
-                    f"{str(_object_value(item, 'market_name', '') or '')} [{market_type(item) or 'unknown'}]"
-                    for item in event_catalogues
-                }
-            )
-            logger.info(
-                "tennis_challenger_game_markets_checked event_id=%s catalogues=%s game_markets=%s types=%s",
-                event_id,
-                len(event_catalogues),
-                len(game_markets),
-                sorted({market_type(item) or "unknown" for item in event_catalogues}),
-            )
-            row.update(
-                {
-                    "status": "needs_action" if game_markets else "clear",
-                    "game_market_count": len(game_markets),
-                    "market_names": names[:20],
-                    "catalogue_count": len(event_catalogues),
-                    "catalogue_summary": observed[:50],
-                    "message": f"{len(game_markets)} game market(s) still present." if game_markets else "Game betting deleted.",
-                }
-            )
-    finally:
-        try:
-            client.logout()
-        except Exception:
-            logger.warning("tennis_challenger_betfair_logout_failed", exc_info=True)
-
-    needs_action = sum(row.get("status") == "needs_action" for row in rows)
-    unresolved = sum(row.get("status") in {"event_not_found", "check_failed"} for row in rows)
-    return {
-        "status": "complete",
-        "started_at": started_at,
-        "completed_at": utc_timestamp(),
-        "summary": "needs_action" if needs_action else "attention" if unresolved else "clear",
-        "needs_action_count": needs_action,
-        "unresolved_count": unresolved,
-        "rows": rows,
-        "message": f"Checked {len(scheduled)} scheduled match(es).",
-    }
-
-
-class TennisGameBettingCheckService:
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._running = False
-
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            running = self._running
-        data = read_game_betting()
-        if running:
-            data["status"] = "running"
-        elif data.get("status") == "running":
-            data.update({"status": "failed", "error": "The previous check was interrupted."})
-        data.setdefault("status", "idle")
-        data.setdefault("rows", [])
-        return data
-
-    def start(self) -> bool:
-        with self._lock:
-            if self._running:
-                return False
-            self._running = True
-        atomic_write_json(
-            GAME_BETTING_PATH,
-            {"status": "running", "started_at": utc_timestamp(), "completed_at": "", "rows": [], "error": ""},
-        )
-        threading.Thread(target=self._run, name="tennis-challenger-game-betting-check", daemon=True).start()
-        return True
-
-    def _run(self) -> None:
-        try:
-            matches = list(read_state().get("matches", []) or [])
-            result = perform_game_betting_check(matches)
-        except Exception as exc:
-            logger.exception("tennis_challenger_game_betting_check_failed")
-            result = {
-                "status": "failed",
-                "started_at": read_game_betting().get("started_at", ""),
-                "completed_at": utc_timestamp(),
-                "rows": [],
-                "error": str(exc),
-            }
-        try:
-            atomic_write_json(GAME_BETTING_PATH, result)
-        finally:
-            with self._lock:
-                self._running = False
-
-
-game_betting_check_service = TennisGameBettingCheckService()

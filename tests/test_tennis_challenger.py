@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,12 +17,10 @@ from app.tennis_challenger import (
     BetfairTennisEvent,
     group_matches_by_tournament,
     is_future_scheduled_match,
-    is_game_market,
     match_betfair_event,
     normalize_tournament_url,
     parse_tournament_links,
     participant_match_score,
-    perform_game_betting_check,
 )
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
@@ -36,6 +34,7 @@ from scripts.Tennis_Challenger_Watcher import (
     overlay_live_rows,
     parse_tournament_feed,
     pending_alerts,
+    prune_expired_finished_matches,
     slack_message,
     slack_webhook_url,
 )
@@ -469,115 +468,28 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertIsNotNone(singles)
         self.assertEqual(singles.event_id, "singles")
 
-    def test_game_market_detection_uses_market_type_and_name(self) -> None:
-        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"), market_name="1st Set Game 1 Winner")))
-        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SPECIAL"), market_name="2nd Set Game 5")))
-        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="MATCH_ODDS"), market_name="1st Set - 1st Game Winner")))
-        self.assertTrue(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SPECIAL"), market_name="Game Betting")))
-        self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="SET_WINNER"), market_name="Set 1 Winner")))
-        self.assertFalse(is_game_market(SimpleNamespace(description=SimpleNamespace(market_type="TOTAL_GAMES"), market_name="Total Games 21.5")))
-
-    def test_game_betting_check_marks_matches_clear_or_needing_action(self) -> None:
-        def list_market_catalogue(**kwargs):
-            event_id = kwargs["filter"]["eventIds"][0]
-            if event_id == "1":
-                return [
-                    SimpleNamespace(
-                        description=SimpleNamespace(market_type="GAME_BY_GAME_01_01"),
-                        market_name="1st Set Game 1 Winner",
-                    )
-                ]
-            return [
-                SimpleNamespace(
-                    description=SimpleNamespace(market_type="MATCH_ODDS"),
-                    market_name="Match Odds",
-                )
-            ]
-
-        betting = SimpleNamespace(
-            list_events=lambda **_kwargs: [
-                SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
-                SimpleNamespace(event=SimpleNamespace(id="2", name="C Brady & M Howse v J Doe & A Roe", open_date="2026-08-27T11:00:00Z")),
-            ],
-            list_market_catalogue=list_market_catalogue,
-        )
-        client = SimpleNamespace(betting=betting, logout=lambda: None)
-        matches = [
-            {
-                "id": "a",
-                "status": "scheduled",
-                "player1": "Kopp S.",
-                "player2": "Krumich M.",
-                "tournament": "Augsburg",
-                "betfair_event_id": "stale-event-id",
+    def test_finished_matches_are_removed_after_one_hour_and_tombstoned(self) -> None:
+        now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+        matches = {
+            "recent": {
+                "id": "recent",
+                "status": "finished",
+                "finished_at": (now - timedelta(minutes=59)).isoformat().replace("+00:00", "Z"),
             },
-            {"id": "b", "status": "scheduled", "player1": "Brady C. / Howse M.", "player2": "Doe J. / Roe A.", "tournament": "Augsburg Doubles"},
-        ]
+            "expired": {
+                "id": "expired",
+                "status": "finished",
+                "finished_at": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            },
+            "live": {"id": "live", "status": "live"},
+        }
+        tombstones: dict[str, str] = {}
 
-        with patch("app.tennis_challenger.betfair_login", return_value=client):
-            result = perform_game_betting_check(matches)
+        removed = prune_expired_finished_matches(matches, tombstones, now)
 
-        statuses = {row["match_id"]: row["status"] for row in result["rows"]}
-        self.assertEqual(statuses, {"a": "needs_action", "b": "clear"})
-        event_ids = {row["match_id"]: row["betfair_event_id"] for row in result["rows"]}
-        self.assertEqual(event_ids, {"a": "1", "b": "2"})
-        self.assertEqual(result["needs_action_count"], 1)
-        self.assertEqual(result["summary"], "needs_action")
-
-    def test_game_betting_check_isolates_a_betfair_500_to_one_event(self) -> None:
-        def list_market_catalogue(**kwargs):
-            event_id = kwargs["filter"]["eventIds"][0]
-            if event_id == "1":
-                raise RuntimeError("Status code error: 500")
-            return [
-                SimpleNamespace(
-                    event=SimpleNamespace(id="2"),
-                    description=SimpleNamespace(market_type="MATCH_ODDS"),
-                    market_name="Match Odds",
-                )
-            ]
-
-        betting = SimpleNamespace(
-            list_events=lambda **_kwargs: [
-                SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
-                SimpleNamespace(event=SimpleNamespace(id="2", name="C Brady v M Howse", open_date="2026-08-27T11:00:00Z")),
-            ],
-            list_market_catalogue=list_market_catalogue,
-        )
-        client = SimpleNamespace(betting=betting, logout=lambda: None)
-        matches = [
-            {"id": "a", "status": "scheduled", "player1": "Kopp S.", "player2": "Krumich M.", "betfair_event_id": "1"},
-            {"id": "b", "status": "scheduled", "player1": "Brady C.", "player2": "Howse M.", "betfair_event_id": "2"},
-        ]
-
-        with (
-            patch("app.tennis_challenger.betfair_login", return_value=client),
-            patch("app.tennis_challenger.time.sleep"),
-        ):
-            result = perform_game_betting_check(matches)
-
-        statuses = {row["match_id"]: row["status"] for row in result["rows"]}
-        self.assertEqual(statuses, {"a": "check_failed", "b": "clear"})
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["summary"], "attention")
-
-    def test_game_betting_check_does_not_mark_an_empty_catalogue_deleted(self) -> None:
-        betting = SimpleNamespace(
-            list_events=lambda **_kwargs: [
-                SimpleNamespace(event=SimpleNamespace(id="1", name="S Kopp v M Krumich", open_date="2026-08-27T09:00:00Z")),
-            ],
-            list_market_catalogue=lambda **_kwargs: [],
-        )
-        client = SimpleNamespace(betting=betting, logout=lambda: None)
-        matches = [
-            {"id": "a", "status": "scheduled", "player1": "Kopp S.", "player2": "Krumich M.", "betfair_event_id": "1"},
-        ]
-
-        with patch("app.tennis_challenger.betfair_login", return_value=client):
-            result = perform_game_betting_check(matches)
-
-        self.assertEqual(result["rows"][0]["status"], "check_failed")
-        self.assertEqual(result["summary"], "attention")
+        self.assertEqual(removed, ["expired"])
+        self.assertEqual(set(matches), {"recent", "live"})
+        self.assertEqual(tombstones, {"expired": "2026-08-27T11:00:00Z"})
 
     def test_challenger_page_renders_controls_and_match_state(self) -> None:
         request = Request(
@@ -610,7 +522,6 @@ class TennisChallengerTests(unittest.TestCase):
                     "display_status": "27.08. 09:00",
                     "score_label": "-",
                     "server": "",
-                    "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
                 }
             ],
             "today_matches": [
@@ -624,7 +535,6 @@ class TennisChallengerTests(unittest.TestCase):
                     "display_status": "26.08. 09:00",
                     "score_label": "-",
                     "server": "",
-                    "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
                 }
             ],
             "future_matches": [
@@ -638,7 +548,6 @@ class TennisChallengerTests(unittest.TestCase):
                     "display_status": "27.08. 11:00",
                     "start_time": "27.08. 11:00",
                     "betfair_event_id": "1.222222222",
-                    "game_betting": {"status": "clear", "game_market_count": 0, "market_names": []},
                 }
             ],
             "today_match_groups": [
@@ -655,7 +564,6 @@ class TennisChallengerTests(unittest.TestCase):
                             "display_status": "26.08. 09:00",
                             "score_label": "-",
                             "server": "",
-                            "game_betting": {"status": "needs_action", "game_market_count": 12, "market_names": []},
                         }
                     ],
                 }
@@ -674,12 +582,10 @@ class TennisChallengerTests(unittest.TestCase):
                             "display_status": "27.08. 11:00",
                             "start_time": "27.08. 11:00",
                             "betfair_event_id": "1.222222222",
-                            "game_betting": {"status": "clear", "game_market_count": 0, "market_names": []},
                         }
                     ],
                 }
             ],
-            "game_check": {"status": "running", "completed_at_label": "", "error": ""},
             "last_sweep_label": "26 Aug 2026 10:00:03",
             "watcher": {"last_error": "", "sources": []},
             "counts": {"total": 1, "scheduled": 1, "live": 0, "finished": 0},
@@ -695,12 +601,9 @@ class TennisChallengerTests(unittest.TestCase):
         )
         html = hub.templates.get_template("tennis_challenger.html").render(context)
         self.assertIn("Start watcher", html)
-        self.assertIn("Check game betting", html)
-        button_text = html.index(">Check game betting</button>")
-        button_tag = html[html.rfind("<button", 0, button_text) : button_text]
-        self.assertNotIn("disabled", button_tag)
+        self.assertNotIn("Check game betting", html)
+        self.assertNotIn("Game betting", html)
         self.assertIn("Kopp S. v Krumich M.", html)
-        self.assertIn("Action needed", html)
         self.assertIn("Tomorrow and future matches", html)
         self.assertIn("Future A. v Future B.", html)
         self.assertIn("Betfair 1.222222222", html)

@@ -27,7 +27,6 @@ from app.reminders import daily_reminders_context
 from app.runner import RUNNING, STOPPING, default_args_for, runner
 from app.scheduler import window_status
 from app.tennis_challenger import (
-    game_betting_check_service,
     parse_tournament_links,
     save_config as save_tennis_challenger_config,
     watcher_context as tennis_challenger_context,
@@ -470,15 +469,6 @@ async def save_tennis_challenger_links(request: Request):
             status_code=303,
         )
     await asyncio.to_thread(save_tennis_challenger_config, links)
-    return RedirectResponse(f"/scripts/{TENNIS_CHALLENGER_SCRIPT_ID}", status_code=303)
-
-
-@app.post("/scripts/tennis-challenger-watcher/check-game-betting")
-async def start_tennis_challenger_game_betting_check(request: Request):
-    auth_redirect = require_auth(request)
-    if auth_redirect:
-        return auth_redirect
-    await asyncio.to_thread(game_betting_check_service.start)
     return RedirectResponse(f"/scripts/{TENNIS_CHALLENGER_SCRIPT_ID}", status_code=303)
 
 
