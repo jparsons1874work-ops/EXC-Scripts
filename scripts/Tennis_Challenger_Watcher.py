@@ -146,8 +146,10 @@ base => {
     if (!Number.isFinite(home) || !Number.isFinite(away)) return '';
     if (home === 7 && away === 6) return 'home';
     if (away === 7 && home === 6) return 'away';
-    if (home >= 6 && home - away >= 2) return 'home';
-    if (away >= 6 && away - home >= 2) return 'away';
+    if ((home === 6 || home === 7) && home - away >= 2) return 'home';
+    if ((away === 6 || away === 7) && away - home >= 2) return 'away';
+    if (home >= 10 && home - away >= 2) return 'home';
+    if (away >= 10 && away - home >= 2) return 'away';
     return '';
   };
   const setWinners = setParts.map(completedSetWinner);
@@ -222,9 +224,13 @@ def completed_set_winner(pair: dict[str, Any]) -> str:
         return "home"
     if away == 7 and home == 6:
         return "away"
-    if home >= 6 and home - away >= 2:
+    if home in {6, 7} and home - away >= 2:
         return "home"
-    if away >= 6 and away - home >= 2:
+    if away in {6, 7} and away - home >= 2:
+        return "away"
+    if home >= 10 and home - away >= 2:
+        return "home"
+    if away >= 10 and away - home >= 2:
         return "away"
     return ""
 
@@ -412,6 +418,22 @@ def score_text(match: dict[str, Any]) -> str:
     return aggregate_text or ", ".join(parts) or "score unavailable"
 
 
+def live_state_fingerprint(match: dict[str, Any] | None) -> str:
+    value = match or {}
+    return json.dumps(
+        {
+            "status": value.get("status"),
+            "set_score": value.get("set_score"),
+            "sets": value.get("sets"),
+            "current_game": value.get("current_game"),
+            "current_points": value.get("current_points"),
+            "server_side": value.get("server_side"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
 def slack_message(alert_type: str, match: dict[str, Any]) -> str:
     players = f"{match.get('player1', '?')} v {match.get('player2', '?')}"
     tournament = str(match.get("tournament", "ATP Challenger"))
@@ -479,7 +501,10 @@ def extract_feed_config(html: str, source_url: str) -> dict[str, str]:
     feed_name = f"t_{sport_id}_{country_id}_{tournament_id}_{timezone_hour}_en_1"
     return {
         "source_url": source_url,
-        "feed_url": f"https://global.flashscore.ninja/2/x/feed/{feed_name}",
+        # The ninja CDN can lag several games behind the website during live
+        # tennis. Flashscore's own x/feed route is the low-latency source used
+        # to render its scoreboard and exposes the same compact payload.
+        "feed_url": f"https://www.flashscore.com/x/feed/{feed_name}",
         "feed_sign": feed_sign_match.group(1),
         "tournament_id": tournament_id,
         "country_id": country_id,
@@ -593,11 +618,12 @@ def fetch_tournament_feed(
         headers={
             "x-fsign": config["feed_sign"],
             "Referer": config["source_url"],
+            "Origin": "https://www.flashscore.com",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         },
         params={"_": int(time.time() * 1000)},
-        timeout=20,
+        timeout=(3.0, 5.0),
     )
     response.raise_for_status()
     rows = parse_tournament_feed(response.text, config["source_url"])
@@ -1209,16 +1235,6 @@ def should_refresh_betfair_events(
     return age >= interval
 
 
-def should_refresh_tournament_feed(
-    loaded_at: float,
-    now: float | None = None,
-) -> bool:
-    if loaded_at <= 0:
-        return True
-    age = (time.monotonic() if now is None else now) - loaded_at
-    return age >= TOURNAMENT_DISCOVERY_REFRESH_SECONDS
-
-
 def timestamp_is_at_least_seconds_old(
     value: Any,
     seconds: float,
@@ -1521,27 +1537,21 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 or utc_timestamp()
             )
     feed_configs: dict[str, dict[str, Any]] = {}
-    tournament_rows: dict[str, list[dict[str, Any]]] = {}
-    tournament_rows_loaded_at: dict[str, float] = {}
+    feed_failures: dict[str, str] = {}
     betfair_events: list[Any] = []
     betfair_loaded_at = 0.0
     betfair_client: Any = None
     session = requests.Session()
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
-    live_monitor = FlashscoreLivePageMonitor()
-    live_monitor.set_targets(
-        {url: tournament_label_from_url(url) for url in links}
-    )
     fixture_monitor = FlashscoreFixtureMonitor()
     fixture_monitor.set_targets(
         {url: tournament_label_from_url(url) for url in links}
     )
 
-    log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
+    log(f"Starting low-latency Flashscore feed watcher for {len(links)} configured tournament(s)")
     log(
-        f"Sweeping direct match pages continuously and processing results every "
-        f"{poll_seconds:g} seconds; "
-        "refreshing tournament discovery and Betfair matching every 10 minutes"
+        f"Polling Flashscore's fresh score feed every {poll_seconds:g} seconds; "
+        "refreshing future fixtures and Betfair matching every 10 minutes"
     )
     write_runtime_state(
         matches,
@@ -1559,8 +1569,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             sweep_started = time.monotonic()
             links = configured_links()
             source_errors: dict[str, str] = {}
-            fresh_overlay_urls: set[str] = set()
-            fresh_detail_matches: set[str] = set()
+            fresh_feed_urls: set[str] = set()
+            changed_match_count = 0
             authoritative_match_ids: dict[str, set[str]] = {}
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
@@ -1610,54 +1620,45 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
             for old_url in set(feed_configs) - set(links):
                 feed_configs.pop(old_url, None)
-                tournament_rows.pop(old_url, None)
-                tournament_rows_loaded_at.pop(old_url, None)
+                feed_failures.pop(old_url, None)
             monitor_targets = {url: tournament_label_from_url(url) for url in links}
-            live_monitor.set_targets(monitor_targets)
             fixture_monitor.set_targets(monitor_targets)
 
             for url in links:
                 tournament = tournament_label_from_url(url)
                 config = feed_configs.get(url)
-                live_rows, live_error, live_age = live_monitor.snapshot(url)
-                if live_rows:
-                    fresh_overlay_urls.add(url)
-                discovery_due = should_refresh_tournament_feed(
-                    tournament_rows_loaded_at.get(url, 0.0)
-                )
                 needs_reload = (
                     config is None
                     or time.monotonic() - float(config.get("loaded_at", 0)) >= reload_minutes * 60
                 )
-                summary_matches = list(tournament_rows.get(url, []))
-                if discovery_due:
-                    try:
-                        if needs_reload:
-                            write_runtime_state(
-                                matches,
-                                alerts,
-                                [],
-                                expired_finished_matches=expired_finished_matches,
-                                last_error="",
-                                phase=f"Configuring {tournament}",
-                            )
-                            config = load_feed_config(session, url, tournament)
-                            config["loaded_at"] = time.monotonic()
-                            feed_configs[url] = config
-                        summary_matches = fetch_tournament_feed(session, config, tournament)
-                        tournament_rows[url] = list(summary_matches)
-                        tournament_rows_loaded_at[url] = time.monotonic()
-                        source_errors.pop(url, None)
-                        log(
-                            f"{tournament}: tournament discovery refreshed "
-                            f"({len(summary_matches)} match(es))"
+                try:
+                    if needs_reload:
+                        write_runtime_state(
+                            matches,
+                            alerts,
+                            [],
+                            expired_finished_matches=expired_finished_matches,
+                            last_error="",
+                            phase=f"Configuring {tournament}",
                         )
-                    except Exception as exc:
-                        source_errors[url] = str(exc) + (f"; live page: {live_error}" if live_error else "")
+                        config = load_feed_config(session, url, tournament)
+                        config["loaded_at"] = time.monotonic()
+                        feed_configs[url] = config
+                    summary_matches = fetch_tournament_feed(session, config, tournament)
+                    fresh_feed_urls.add(url)
+                    recovered = bool(feed_failures.pop(url, ""))
+                    if recovered:
+                        log(f"{tournament}: fresh score feed recovered")
+                except Exception as exc:
+                    error_text = str(exc)
+                    source_errors[url] = error_text
+                    prior_error = feed_failures.get(url, "")
+                    feed_failures[url] = error_text
+                    if "401" in error_text or "403" in error_text:
                         feed_configs.pop(url, None)
-                        log(f"Tournament feed failed for {tournament}: {exc}")
-                        if url not in tournament_rows:
-                            continue
+                    if error_text != prior_error:
+                        log(f"{tournament}: fresh score feed failed: {error_text}")
+                    continue
 
                 future_rows, _fixture_error = fixture_monitor.snapshot(url)
 
@@ -1673,38 +1674,25 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         if item.get("id")
                     }
                 )
-                if live_rows:
-                    combined_matches = overlay_live_rows(combined_matches, live_rows)
-                    authoritative_match_ids[url] = set(combined_matches)
+                authoritative_match_ids[url] = set(combined_matches)
                 raw_matches = list(combined_matches.values())
-                # The direct feed is the dependable discovery source on EC2.
-                # Hand its live and upcoming matches straight to the sequential
-                # one-page-at-a-time scanner instead of waiting for a tournament
-                # summary page to render.
-                live_monitor.set_detail_targets(url, raw_matches)
 
                 now = utc_timestamp()
                 for raw in raw_matches:
                     scraped = normalize_scraped_match(raw, url, tournament)
                     match_id = scraped["id"]
-                    if raw.get("_detail_source"):
-                        fresh_detail_matches.add(match_id)
                     previous = matches.get(match_id) or prior_matches.get(match_id)
                     next_match = {
                         **(previous or {}),
                         **scraped,
                         "first_seen_at": (previous or {}).get("first_seen_at", now),
                         "last_checked_at": now,
-                        "score_source": (
-                            "match_detail"
-                            if raw.get("_detail_source")
-                            else "tournament_browser"
-                            if live_rows
-                            else "direct_feed"
-                        ),
-                        "score_age_seconds": round(live_age or 0.0, 1) if live_rows else None,
+                        "score_source": "flashscore_live_feed",
+                        "score_age_seconds": 0.0,
                         "last_error": "",
                     }
+                    if previous is not None and live_state_fingerprint(previous) != live_state_fingerprint(next_match):
+                        changed_match_count += 1
                     if next_match.get("status") == "finished":
                         if match_id in expired_finished_matches:
                             matches.pop(match_id, None)
@@ -1782,9 +1770,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for key, value in matches.items()
                 if value.get("source_url") in active_urls
             }
-            # A successful clean browser snapshot fully replaces that
-            # tournament's prior live-score cache. Do not carry vanished
-            # scheduled/live rows forward with an old score.
+            # A successful fresh feed fully replaces that tournament's prior
+            # live-score cache. Do not carry vanished scheduled/live rows
+            # forward with an old score.
             matches = {
                 key: value
                 for key, value in matches.items()
@@ -1809,8 +1797,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for url, error in source_errors.items()
             )
             overlay_status = (
-                f"{len(fresh_detail_matches)} direct match page(s) fresh · "
-                "tournament/Betfair discovery every 10m"
+                f"fresh score feed {len(fresh_feed_urls)}/{len(links)} · "
+                "future fixtures/Betfair every 10m"
             )
             phase = (
                 f"Watching {len(links)} tournament(s) · {overlay_status}"
@@ -1828,19 +1816,17 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 last_error=error_message,
                 phase=phase,
             )
-            if sweep_number == 1 or sweep_number % 10 == 0 or error_message:
-                live_count = sum(item.get("status") == "live" for item in matches.values())
-                scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
-                log(
-                    f"State sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
-                    f"{len(matches)} match(es), {scheduled_count} scheduled, {live_count} live, "
-                    f"{len(source_errors)} source error(s)"
-                )
+            live_count = sum(item.get("status") == "live" for item in matches.values())
+            scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
+            log(
+                f"Fresh feed sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
+                f"{len(fresh_feed_urls)}/{len(links)} feed(s), {len(matches)} match(es), "
+                f"{scheduled_count} scheduled, {live_count} live, "
+                f"{changed_match_count} changed, {len(source_errors)} error(s)"
+            )
             STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
     finally:
         session.close()
-        if not live_monitor.close():
-            log("Live-page browser is still stopping; watcher shutdown will clean up its process group")
         if not fixture_monitor.close():
             log("Future-fixture monitor is still stopping; watcher shutdown will clean up its thread")
         if betfair_client is not None:

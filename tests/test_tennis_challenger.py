@@ -40,7 +40,6 @@ from scripts.Tennis_Challenger_Watcher import (
     prune_expired_finished_matches,
     should_scan_match_detail,
     should_refresh_betfair_events,
-    should_refresh_tournament_feed,
     slack_message,
     slack_webhook_url,
 )
@@ -118,7 +117,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(config["tournament_id"], "SUQ1VjQ1")
         self.assertEqual(config["country_id"], "5729")
         self.assertEqual(config["feed_sign"], "SW9D1eZo")
-        self.assertIn("/2/x/feed/t_2_5729_SUQ1VjQ1_", config["feed_url"])
+        self.assertIn("www.flashscore.com/x/feed/t_2_5729_SUQ1VjQ1_", config["feed_url"])
 
     def test_flashscore_feed_parser_reads_status_scores_and_server(self) -> None:
         payload = (
@@ -139,6 +138,22 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(rows[1]["scheduled_at"], "2026-08-27T09:00:00Z")
         self.assertEqual(rows[2]["raw_status"], "Finished")
         self.assertEqual(rows[2]["set_score"], {"home": 0, "away": 2})
+
+    def test_fresh_feed_parses_a_live_doubles_match_tiebreak(self) -> None:
+        payload = (
+            "AA÷doubles123¬AD÷1787857800¬AB÷2"
+            "¬AE÷Oliveira B./Rodrigues N.¬AF÷Puttergill C./Rai A."
+            "¬AI÷y¬AG÷1¬AH÷1¬BA÷6¬BB÷7¬BC÷6¬BD÷3¬BE÷4¬BF÷9¬WA÷0¬WB÷0¬~"
+        )
+
+        raw = parse_tournament_feed(payload, AUGSBURG_URL)[0]
+        match = normalize_scraped_match(raw, AUGSBURG_URL, "Kingston 2 (Doubles)")
+
+        self.assertEqual(match["status"], "live")
+        self.assertEqual(match["current_set_number"], 3)
+        self.assertEqual(match["current_game"], {"home": 4, "away": 9})
+        self.assertEqual(match["current_points"], {"home": 0, "away": 0})
+        self.assertEqual(match["server_side"], "home")
 
     def test_flashscore_fixtures_payload_is_read_from_the_fixtures_page(self) -> None:
         payload = (
@@ -177,7 +192,7 @@ class TennisChallengerTests(unittest.TestCase):
         rows = fetch_tournament_feed(
             session,
             {
-                "feed_url": "https://global.flashscore.ninja/2/x/feed/test",
+                "feed_url": "https://www.flashscore.com/x/feed/test",
                 "feed_sign": "feed-sign",
                 "source_url": AUGSBURG_URL,
             },
@@ -187,6 +202,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIsInstance(session.call[1]["params"]["_"], int)
         self.assertEqual(session.call[1]["headers"]["Cache-Control"], "no-cache")
+        self.assertEqual(session.call[1]["headers"]["Origin"], "https://www.flashscore.com")
 
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
@@ -400,11 +416,6 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertFalse(should_refresh_betfair_events(100, False, now=699.9))
         self.assertTrue(should_refresh_betfair_events(100, False, now=700))
 
-    def test_tournament_discovery_refreshes_every_ten_minutes(self) -> None:
-        self.assertTrue(should_refresh_tournament_feed(0, now=100))
-        self.assertFalse(should_refresh_tournament_feed(100, now=699.9))
-        self.assertTrue(should_refresh_tournament_feed(100, now=700))
-
     def test_slack_alert_includes_the_betfair_event_id(self) -> None:
         match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
         match["betfair_event_id"] = "1.234567890"
@@ -534,6 +545,42 @@ class TennisChallengerTests(unittest.TestCase):
             "Augsburg (Singles)",
         )
 
+        self.assertEqual(finished["status"], "finished")
+
+    def test_doubles_match_tiebreak_waits_for_ten_points(self) -> None:
+        common = {
+            "raw_status": "Set 3",
+            "row_classes": "event__match event__match--live",
+            "is_live": True,
+            "is_scheduled": False,
+            "set_score": {"home": "1", "away": "1"},
+        }
+        still_live = normalize_scraped_match(
+            raw_match(
+                **common,
+                set_parts=[
+                    {"home": "6", "away": "7"},
+                    {"home": "6", "away": "3"},
+                    {"home": "4", "away": "9"},
+                ],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Doubles)",
+        )
+        finished = normalize_scraped_match(
+            raw_match(
+                **common,
+                set_parts=[
+                    {"home": "6", "away": "7"},
+                    {"home": "6", "away": "3"},
+                    {"home": "4", "away": "10"},
+                ],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Doubles)",
+        )
+
+        self.assertEqual(still_live["status"], "live")
         self.assertEqual(finished["status"], "finished")
 
     def test_finished_detail_result_survives_the_stale_feed_overlay(self) -> None:
