@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -58,13 +59,15 @@ ALERT_FLAG_BY_TYPE = {
 }
 DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_RELOAD_MINUTES = 15.0
-MAX_ALERT_HISTORY = 500
+MAX_ALERT_HISTORY = 100
 BETFAIR_REFRESH_SECONDS = 5 * 60
 BETFAIR_UNMATCHED_REFRESH_SECONDS = 60
 FIXTURES_REFRESH_SECONDS = 60
 FINISHED_RETENTION_SECONDS = 60 * 60
 LIVE_PAGE_POLL_SECONDS = 10
-LIVE_PAGE_MAX_AGE_SECONDS = 15
+LIVE_PAGE_MAX_AGE_SECONDS = 30
+LIVE_PAGE_SCAN_TIMEOUT_SECONDS = 30
+LIVE_PAGE_CONCURRENCY = 4
 EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -103,9 +106,9 @@ rows => rows.map(row => {
       home: value('home', 6),
       away: value('away', 6)
     },
-    server_side: serve && String(serve.className.baseVal || serve.className).includes('serveHome')
+    server_side: serve && /(?:serveHome|icon--serveHome)/.test(String(serve.className.baseVal || serve.className))
       ? 'home'
-      : serve && String(serve.className.baseVal || serve.className).includes('serveAway')
+      : serve && /(?:serveAway|icon--serveAway)/.test(String(serve.className.baseVal || serve.className))
         ? 'away'
         : '',
     is_live: classes.includes('event__match--live'),
@@ -459,8 +462,6 @@ def fetch_tournament_feed(
             f"Flashscore feed returned no matches (HTTP {response.status_code}, "
             f"{len(response.text)} characters)"
         )
-    age = response.headers.get("Age", "unknown")
-    log(f"{label}: feed returned {len(rows)} match(es), cache age {age}s")
     return rows
 
 
@@ -622,11 +623,11 @@ class FlashscoreLivePageProbe:
 
 
 class FlashscoreLivePageMonitor:
-    """Run the optional browser overlay away from the feed-scanning thread."""
+    """Scan fresh tournament pages without blocking the feed-scanning thread."""
 
     def __init__(
         self,
-        probe_factory: Any = FlashscoreLivePageProbe,
+        probe_factory: Any | None = None,
         poll_seconds: float = LIVE_PAGE_POLL_SECONDS,
         max_age_seconds: float = LIVE_PAGE_MAX_AGE_SECONDS,
     ) -> None:
@@ -639,6 +640,7 @@ class FlashscoreLivePageMonitor:
         self._updated_at: dict[str, float] = {}
         self._errors: dict[str, str] = {}
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name="challenger-live-page-monitor",
@@ -653,6 +655,7 @@ class FlashscoreLivePageMonitor:
                 self._rows.pop(old_url, None)
                 self._updated_at.pop(old_url, None)
                 self._errors.pop(old_url, None)
+        self._wake.set()
 
     def snapshot(self, url: str) -> tuple[list[dict[str, Any]], str, float | None]:
         with self._lock:
@@ -662,11 +665,21 @@ class FlashscoreLivePageMonitor:
             return rows, self._errors.get(url, ""), age
 
     def _run(self) -> None:
+        if self._probe_factory is not None:
+            self._run_test_probe()
+            return
+        try:
+            asyncio.run(self._run_async())
+        except Exception as exc:
+            log(f"Live-page overlay unavailable; feed monitoring continues: {exc}")
+
+    def _run_test_probe(self) -> None:
         probe: FlashscoreLivePageProbe | None = None
         try:
             probe = self._probe_factory()
             log("Live-page browser launched in independent monitor")
             while not self._stop.is_set():
+                self._wake.clear()
                 with self._lock:
                     targets = dict(self._targets)
                 probe.retain(set(targets))
@@ -690,7 +703,8 @@ class FlashscoreLivePageMonitor:
                         self._updated_at[url] = time.monotonic()
                     if recovered:
                         log(f"{label}: live-page overlay recovered")
-                self._stop.wait(self._poll_seconds)
+                self._wake.wait(self._poll_seconds)
+                self._wake.clear()
         except Exception as exc:
             log(f"Live-page overlay unavailable; feed monitoring continues: {exc}")
         finally:
@@ -700,8 +714,98 @@ class FlashscoreLivePageMonitor:
                 except Exception as exc:
                     log(f"Live-page browser cleanup failed: {exc}")
 
+    async def _scan_target(self, context: Any, url: str, label: str) -> list[dict[str, Any]]:
+        page = await context.new_page()
+        try:
+            try:
+                await page.goto(url, wait_until="commit", timeout=15000)
+            except Exception:
+                # Flashscore can keep navigation requests open after the useful
+                # document has arrived, so inspect the DOM before treating the
+                # navigation timeout as a source failure.
+                pass
+            await page.wait_for_selector(EVENT_ROW_SELECTOR, state="attached", timeout=10000)
+            rows = await page.eval_on_selector_all(EVENT_ROW_SELECTOR, ROW_EXTRACTOR)
+            clean_rows = [row for row in rows or [] if isinstance(row, dict)]
+            if not clean_rows:
+                raise RuntimeError(f"{label} live page returned no match rows")
+            return clean_rows
+        finally:
+            try:
+                await asyncio.wait_for(page.close(), timeout=3)
+            except Exception:
+                pass
+
+    async def _run_async(self) -> None:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            raise RuntimeError("Playwright is not installed") from exc
+
+        async with async_playwright() as manager:
+            browser = await manager.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage", "--no-sandbox"],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=FLASHSCORE_USER_AGENT,
+            )
+            log("Fresh-page serve overlay launched in independent monitor")
+            try:
+                while not self._stop.is_set():
+                    cycle_started = time.monotonic()
+                    self._wake.clear()
+                    with self._lock:
+                        targets = dict(self._targets)
+                    semaphore = asyncio.Semaphore(max(1, LIVE_PAGE_CONCURRENCY))
+
+                    async def scan(url: str, label: str) -> None:
+                        async with semaphore:
+                            try:
+                                rows = await asyncio.wait_for(
+                                    self._scan_target(context, url, label),
+                                    timeout=LIVE_PAGE_SCAN_TIMEOUT_SECONDS,
+                                )
+                            except Exception as exc:
+                                error_text = str(exc) or type(exc).__name__
+                                with self._lock:
+                                    prior_error = self._errors.get(url, "")
+                                    self._errors[url] = error_text
+                                    self._rows.pop(url, None)
+                                    self._updated_at.pop(url, None)
+                                if error_text != prior_error:
+                                    log(
+                                        f"{label}: serve overlay failed; "
+                                        f"feed monitoring continues: {error_text}"
+                                    )
+                                return
+                            with self._lock:
+                                recovered = bool(self._errors.pop(url, ""))
+                                self._rows[url] = rows
+                                self._updated_at[url] = time.monotonic()
+                            if recovered:
+                                log(f"{label}: serve overlay recovered")
+
+                    if targets:
+                        await asyncio.gather(
+                            *(scan(url, label) for url, label in targets.items())
+                        )
+                    wait_until = cycle_started + self._poll_seconds
+                    while not self._stop.is_set() and time.monotonic() < wait_until:
+                        if self._wake.is_set():
+                            self._wake.clear()
+                            break
+                        await asyncio.sleep(0.25)
+            finally:
+                try:
+                    await context.close()
+                finally:
+                    await browser.close()
+
     def close(self, timeout: float = 5.0) -> bool:
         self._stop.set()
+        self._wake.set()
         self._thread.join(timeout=max(0.0, timeout))
         return not self._thread.is_alive()
 
@@ -815,7 +919,9 @@ def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
         for item in prior.get("matches", []) or []
         if isinstance(item, dict) and item.get("id")
     }
-    alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
+    alerts = [
+        item for item in prior.get("alerts", []) or [] if isinstance(item, dict)
+    ][-MAX_ALERT_HISTORY:]
     pages: dict[str, Page] = {}
     loaded_at: dict[str, float] = {}
     source_errors: dict[str, str] = {}
@@ -1011,7 +1117,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
         for item in prior.get("matches", []) or []
         if isinstance(item, dict) and item.get("id")
     }
-    alerts = [item for item in prior.get("alerts", []) or [] if isinstance(item, dict)]
+    alerts = [
+        item for item in prior.get("alerts", []) or [] if isinstance(item, dict)
+    ][-MAX_ALERT_HISTORY:]
     expired_finished_matches = {
         str(match_id): str(finished_at)
         for match_id, finished_at in dict(prior.get("expired_finished_matches", {}) or {}).items()
@@ -1058,6 +1166,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             sweep_started = time.monotonic()
             links = configured_links()
             source_errors: dict[str, str] = {}
+            fresh_overlay_urls: set[str] = set()
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
                     f"Feed sweep {sweep_number} started: {len(links)} tournament(s), "
@@ -1165,6 +1274,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 )
                 live_rows, _live_error, _live_age = live_monitor.snapshot(url)
                 if live_rows:
+                    fresh_overlay_urls.add(url)
                     combined_matches = overlay_live_rows(combined_matches, live_rows)
                 raw_matches = list(combined_matches.values())
 
@@ -1272,10 +1382,14 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 f"{tournament_label_from_url(url)}: {error}"
                 for url, error in source_errors.items()
             )
+            overlay_status = f"serve overlay {len(fresh_overlay_urls)}/{len(links)} fresh"
             phase = (
-                f"Watching {len(links)} tournament feed(s)"
+                f"Watching {len(links)} tournament feed(s) · {overlay_status}"
                 if not error_message
-                else f"Feed scan completed with {len(source_errors)} source error(s)"
+                else (
+                    f"Feed scan completed with {len(source_errors)} source error(s) · "
+                    f"{overlay_status}"
+                )
             )
             write_runtime_state(
                 matches,
