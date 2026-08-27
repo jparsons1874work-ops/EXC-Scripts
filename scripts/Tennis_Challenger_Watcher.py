@@ -1458,7 +1458,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
     log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
     log(
-        f"Processing direct match-page updates every {poll_seconds:g} seconds; "
+        f"Sweeping direct match pages continuously and processing results every "
+        f"{poll_seconds:g} seconds; "
         "refreshing tournament discovery and Betfair matching every 10 minutes"
     )
     write_runtime_state(
