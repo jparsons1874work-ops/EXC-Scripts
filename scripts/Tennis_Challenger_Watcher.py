@@ -70,6 +70,7 @@ LIVE_PAGE_SCAN_TIMEOUT_SECONDS = 30
 LIVE_PAGE_CONCURRENCY = 4
 DETAIL_PAGE_POLL_SECONDS = 0.25
 DETAIL_PAGE_MAX_AGE_SECONDS = 60
+DETAIL_PAGE_TIMEOUT_SECONDS = 6
 DETAIL_PREMATCH_WINDOW_SECONDS = 12 * 60 * 60
 DETAIL_PAST_WINDOW_SECONDS = 8 * 60 * 60
 EVENT_ROW_SELECTOR = ".event__match[id]"
@@ -888,86 +889,112 @@ class FlashscoreLivePageMonitor:
                 pass
 
     async def _run_detail_pages(self, browser: Any) -> None:
-        while not self._stop.is_set():
-            with self._lock:
-                targets = [
-                    row
-                    for source_targets in self._detail_targets_by_source.values()
-                    for row in source_targets.values()
-                ]
-            # Live matches are checked first. Upcoming matches retain the
-            # chronological order supplied by their tournament page.
-            targets.sort(key=lambda row: 0 if row.get("is_live") else 1)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=FLASHSCORE_USER_AGENT,
+            timezone_id="Europe/London",
+        )
 
-            if not targets:
-                await asyncio.sleep(1)
-                continue
+        async def trim_heavy_resources(route: Any) -> None:
+            if route.request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
 
-            for row in targets:
-                if self._stop.is_set():
-                    break
-                match_id = str(row.get("id", "") or "")
-                context = None
-                try:
-                    # A brand-new context for every match is a complete cache
-                    # clear. Only this one match page exists at any time.
-                    context = await browser.new_context(
-                        viewport={"width": 1280, "height": 900},
-                        user_agent=FLASHSCORE_USER_AGENT,
-                        timezone_id="Europe/London",
-                    )
+        await context.route("**/*", trim_heavy_resources)
+        cache_cleared_at = 0.0
+        detail_sweep_number = 0
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    targets = [
+                        row
+                        for source_targets in self._detail_targets_by_source.values()
+                        for row in source_targets.values()
+                    ]
+                # Live matches are checked first. Upcoming matches retain the
+                # chronological order supplied by their tournament page.
+                targets.sort(key=lambda row: 0 if row.get("is_live") else 1)
 
-                    async def trim_heavy_resources(route: Any) -> None:
-                        if route.request.resource_type in {"image", "media", "font"}:
-                            await route.abort()
-                        else:
-                            await route.continue_()
-
-                    await context.route("**/*", trim_heavy_resources)
-                    page = await context.new_page()
-                    try:
-                        await page.goto(
-                            str(row.get("url", "")),
-                            wait_until="domcontentloaded",
-                            timeout=15000,
-                        )
-                    except Exception:
-                        pass
-                    await page.wait_for_selector(
-                        ".smh__template.tennis, .duelParticipant",
-                        state="attached",
-                        timeout=8000,
-                    )
-                    # Let the initial live-data message update the DOM before
-                    # reading, then close everything before the next match.
+                if not targets:
                     await asyncio.sleep(1)
-                    result = await page.evaluate(DETAIL_EXTRACTOR, row)
-                    if not isinstance(result, dict) or not result.get("id"):
-                        raise RuntimeError("Direct match page returned no match data")
-                except Exception as exc:
-                    error_text = str(exc) or type(exc).__name__
-                    with self._lock:
-                        prior_error = self._detail_errors.get(match_id, "")
-                        self._detail_errors[match_id] = error_text
-                    if error_text != prior_error:
-                        players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
-                        log(f"{players}: direct match page failed: {error_text}")
-                else:
-                    with self._lock:
-                        recovered = bool(self._detail_errors.pop(match_id, ""))
-                        self._detail_rows[match_id] = result
-                        self._detail_updated_at[match_id] = time.monotonic()
-                    if recovered:
-                        players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
-                        log(f"{players}: direct match page recovered")
-                finally:
-                    if context is not None:
-                        try:
-                            await asyncio.wait_for(context.close(), timeout=5)
-                        except Exception:
-                            pass
+                    continue
 
-            await asyncio.sleep(DETAIL_PAGE_POLL_SECONDS)
+                detail_sweep_number += 1
+                detail_sweep_started = time.monotonic()
+                successful_checks = 0
+                for row in targets:
+                    if self._stop.is_set():
+                        break
+                    match_id = str(row.get("id", "") or "")
+                    page = None
+                    try:
+                        page = await context.new_page()
+                        now = time.monotonic()
+                        if now - cache_cleared_at >= 60:
+                            cache_session = await context.new_cdp_session(page)
+                            try:
+                                await cache_session.send("Network.clearBrowserCache")
+                            finally:
+                                await cache_session.detach()
+                            cache_cleared_at = now
+                        async def read_match_page() -> Any:
+                            try:
+                                await page.goto(
+                                    str(row.get("url", "")),
+                                    wait_until="commit",
+                                    timeout=5000,
+                                )
+                            except Exception:
+                                pass
+                            await page.wait_for_selector(
+                                ".smh__template.tennis, .duelParticipant",
+                                state="attached",
+                                timeout=4500,
+                            )
+                            await asyncio.sleep(0.5)
+                            return await page.evaluate(DETAIL_EXTRACTOR, row)
+
+                        result = await asyncio.wait_for(
+                            read_match_page(),
+                            timeout=DETAIL_PAGE_TIMEOUT_SECONDS,
+                        )
+                        if not isinstance(result, dict) or not result.get("id"):
+                            raise RuntimeError("Direct match page returned no match data")
+                    except Exception as exc:
+                        error_text = str(exc) or type(exc).__name__
+                        with self._lock:
+                            prior_error = self._detail_errors.get(match_id, "")
+                            self._detail_errors[match_id] = error_text
+                        if error_text != prior_error:
+                            players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
+                            log(f"{players}: direct match page failed: {error_text}")
+                    else:
+                        successful_checks += 1
+                        with self._lock:
+                            recovered = bool(self._detail_errors.pop(match_id, ""))
+                            self._detail_rows[match_id] = result
+                            self._detail_updated_at[match_id] = time.monotonic()
+                        if recovered:
+                            players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
+                            log(f"{players}: direct match page recovered")
+                    finally:
+                        if page is not None:
+                            try:
+                                await asyncio.wait_for(page.close(), timeout=3)
+                            except Exception:
+                                pass
+                log(
+                    f"Direct match sweep {detail_sweep_number} complete in "
+                    f"{time.monotonic() - detail_sweep_started:.1f}s: "
+                    f"{successful_checks}/{len(targets)} match page(s) updated"
+                )
+                await asyncio.sleep(DETAIL_PAGE_POLL_SECONDS)
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
     async def _run_async(self) -> None:
         try:
