@@ -266,25 +266,42 @@ def normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
-def participant_surnames(value: str) -> list[str]:
+def participant_surnames(value: str, *, flashscore: bool = False) -> list[str]:
     surnames: list[str] = []
     for participant in re.split(r"\s*(?:/|&|\+|\band\b)\s*", str(value or ""), flags=re.IGNORECASE):
         tokens = normalize_name(participant).split()
-        useful = [token for token in tokens if len(token) > 1]
-        if useful:
-            surnames.append(" ".join(useful))
+        if flashscore:
+            # Flashscore writes doubles players as "Surname I." (and can use
+            # multiple trailing initials). Betfair event names use surnames
+            # only, so remove those initials before comparing the pair.
+            while len(tokens) > 1 and len(tokens[-1]) == 1:
+                tokens.pop()
+        else:
+            # Betfair runner names can be "I Surname" even though its event
+            # title is surname-only. Accept both representations.
+            while len(tokens) > 1 and len(tokens[0]) == 1:
+                tokens.pop(0)
+            while len(tokens) > 1 and len(tokens[-1]) == 1:
+                tokens.pop()
+        if tokens:
+            surnames.append(" ".join(tokens))
     return surnames
 
 
 def split_betfair_players(value: str) -> tuple[str, str] | None:
-    parts = re.split(r"\s+(?:v|vs|versus)\.?\s+", str(value or ""), maxsplit=1, flags=re.IGNORECASE)
+    parts = re.split(
+        r"\s+(?:(?:v|vs|versus)\.?|[-–—])\s+",
+        str(value or ""),
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
     if len(parts) != 2:
         return None
     return parts[0].strip(), parts[1].strip()
 
 
 def participant_match_score(flashscore_name: str, betfair_name: str) -> float:
-    source_surnames = participant_surnames(flashscore_name)
+    source_surnames = participant_surnames(flashscore_name, flashscore=True)
     target_surnames = participant_surnames(betfair_name)
     if not source_surnames or len(source_surnames) != len(target_surnames):
         return 0.0

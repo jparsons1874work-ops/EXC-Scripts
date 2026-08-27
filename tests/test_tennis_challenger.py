@@ -518,12 +518,12 @@ class TennisChallengerTests(unittest.TestCase):
 
     def test_betfair_event_matching_handles_surname_only_doubles_pairs(self) -> None:
         match = {
-            "player1": "Brady C. / Howse M.",
-            "player2": "Jones A. / Smith B.",
+            "player1": "Hands T./Summers M.",
+            "player2": "Blaydes B./Frydrych V.",
         }
         events = [
-            BetfairTennisEvent("wrong", "Brady / Other v Jones / Smith", None),
-            BetfairTennisEvent("right", "Brady / Howse v Jones / Smith", None),
+            BetfairTennisEvent("wrong", "Hands/Other - Blaydes/Frydrych", None),
+            BetfairTennisEvent("right", "Hands/Summers - Blaydes/Frydrych", None),
         ]
 
         event, score, reason = match_betfair_event(match, events)
@@ -532,7 +532,8 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(event.event_id, "right")
         self.assertEqual(score, 100)
         self.assertEqual(reason, "Matched")
-        self.assertEqual(participant_match_score("Howse M. / Brady C.", "Brady / Howse"), 100)
+        self.assertEqual(participant_match_score("Summers M./Hands T.", "Hands/Summers"), 100)
+        self.assertEqual(participant_match_score("Hands T./Summers M.", "M Summers / T Hands"), 100)
 
     def test_doubles_matching_uses_each_betfair_surname_once(self) -> None:
         self.assertLess(
