@@ -7,6 +7,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse, urlunparse
@@ -267,7 +268,7 @@ def normalize_name(value: str) -> str:
 
 def participant_surnames(value: str) -> list[str]:
     surnames: list[str] = []
-    for participant in re.split(r"\s*(?:/|&)\s*", str(value or "")):
+    for participant in re.split(r"\s*(?:/|&|\+|\band\b)\s*", str(value or ""), flags=re.IGNORECASE):
         tokens = normalize_name(participant).split()
         useful = [token for token in tokens if len(token) > 1]
         if useful:
@@ -285,16 +286,31 @@ def split_betfair_players(value: str) -> tuple[str, str] | None:
 def participant_match_score(flashscore_name: str, betfair_name: str) -> float:
     source_surnames = participant_surnames(flashscore_name)
     target_surnames = participant_surnames(betfair_name)
-    target = normalize_name(betfair_name)
-    if not source_surnames or not target_surnames or len(source_surnames) != len(target_surnames) or not target:
+    if not source_surnames or len(source_surnames) != len(target_surnames):
         return 0.0
-    token_scores = []
-    for surname in source_surnames:
-        if surname in target:
-            token_scores.append(100.0)
-        else:
-            token_scores.append(float(fuzz.token_set_ratio(surname, target)))
-    return sum(token_scores) / len(token_scores)
+
+    def surname_score(source: str, target: str) -> float:
+        if source == target:
+            return 100.0
+        source_tokens = set(source.split())
+        target_tokens = set(target.split())
+        if source_tokens == target_tokens:
+            return 100.0
+        if source_tokens and target_tokens and (source_tokens < target_tokens or target_tokens < source_tokens):
+            return 97.0
+        return float(fuzz.ratio(source, target))
+
+    # A doubles pair is a two-person team, but Flashscore and Betfair do not
+    # always list the partners in the same order. Score every one-to-one
+    # assignment so one common surname cannot accidentally satisfy both names.
+    best_score = 0.0
+    for ordered_targets in permutations(target_surnames):
+        score = sum(
+            surname_score(source, target)
+            for source, target in zip(source_surnames, ordered_targets)
+        ) / len(source_surnames)
+        best_score = max(best_score, score)
+    return best_score
 
 
 @dataclass(frozen=True)

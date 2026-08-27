@@ -468,6 +468,30 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertIsNotNone(singles)
         self.assertEqual(singles.event_id, "singles")
 
+    def test_betfair_event_matching_handles_surname_only_doubles_pairs(self) -> None:
+        match = {
+            "player1": "Brady C. / Howse M.",
+            "player2": "Jones A. / Smith B.",
+        }
+        events = [
+            BetfairTennisEvent("wrong", "Brady / Other v Jones / Smith", None),
+            BetfairTennisEvent("right", "Brady / Howse v Jones / Smith", None),
+        ]
+
+        event, score, reason = match_betfair_event(match, events)
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.event_id, "right")
+        self.assertEqual(score, 100)
+        self.assertEqual(reason, "Matched")
+        self.assertEqual(participant_match_score("Howse M. / Brady C.", "Brady / Howse"), 100)
+
+    def test_doubles_matching_uses_each_betfair_surname_once(self) -> None:
+        self.assertLess(
+            participant_match_score("Smith A. / Smith B.", "Smith / Jones"),
+            86,
+        )
+
     def test_finished_matches_are_removed_after_one_hour_and_tombstoned(self) -> None:
         now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
         matches = {
