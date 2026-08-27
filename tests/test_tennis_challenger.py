@@ -342,9 +342,15 @@ class TennisChallengerTests(unittest.TestCase):
                 now,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             should_scan_match_detail(
                 raw_match(scheduled_at="2026-08-27T21:30:00Z"),
+                now,
+            )
+        )
+        self.assertFalse(
+            should_scan_match_detail(
+                raw_match(scheduled_at="2026-08-28T12:30:00Z"),
                 now,
             )
         )
