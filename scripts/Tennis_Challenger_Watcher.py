@@ -60,9 +60,10 @@ ALERT_FLAG_BY_TYPE = {
 DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 100
-BETFAIR_REFRESH_SECONDS = 5 * 60
-BETFAIR_UNMATCHED_REFRESH_SECONDS = 60
-FIXTURES_REFRESH_SECONDS = 60
+BETFAIR_REFRESH_SECONDS = 10 * 60
+BETFAIR_UNMATCHED_REFRESH_SECONDS = BETFAIR_REFRESH_SECONDS
+TOURNAMENT_DISCOVERY_REFRESH_SECONDS = 10 * 60
+FIXTURES_REFRESH_SECONDS = TOURNAMENT_DISCOVERY_REFRESH_SECONDS
 FINISHED_RETENTION_SECONDS = 60 * 60
 LIVE_PAGE_POLL_SECONDS = 10
 LIVE_PAGE_MAX_AGE_SECONDS = 30
@@ -718,7 +719,7 @@ class FlashscoreLivePageProbe:
 
 
 class FlashscoreLivePageMonitor:
-    """Scan fresh tournament pages without blocking the feed-scanning thread."""
+    """Scan individual match pages without blocking the feed-scanning thread."""
 
     def __init__(
         self,
@@ -793,6 +794,10 @@ class FlashscoreLivePageMonitor:
                 ).values())
                 age = min([value for value in [age, *detail_ages] if value is not None])
             return rows, self._errors.get(url, ""), age
+
+    def set_detail_targets(self, source_url: str, rows: list[dict[str, Any]]) -> None:
+        """Seed the sequential match-page queue from the successful feed scan."""
+        self._set_detail_targets(source_url, rows)
 
     def _set_detail_targets(self, source_url: str, rows: list[dict[str, Any]]) -> None:
         candidates = [
@@ -902,7 +907,6 @@ class FlashscoreLivePageMonitor:
                 await route.continue_()
 
         await context.route("**/*", trim_heavy_resources)
-        cache_cleared_at = 0.0
         detail_sweep_number = 0
         try:
             while not self._stop.is_set():
@@ -923,21 +927,14 @@ class FlashscoreLivePageMonitor:
                 detail_sweep_number += 1
                 detail_sweep_started = time.monotonic()
                 successful_checks = 0
-                for row in targets:
+                cache_cleared = False
+                for target_index, row in enumerate(targets):
                     if self._stop.is_set():
                         break
                     match_id = str(row.get("id", "") or "")
                     page = None
                     try:
                         page = await context.new_page()
-                        now = time.monotonic()
-                        if now - cache_cleared_at >= 60:
-                            cache_session = await context.new_cdp_session(page)
-                            try:
-                                await cache_session.send("Network.clearBrowserCache")
-                            finally:
-                                await cache_session.detach()
-                            cache_cleared_at = now
                         async def read_match_page() -> Any:
                             try:
                                 await page.goto(
@@ -980,6 +977,16 @@ class FlashscoreLivePageMonitor:
                             log(f"{players}: direct match page recovered")
                     finally:
                         if page is not None:
+                            if target_index == len(targets) - 1:
+                                try:
+                                    cache_session = await context.new_cdp_session(page)
+                                    try:
+                                        await cache_session.send("Network.clearBrowserCache")
+                                        cache_cleared = True
+                                    finally:
+                                        await cache_session.detach()
+                                except Exception as exc:
+                                    log(f"Direct match sweep cache clear failed: {exc}")
                             try:
                                 await asyncio.wait_for(page.close(), timeout=3)
                             except Exception:
@@ -987,7 +994,8 @@ class FlashscoreLivePageMonitor:
                 log(
                     f"Direct match sweep {detail_sweep_number} complete in "
                     f"{time.monotonic() - detail_sweep_started:.1f}s: "
-                    f"{successful_checks}/{len(targets)} match page(s) updated"
+                    f"{successful_checks}/{len(targets)} match page(s) updated; "
+                    f"cache {'cleared' if cache_cleared else 'not cleared'}"
                 )
                 await asyncio.sleep(DETAIL_PAGE_POLL_SECONDS)
         finally:
@@ -1007,75 +1015,10 @@ class FlashscoreLivePageMonitor:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--no-sandbox"],
             )
-            detail_task = asyncio.create_task(self._run_detail_pages(browser))
-            log("Fresh tournament pages and sequential direct match-page sweeps launched")
+            log("Sequential direct match-page sweeps launched")
             try:
-                while not self._stop.is_set():
-                    cycle_started = time.monotonic()
-                    self._wake.clear()
-                    with self._lock:
-                        targets = dict(self._targets)
-                    semaphore = asyncio.Semaphore(max(1, LIVE_PAGE_CONCURRENCY))
-
-                    # Use a clean context for every cycle so Chromium's HTTP
-                    # cache and prior Flashscore page state cannot supply an
-                    # older score. Flashscore needs its normal request headers
-                    # and service-worker behavior to populate match rows.
-                    context = await browser.new_context(
-                        viewport={"width": 1280, "height": 900},
-                        user_agent=FLASHSCORE_USER_AGENT,
-                        timezone_id="Europe/London",
-                    )
-
-                    async def scan(url: str, label: str) -> None:
-                        async with semaphore:
-                            try:
-                                rows = await asyncio.wait_for(
-                                    self._scan_target(context, url, label),
-                                    timeout=LIVE_PAGE_SCAN_TIMEOUT_SECONDS,
-                                )
-                            except Exception as exc:
-                                error_text = str(exc) or type(exc).__name__
-                                with self._lock:
-                                    prior_error = self._errors.get(url, "")
-                                    self._errors[url] = error_text
-                                    self._rows.pop(url, None)
-                                    self._updated_at.pop(url, None)
-                                if error_text != prior_error:
-                                    log(
-                                        f"{label}: serve overlay failed; "
-                                        f"feed monitoring continues: {error_text}"
-                                    )
-                                return
-                            with self._lock:
-                                recovered = bool(self._errors.pop(url, ""))
-                                self._rows[url] = rows
-                                self._updated_at[url] = time.monotonic()
-                            if recovered:
-                                log(f"{label}: serve overlay recovered")
-
-                    try:
-                        if targets:
-                            await asyncio.gather(
-                                *(scan(url, label) for url, label in targets.items())
-                            )
-                    finally:
-                        try:
-                            await asyncio.wait_for(context.close(), timeout=5)
-                        except Exception:
-                            pass
-                    wait_until = cycle_started + self._poll_seconds
-                    while not self._stop.is_set() and time.monotonic() < wait_until:
-                        if self._wake.is_set():
-                            self._wake.clear()
-                            break
-                        await asyncio.sleep(0.25)
+                await self._run_detail_pages(browser)
             finally:
-                detail_task.cancel()
-                try:
-                    await detail_task
-                except asyncio.CancelledError:
-                    pass
                 await browser.close()
 
     def close(self, timeout: float = 5.0) -> bool:
@@ -1183,6 +1126,16 @@ def should_refresh_betfair_events(
     age = (time.monotonic() if now is None else now) - loaded_at
     interval = BETFAIR_UNMATCHED_REFRESH_SECONDS if unmatched_scheduled else BETFAIR_REFRESH_SECONDS
     return age >= interval
+
+
+def should_refresh_tournament_feed(
+    loaded_at: float,
+    now: float | None = None,
+) -> bool:
+    if loaded_at <= 0:
+        return True
+    age = (time.monotonic() if now is None else now) - loaded_at
+    return age >= TOURNAMENT_DISCOVERY_REFRESH_SECONDS
 
 
 def timestamp_is_at_least_seconds_old(
@@ -1487,6 +1440,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 or utc_timestamp()
             )
     feed_configs: dict[str, dict[str, Any]] = {}
+    tournament_rows: dict[str, list[dict[str, Any]]] = {}
+    tournament_rows_loaded_at: dict[str, float] = {}
     betfair_events: list[Any] = []
     betfair_loaded_at = 0.0
     betfair_client: Any = None
@@ -1503,8 +1458,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
     log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
     log(
-        f"Reading the tournament feed every {poll_seconds:g} seconds "
-        "with an independent live-page overlay"
+        f"Processing direct match-page updates every {poll_seconds:g} seconds; "
+        "refreshing tournament discovery and Betfair matching every 10 minutes"
     )
     write_runtime_state(
         matches,
@@ -1527,7 +1482,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             authoritative_match_ids: dict[str, set[str]] = {}
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
-                    f"Feed sweep {sweep_number} started: {len(links)} tournament(s), "
+                    f"State sweep {sweep_number} started: {len(links)} tournament(s), "
                     f"{len(matches)} known match(es)"
                 )
 
@@ -1573,6 +1528,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
 
             for old_url in set(feed_configs) - set(links):
                 feed_configs.pop(old_url, None)
+                tournament_rows.pop(old_url, None)
+                tournament_rows_loaded_at.pop(old_url, None)
             monitor_targets = {url: tournament_label_from_url(url) for url in links}
             live_monitor.set_targets(monitor_targets)
             fixture_monitor.set_targets(monitor_targets)
@@ -1583,17 +1540,16 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 live_rows, live_error, live_age = live_monitor.snapshot(url)
                 if live_rows:
                     fresh_overlay_urls.add(url)
+                discovery_due = should_refresh_tournament_feed(
+                    tournament_rows_loaded_at.get(url, 0.0)
+                )
                 needs_reload = (
                     config is None
                     or time.monotonic() - float(config.get("loaded_at", 0)) >= reload_minutes * 60
                 )
-                try:
-                    if live_rows:
-                        # The clean browser page is authoritative. Avoid the
-                        # Flashscore CDN feed because its HTTP cache can lag by
-                        # several minutes even with a cache-busting query.
-                        summary_matches = live_rows
-                    else:
+                summary_matches = list(tournament_rows.get(url, []))
+                if discovery_due:
+                    try:
                         if needs_reload:
                             write_runtime_state(
                                 matches,
@@ -1607,12 +1563,19 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                             config["loaded_at"] = time.monotonic()
                             feed_configs[url] = config
                         summary_matches = fetch_tournament_feed(session, config, tournament)
-                    source_errors.pop(url, None)
-                except Exception as exc:
-                    source_errors[url] = str(exc) + (f"; live page: {live_error}" if live_error else "")
-                    feed_configs.pop(url, None)
-                    log(f"Tournament feed failed for {tournament}: {exc}")
-                    continue
+                        tournament_rows[url] = list(summary_matches)
+                        tournament_rows_loaded_at[url] = time.monotonic()
+                        source_errors.pop(url, None)
+                        log(
+                            f"{tournament}: tournament discovery refreshed "
+                            f"({len(summary_matches)} match(es))"
+                        )
+                    except Exception as exc:
+                        source_errors[url] = str(exc) + (f"; live page: {live_error}" if live_error else "")
+                        feed_configs.pop(url, None)
+                        log(f"Tournament feed failed for {tournament}: {exc}")
+                        if url not in tournament_rows:
+                            continue
 
                 future_rows, _fixture_error = fixture_monitor.snapshot(url)
 
@@ -1632,6 +1595,11 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                     combined_matches = overlay_live_rows(combined_matches, live_rows)
                     authoritative_match_ids[url] = set(combined_matches)
                 raw_matches = list(combined_matches.values())
+                # The direct feed is the dependable discovery source on EC2.
+                # Hand its live and upcoming matches straight to the sequential
+                # one-page-at-a-time scanner instead of waiting for a tournament
+                # summary page to render.
+                live_monitor.set_detail_targets(url, raw_matches)
 
                 now = utc_timestamp()
                 for raw in raw_matches:
@@ -1759,11 +1727,11 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for url, error in source_errors.items()
             )
             overlay_status = (
-                f"live browser {len(fresh_overlay_urls)}/{len(links)} fresh · "
-                f"{len(fresh_detail_matches)} direct match page(s)"
+                f"{len(fresh_detail_matches)} direct match page(s) fresh · "
+                "tournament/Betfair discovery every 10m"
             )
             phase = (
-                f"Watching {len(links)} tournament feed(s) · {overlay_status}"
+                f"Watching {len(links)} tournament(s) · {overlay_status}"
                 if not error_message
                 else (
                     f"Feed scan completed with {len(source_errors)} source error(s) · "
@@ -1782,7 +1750,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 live_count = sum(item.get("status") == "live" for item in matches.values())
                 scheduled_count = sum(item.get("status") == "scheduled" for item in matches.values())
                 log(
-                    f"Feed sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
+                    f"State sweep {sweep_number} complete in {time.monotonic() - sweep_started:.1f}s: "
                     f"{len(matches)} match(es), {scheduled_count} scheduled, {live_count} live, "
                     f"{len(source_errors)} source error(s)"
                 )

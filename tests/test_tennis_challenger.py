@@ -40,6 +40,7 @@ from scripts.Tennis_Challenger_Watcher import (
     prune_expired_finished_matches,
     should_scan_match_detail,
     should_refresh_betfair_events,
+    should_refresh_tournament_feed,
     slack_message,
     slack_webhook_url,
 )
@@ -392,12 +393,17 @@ class TennisChallengerTests(unittest.TestCase):
             release.set()
             self.assertTrue(monitor.close(1))
 
-    def test_unmatched_betfair_events_retry_once_per_minute(self) -> None:
+    def test_betfair_events_refresh_every_ten_minutes(self) -> None:
         self.assertTrue(should_refresh_betfair_events(0, True, now=100))
-        self.assertFalse(should_refresh_betfair_events(100, True, now=159.9))
-        self.assertTrue(should_refresh_betfair_events(100, True, now=160))
-        self.assertFalse(should_refresh_betfair_events(100, False, now=399.9))
-        self.assertTrue(should_refresh_betfair_events(100, False, now=400))
+        self.assertFalse(should_refresh_betfair_events(100, True, now=699.9))
+        self.assertTrue(should_refresh_betfair_events(100, True, now=700))
+        self.assertFalse(should_refresh_betfair_events(100, False, now=699.9))
+        self.assertTrue(should_refresh_betfair_events(100, False, now=700))
+
+    def test_tournament_discovery_refreshes_every_ten_minutes(self) -> None:
+        self.assertTrue(should_refresh_tournament_feed(0, now=100))
+        self.assertFalse(should_refresh_tournament_feed(100, now=699.9))
+        self.assertTrue(should_refresh_tournament_feed(100, now=700))
 
     def test_slack_alert_includes_the_betfair_event_id(self) -> None:
         match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
