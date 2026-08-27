@@ -69,7 +69,11 @@ LIVE_PAGE_MAX_AGE_SECONDS = 30
 LIVE_PAGE_SCAN_TIMEOUT_SECONDS = 30
 LIVE_PAGE_CONCURRENCY = 4
 DETAIL_PAGE_CONCURRENCY = 6
-DETAIL_PREMATCH_WINDOW_SECONDS = 2 * 60 * 60
+DETAIL_PAGE_POLL_SECONDS = 2
+DETAIL_PAGE_MAX_AGE_SECONDS = 15
+DETAIL_PAGE_ROTATE_SECONDS = 60
+MAX_DETAIL_PAGES = 8
+DETAIL_PREMATCH_WINDOW_SECONDS = 45 * 60
 DETAIL_PAST_WINDOW_SECONDS = 8 * 60 * 60
 EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
@@ -732,6 +736,10 @@ class FlashscoreLivePageMonitor:
         self._rows: dict[str, list[dict[str, Any]]] = {}
         self._updated_at: dict[str, float] = {}
         self._errors: dict[str, str] = {}
+        self._detail_targets_by_source: dict[str, dict[str, dict[str, Any]]] = {}
+        self._detail_rows: dict[str, dict[str, Any]] = {}
+        self._detail_updated_at: dict[str, float] = {}
+        self._detail_errors: dict[str, str] = {}
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = threading.Thread(
@@ -750,6 +758,16 @@ class FlashscoreLivePageMonitor:
                 self._rows.pop(old_url, None)
                 self._updated_at.pop(old_url, None)
                 self._errors.pop(old_url, None)
+                self._detail_targets_by_source.pop(old_url, None)
+            valid_detail_ids = {
+                match_id
+                for source_targets in self._detail_targets_by_source.values()
+                for match_id in source_targets
+            }
+            for match_id in set(self._detail_rows) - valid_detail_ids:
+                self._detail_rows.pop(match_id, None)
+                self._detail_updated_at.pop(match_id, None)
+                self._detail_errors.pop(match_id, None)
         self._wake.set()
 
     def snapshot(self, url: str) -> tuple[list[dict[str, Any]], str, float | None]:
@@ -757,7 +775,47 @@ class FlashscoreLivePageMonitor:
             updated_at = self._updated_at.get(url)
             age = time.monotonic() - updated_at if updated_at is not None else None
             rows = list(self._rows.get(url, [])) if age is not None and age <= self._max_age_seconds else []
+            source_targets = self._detail_targets_by_source.get(url, {})
+            detail_rows: list[dict[str, Any]] = []
+            detail_ages: list[float] = []
+            now = time.monotonic()
+            for match_id in source_targets:
+                detail_updated_at = self._detail_updated_at.get(match_id)
+                detail_age = now - detail_updated_at if detail_updated_at is not None else None
+                if detail_age is None or detail_age > DETAIL_PAGE_MAX_AGE_SECONDS:
+                    continue
+                detail_row = self._detail_rows.get(match_id)
+                if detail_row:
+                    detail_rows.append(dict(detail_row))
+                    detail_ages.append(detail_age)
+            if detail_rows:
+                rows = list(overlay_live_rows(
+                    {str(row.get("id", "")): row for row in rows if row.get("id")},
+                    detail_rows,
+                ).values())
+                age = min([value for value in [age, *detail_ages] if value is not None])
             return rows, self._errors.get(url, ""), age
+
+    def _set_detail_targets(self, source_url: str, rows: list[dict[str, Any]]) -> None:
+        candidates = [
+            {**row, "_detail_source_url": source_url}
+            for row in rows
+            if row.get("id") and row.get("url") and should_scan_match_detail(row)
+        ]
+        candidates.sort(key=lambda row: 0 if row.get("is_live") else 1)
+        with self._lock:
+            self._detail_targets_by_source[source_url] = {
+                str(row["id"]): row for row in candidates
+            }
+            valid_detail_ids = {
+                match_id
+                for source_targets in self._detail_targets_by_source.values()
+                for match_id in source_targets
+            }
+            for match_id in set(self._detail_rows) - valid_detail_ids:
+                self._detail_rows.pop(match_id, None)
+                self._detail_updated_at.pop(match_id, None)
+                self._detail_errors.pop(match_id, None)
 
     def _run(self) -> None:
         if self._probe_factory is not None:
@@ -809,38 +867,6 @@ class FlashscoreLivePageMonitor:
                 except Exception as exc:
                     log(f"Live-page browser cleanup failed: {exc}")
 
-    async def _scan_detail_row(
-        self,
-        context: Any,
-        row: dict[str, Any],
-        label: str,
-    ) -> dict[str, Any]:
-        async with self._detail_semaphore:
-            page = await context.new_page()
-            try:
-                try:
-                    await page.goto(str(row.get("url", "")), wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                await page.wait_for_selector(
-                    ".smh__template.tennis, .duelParticipant",
-                    state="attached",
-                    timeout=10000,
-                )
-                # The detail-page live connection updates just after the main
-                # participant block arrives. Give it a short moment to apply
-                # the score and pre-match serving marker.
-                await asyncio.sleep(2)
-                result = await page.evaluate(DETAIL_EXTRACTOR, row)
-                if not isinstance(result, dict) or not result.get("id"):
-                    raise RuntimeError(f"{label} detail page returned no match data")
-                return result
-            finally:
-                try:
-                    await asyncio.wait_for(page.close(), timeout=3)
-                except Exception:
-                    pass
-
     async def _scan_target(self, context: Any, url: str, label: str) -> list[dict[str, Any]]:
         page = await context.new_page()
         try:
@@ -856,21 +882,140 @@ class FlashscoreLivePageMonitor:
             clean_rows = [row for row in rows or [] if isinstance(row, dict)]
             if not clean_rows:
                 raise RuntimeError(f"{label} live page returned no match rows")
-            detail_candidates = [row for row in clean_rows if should_scan_match_detail(row)]
-            if not detail_candidates:
-                return clean_rows
-            detail_results = await asyncio.gather(
-                *(self._scan_detail_row(context, row, label) for row in detail_candidates),
-                return_exceptions=True,
-            )
-            detail_rows = [item for item in detail_results if isinstance(item, dict)]
-            return list(overlay_live_rows(
-                {str(row.get("id", "")): row for row in clean_rows if row.get("id")},
-                detail_rows,
-            ).values())
+            self._set_detail_targets(url, clean_rows)
+            return clean_rows
         finally:
             try:
                 await asyncio.wait_for(page.close(), timeout=3)
+            except Exception:
+                pass
+
+    async def _run_detail_pages(self, browser: Any) -> None:
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=FLASHSCORE_USER_AGENT,
+            timezone_id="Europe/London",
+        )
+
+        async def trim_heavy_resources(route: Any) -> None:
+            if route.request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await context.route("**/*", trim_heavy_resources)
+        pages: dict[str, Any] = {}
+        page_opened_at: dict[str, float] = {}
+        cache_cleared_at = time.monotonic()
+        semaphore = asyncio.Semaphore(max(1, DETAIL_PAGE_CONCURRENCY))
+
+        async def close_page(match_id: str) -> None:
+            page = pages.pop(match_id, None)
+            page_opened_at.pop(match_id, None)
+            if page is not None:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3)
+                except Exception:
+                    pass
+
+        async def sample(match_id: str, row: dict[str, Any]) -> None:
+            async with semaphore:
+                page = pages.get(match_id)
+                try:
+                    if page is None:
+                        page = await context.new_page()
+                        pages[match_id] = page
+                        page_opened_at[match_id] = time.monotonic()
+                        try:
+                            await page.goto(
+                                str(row.get("url", "")),
+                                wait_until="domcontentloaded",
+                                timeout=20000,
+                            )
+                        except Exception:
+                            pass
+                        await page.wait_for_selector(
+                            ".smh__template.tennis, .duelParticipant",
+                            state="attached",
+                            timeout=10000,
+                        )
+                        # Allow the page's live connection to apply its first
+                        # score/server update. The page then remains open and
+                        # receives Flashscore changes continuously.
+                        await asyncio.sleep(2)
+                    result = await page.evaluate(DETAIL_EXTRACTOR, row)
+                    if not isinstance(result, dict) or not result.get("id"):
+                        raise RuntimeError("Direct match page returned no match data")
+                except Exception as exc:
+                    error_text = str(exc) or type(exc).__name__
+                    with self._lock:
+                        prior_error = self._detail_errors.get(match_id, "")
+                        self._detail_errors[match_id] = error_text
+                        self._detail_rows.pop(match_id, None)
+                        self._detail_updated_at.pop(match_id, None)
+                    if error_text != prior_error:
+                        players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
+                        log(f"{players}: direct match page failed: {error_text}")
+                    await close_page(match_id)
+                    return
+
+                with self._lock:
+                    recovered = bool(self._detail_errors.pop(match_id, ""))
+                    self._detail_rows[match_id] = result
+                    self._detail_updated_at[match_id] = time.monotonic()
+                if recovered:
+                    players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
+                    log(f"{players}: direct match page recovered")
+
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    targets = [
+                        row
+                        for source_targets in self._detail_targets_by_source.values()
+                        for row in source_targets.values()
+                    ]
+                targets.sort(key=lambda row: 0 if row.get("is_live") else 1)
+                targets = targets[:MAX_DETAIL_PAGES]
+                target_map = {str(row.get("id", "")): row for row in targets if row.get("id")}
+
+                for obsolete_id in set(pages) - set(target_map):
+                    await close_page(obsolete_id)
+                now = time.monotonic()
+                if pages and now - cache_cleared_at >= DETAIL_PAGE_ROTATE_SECONDS:
+                    try:
+                        cache_session = await context.new_cdp_session(next(iter(pages.values())))
+                        try:
+                            await cache_session.send("Network.clearBrowserCache")
+                        finally:
+                            await cache_session.detach()
+                    except Exception as exc:
+                        log(f"Direct match-page cache clear failed: {exc}")
+                    cache_cleared_at = now
+                # Rotate one page per pass. This prevents long-running
+                # Flashscore tabs accumulating memory while avoiding a burst
+                # where every live match is reloaded at the same time.
+                rotation_due = next(
+                    (
+                        match_id
+                        for match_id, opened_at in page_opened_at.items()
+                        if match_id in target_map
+                        and now - opened_at >= DETAIL_PAGE_ROTATE_SECONDS
+                    ),
+                    None,
+                )
+                if rotation_due is not None:
+                    await close_page(rotation_due)
+                if target_map:
+                    await asyncio.gather(
+                        *(sample(match_id, row) for match_id, row in target_map.items())
+                    )
+                await asyncio.sleep(DETAIL_PAGE_POLL_SECONDS)
+        finally:
+            for match_id in list(pages):
+                await close_page(match_id)
+            try:
+                await context.close()
             except Exception:
                 pass
 
@@ -885,8 +1030,8 @@ class FlashscoreLivePageMonitor:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--no-sandbox"],
             )
-            self._detail_semaphore = asyncio.Semaphore(max(1, DETAIL_PAGE_CONCURRENCY))
-            log("Fresh-page serve overlay launched in independent monitor")
+            detail_task = asyncio.create_task(self._run_detail_pages(browser))
+            log("Fresh tournament pages and persistent direct match pages launched")
             try:
                 while not self._stop.is_set():
                     cycle_started = time.monotonic()
@@ -949,6 +1094,11 @@ class FlashscoreLivePageMonitor:
                             break
                         await asyncio.sleep(0.25)
             finally:
+                detail_task.cancel()
+                try:
+                    await detail_task
+                except asyncio.CancelledError:
+                    pass
                 await browser.close()
 
     def close(self, timeout: float = 5.0) -> bool:
