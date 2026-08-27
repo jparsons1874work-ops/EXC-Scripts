@@ -520,6 +520,51 @@ class TennisChallengerTests(unittest.TestCase):
         finished["alerts_sent"] = dict(previous["alerts_sent"])
         self.assertEqual(pending_alerts(previous, finished), ["match_complete"])
 
+    def test_final_score_overrides_a_stale_live_status(self) -> None:
+        finished = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 2",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "0", "away": "2"},
+                set_parts=[{"home": "2", "away": "6"}, {"home": "4", "away": "6"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+
+        self.assertEqual(finished["status"], "finished")
+
+    def test_finished_detail_result_survives_the_stale_feed_overlay(self) -> None:
+        monitor = FlashscoreLivePageMonitor.__new__(FlashscoreLivePageMonitor)
+        monitor._lock = threading.Lock()
+        monitor._rows = {}
+        monitor._updated_at = {}
+        monitor._errors = {}
+        monitor._detail_targets_by_source = {}
+        monitor._detail_rows = {}
+        monitor._detail_updated_at = {}
+        monitor._detail_errors = {}
+        monitor._max_age_seconds = 30
+        finished_raw = raw_match(
+            raw_status="Finished",
+            row_classes="event__match event__match--finished",
+            is_live=False,
+            is_scheduled=False,
+            set_score={"home": "0", "away": "2"},
+            set_parts=[{"home": "2", "away": "6"}, {"home": "4", "away": "6"}],
+        )
+        monitor.set_detail_targets(AUGSBURG_URL, [finished_raw])
+        monitor._detail_rows["abc123"] = finished_raw
+        monitor._detail_updated_at["abc123"] = time.monotonic()
+
+        rows, error, age = monitor.snapshot(AUGSBURG_URL)
+
+        self.assertEqual(error, "")
+        self.assertIsNotNone(age)
+        self.assertEqual(rows[0]["raw_status"], "Finished")
+
     def test_historical_finished_match_does_not_alert_when_first_discovered(self) -> None:
         finished = normalize_scraped_match(
             raw_match(

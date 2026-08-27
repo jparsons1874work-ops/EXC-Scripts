@@ -67,11 +67,8 @@ FIXTURES_REFRESH_SECONDS = TOURNAMENT_DISCOVERY_REFRESH_SECONDS
 FINISHED_RETENTION_SECONDS = 60 * 60
 LIVE_PAGE_POLL_SECONDS = 10
 LIVE_PAGE_MAX_AGE_SECONDS = 30
-LIVE_PAGE_SCAN_TIMEOUT_SECONDS = 30
-LIVE_PAGE_CONCURRENCY = 4
 DETAIL_PAGE_POLL_SECONDS = 0.25
 DETAIL_PAGE_MAX_AGE_SECONDS = 60
-DETAIL_PAGE_TIMEOUT_SECONDS = 6
 DETAIL_PREMATCH_WINDOW_SECONDS = 12 * 60 * 60
 DETAIL_PAST_WINDOW_SECONDS = 8 * 60 * 60
 EVENT_ROW_SELECTOR = ".event__match[id]"
@@ -131,14 +128,33 @@ base => {
     return node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
   };
   const value = (side, suffix) => text(`.smh__${side}.smh__part--${suffix}`);
-  const rawStatus = text('.detailScore__status')
+  const observedRawStatus = text('.detailScore__status')
     || text('.fixedHeaderDuel__detailStatus')
-    || String(base.raw_status || '');
+    || text('[class*="detailStatus"]');
+  const rawStatus = observedRawStatus || String(base.raw_status || '');
   const statusText = rawStatus.toLowerCase();
   const currentSetMatch = rawStatus.match(/\bset\s*([1-5])/i);
   const statusLabel = currentSetMatch ? `Set ${currentSetMatch[1]}` : rawStatus;
   const table = document.querySelector('.smh__template.tennis, .smh__template[class*="tennis"]');
-  const isFinished = /\b(finished|final|retired|walkover|abandoned|cancelled|canceled|awarded)\b/.test(statusText);
+  const setParts = table ? [1, 2, 3, 4, 5].map(index => ({
+    home: value('home', index),
+    away: value('away', index)
+  })) : (base.set_parts || []);
+  const completedSetWinner = pair => {
+    const home = Number.parseInt(String(pair.home || ''), 10);
+    const away = Number.parseInt(String(pair.away || ''), 10);
+    if (!Number.isFinite(home) || !Number.isFinite(away)) return '';
+    if (home === 7 && away === 6) return 'home';
+    if (away === 7 && home === 6) return 'away';
+    if (home >= 6 && home - away >= 2) return 'home';
+    if (away >= 6 && away - home >= 2) return 'away';
+    return '';
+  };
+  const setWinners = setParts.map(completedSetWinner);
+  const scoreShowsFinished = setWinners.filter(side => side === 'home').length >= 2
+    || setWinners.filter(side => side === 'away').length >= 2;
+  const isFinished = /\b(finished|final|retired|walkover|abandoned|cancelled|canceled|awarded)\b/.test(statusText)
+    || scoreShowsFinished;
   const isLive = !isFinished && Boolean(
     table && (document.querySelector('.smh__live') || /\b(set\s*\d+|live|tiebreak)\b/.test(statusText))
   );
@@ -156,10 +172,7 @@ base => {
       home: value('home', 'current'),
       away: value('away', 'current')
     } : (base.set_score || {home: '', away: ''}),
-    set_parts: table ? [1, 2, 3, 4, 5].map(index => ({
-      home: value('home', index),
-      away: value('away', index)
-    })) : (base.set_parts || []),
+    set_parts: setParts,
     current_points: table ? {
       home: value('home', 'game'),
       away: value('away', 'game')
@@ -200,6 +213,45 @@ def normalize_status(raw_status: str, row_classes: str = "", is_live: bool = Fal
     return "unknown"
 
 
+def completed_set_winner(pair: dict[str, Any]) -> str:
+    home = clean_score_value(pair.get("home"))
+    away = clean_score_value(pair.get("away"))
+    if not isinstance(home, int) or not isinstance(away, int):
+        return ""
+    if home == 7 and away == 6:
+        return "home"
+    if away == 7 and home == 6:
+        return "away"
+    if home >= 6 and home - away >= 2:
+        return "home"
+    if away >= 6 and away - home >= 2:
+        return "away"
+    return ""
+
+
+def score_shows_match_complete(set_parts: Any) -> bool:
+    wins = {"home": 0, "away": 0}
+    for pair in set_parts or []:
+        if not isinstance(pair, dict):
+            continue
+        winner = completed_set_winner(pair)
+        if winner:
+            wins[winner] += 1
+    return max(wins.values()) >= 2
+
+
+def status_from_raw_match(raw: dict[str, Any]) -> str:
+    status = normalize_status(
+        str(raw.get("raw_status", "")),
+        str(raw.get("row_classes", "")),
+        bool(raw.get("is_live")),
+        bool(raw.get("is_scheduled")),
+    )
+    if status not in COMPLETED_STATUSES and score_shows_match_complete(raw.get("set_parts")):
+        return "finished"
+    return status
+
+
 def current_set_number(raw_status: str, status: str) -> int | None:
     match = re.search(r"\bset\s*([1-5])\b", str(raw_status or ""), re.IGNORECASE)
     if match:
@@ -210,12 +262,7 @@ def current_set_number(raw_status: str, status: str) -> int | None:
 
 
 def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: str) -> dict[str, Any]:
-    status = normalize_status(
-        str(raw.get("raw_status", "")),
-        str(raw.get("row_classes", "")),
-        bool(raw.get("is_live")),
-        bool(raw.get("is_scheduled")),
-    )
+    status = status_from_raw_match(raw)
     current_set = current_set_number(str(raw.get("raw_status", "")), status)
     sets: list[dict[str, Any]] = []
     for pair in raw.get("set_parts", []) or []:
@@ -781,12 +828,16 @@ class FlashscoreLivePageMonitor:
             for match_id in source_targets:
                 detail_updated_at = self._detail_updated_at.get(match_id)
                 detail_age = now - detail_updated_at if detail_updated_at is not None else None
-                if detail_age is None or detail_age > DETAIL_PAGE_MAX_AGE_SECONDS:
-                    continue
                 detail_row = self._detail_rows.get(match_id)
-                if detail_row:
-                    detail_rows.append(dict(detail_row))
-                    detail_ages.append(detail_age)
+                max_detail_age = (
+                    FINISHED_RETENTION_SECONDS
+                    if detail_row and status_from_raw_match(detail_row) in COMPLETED_STATUSES
+                    else DETAIL_PAGE_MAX_AGE_SECONDS
+                )
+                if detail_age is None or detail_age > max_detail_age or not detail_row:
+                    continue
+                detail_rows.append(dict(detail_row))
+                detail_ages.append(detail_age)
             if detail_rows:
                 rows = list(overlay_live_rows(
                     {str(row.get("id", "")): row for row in rows if row.get("id")},
@@ -803,7 +854,7 @@ class FlashscoreLivePageMonitor:
         candidates = [
             {**row, "_detail_source_url": source_url}
             for row in rows
-            if row.get("id") and row.get("url") and should_scan_match_detail(row)
+            if row.get("id") and row.get("url")
         ]
         candidates.sort(key=lambda row: 0 if row.get("is_live") else 1)
         with self._lock:
@@ -915,6 +966,7 @@ class FlashscoreLivePageMonitor:
                         row
                         for source_targets in self._detail_targets_by_source.values()
                         for row in source_targets.values()
+                        if should_scan_match_detail(row)
                     ]
                 # Live matches are checked first. Upcoming matches retain the
                 # chronological order supplied by their tournament page.
@@ -940,22 +992,40 @@ class FlashscoreLivePageMonitor:
                                 await page.goto(
                                     str(row.get("url", "")),
                                     wait_until="commit",
-                                    timeout=5000,
+                                    timeout=3500,
                                 )
                             except Exception:
                                 pass
                             await page.wait_for_selector(
                                 ".smh__template.tennis, .duelParticipant",
                                 state="attached",
-                                timeout=4500,
+                                timeout=3500,
                             )
-                            await asyncio.sleep(0.5)
+                            try:
+                                await page.wait_for_function(
+                                    """
+                                    () => {
+                                      const status = document.querySelector(
+                                        '.detailScore__status, .fixedHeaderDuel__detailStatus, [class*="detailStatus"]'
+                                      );
+                                      const statusText = String(status?.textContent || '').trim();
+                                      const score = document.querySelector(
+                                        '.smh__template.tennis .smh__part--1, .smh__template.tennis .smh__part--current'
+                                      );
+                                      const serving = document.querySelector('[title*="Serving"]');
+                                      return Boolean(statusText || score || serving);
+                                    }
+                                    """,
+                                    timeout=2000,
+                                )
+                            except Exception:
+                                # Scheduled pages can legitimately have no status,
+                                # score or server until the toss is published.
+                                pass
+                            await asyncio.sleep(0.25)
                             return await page.evaluate(DETAIL_EXTRACTOR, row)
 
-                        result = await asyncio.wait_for(
-                            read_match_page(),
-                            timeout=DETAIL_PAGE_TIMEOUT_SECONDS,
-                        )
+                        result = await read_match_page()
                         if not isinstance(result, dict) or not result.get("id"):
                             raise RuntimeError("Direct match page returned no match data")
                     except Exception as exc:
@@ -969,12 +1039,23 @@ class FlashscoreLivePageMonitor:
                     else:
                         successful_checks += 1
                         with self._lock:
+                            prior_result = self._detail_rows.get(match_id)
                             recovered = bool(self._detail_errors.pop(match_id, ""))
                             self._detail_rows[match_id] = result
                             self._detail_updated_at[match_id] = time.monotonic()
                         if recovered:
                             players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
                             log(f"{players}: direct match page recovered")
+                        prior_status = status_from_raw_match(prior_result) if prior_result else ""
+                        current_status = status_from_raw_match(result)
+                        if current_status != prior_status:
+                            players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
+                            score = result.get("set_score") or {}
+                            score_text = f"{score.get('home', '')}-{score.get('away', '')}".strip("-")
+                            log(
+                                f"Direct match update: {players} -> {current_status}"
+                                + (f" ({score_text})" if score_text else "")
+                            )
                     finally:
                         if page is not None:
                             if target_index == len(targets) - 1:
