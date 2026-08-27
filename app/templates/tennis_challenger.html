@@ -38,7 +38,7 @@
   <div class="panel">
     <div class="panel-header">
       <h2>Watcher controls</h2>
-      <span class="meta">Checks every 3 seconds</span>
+      <span class="meta">Checks every 10 seconds</span>
     </div>
     <div class="challenger-action-stack">
       <form method="post" action="/scripts/{{ spec.id }}/start">
@@ -55,7 +55,7 @@
   </div>
 </section>
 
-<div id="challenger-panel" hx-get="/scripts/{{ spec.id }}/panel" hx-trigger="every 3s" hx-swap="innerHTML">
+<div id="challenger-panel" hx-get="/scripts/{{ spec.id }}/panel" hx-trigger="every 10s" hx-swap="innerHTML">
   {% include "partials/tennis_challenger_panel.html" %}
 </div>
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,7 @@ from app.tennis_challenger import (
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
     EVENT_ROW_SELECTOR,
+    FlashscoreLivePageMonitor,
     extract_feed_config,
     extract_fixtures_feed,
     fetch_tournament_feed,
@@ -35,6 +38,7 @@ from scripts.Tennis_Challenger_Watcher import (
     parse_tournament_feed,
     pending_alerts,
     prune_expired_finished_matches,
+    should_refresh_betfair_events,
     slack_message,
     slack_webhook_url,
 )
@@ -186,7 +190,7 @@ class TennisChallengerTests(unittest.TestCase):
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
         self.assertTrue(spec.long_running)
         self.assertFalse(spec.auto_start_on_hub_start)
-        self.assertEqual(spec.default_args[:2], ("--poll-seconds", "3"))
+        self.assertEqual(spec.default_args[:2], ("--poll-seconds", "10"))
 
     def test_tournament_links_are_normalized_to_summary_page(self) -> None:
         self.assertEqual(
@@ -313,6 +317,50 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(merged["abc123"]["scheduled_at"], "2026-08-27T09:00:00Z")
         self.assertTrue(merged["abc123"]["is_live"])
         self.assertEqual(merged["abc123"]["server_side"], "away")
+
+    def test_live_page_monitor_cannot_block_feed_scans(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingProbe:
+            def retain(self, _urls) -> None:
+                return None
+
+            def rows(self, _url, _label):
+                started.set()
+                release.wait(2)
+                return []
+
+            def discard(self, _url) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        monitor = FlashscoreLivePageMonitor(
+            probe_factory=BlockingProbe,
+            poll_seconds=60,
+            max_age_seconds=15,
+        )
+        try:
+            monitor.set_targets({AUGSBURG_URL: "Augsburg (Singles)"})
+            self.assertTrue(started.wait(1))
+            before = time.monotonic()
+            rows, error, age = monitor.snapshot(AUGSBURG_URL)
+            self.assertLess(time.monotonic() - before, 0.1)
+            self.assertEqual(rows, [])
+            self.assertEqual(error, "")
+            self.assertIsNone(age)
+        finally:
+            release.set()
+            self.assertTrue(monitor.close(1))
+
+    def test_unmatched_betfair_events_retry_once_per_minute(self) -> None:
+        self.assertTrue(should_refresh_betfair_events(0, True, now=100))
+        self.assertFalse(should_refresh_betfair_events(100, True, now=159.9))
+        self.assertTrue(should_refresh_betfair_events(100, True, now=160))
+        self.assertFalse(should_refresh_betfair_events(100, False, now=399.9))
+        self.assertTrue(should_refresh_betfair_events(100, False, now=400))
 
     def test_slack_alert_includes_the_betfair_event_id(self) -> None:
         match = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")

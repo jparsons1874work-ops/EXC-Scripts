@@ -56,12 +56,15 @@ ALERT_FLAG_BY_TYPE = {
     "set_2_complete": "set_2_complete",
     "match_complete": "match_complete",
 }
-DEFAULT_POLL_SECONDS = 3.0
+DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_RELOAD_MINUTES = 15.0
 MAX_ALERT_HISTORY = 500
 BETFAIR_REFRESH_SECONDS = 5 * 60
+BETFAIR_UNMATCHED_REFRESH_SECONDS = 60
 FIXTURES_REFRESH_SECONDS = 60
 FINISHED_RETENTION_SECONDS = 60 * 60
+LIVE_PAGE_POLL_SECONDS = 10
+LIVE_PAGE_MAX_AGE_SECONDS = 15
 EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -618,6 +621,91 @@ class FlashscoreLivePageProbe:
                 self._manager.stop()
 
 
+class FlashscoreLivePageMonitor:
+    """Run the optional browser overlay away from the feed-scanning thread."""
+
+    def __init__(
+        self,
+        probe_factory: Any = FlashscoreLivePageProbe,
+        poll_seconds: float = LIVE_PAGE_POLL_SECONDS,
+        max_age_seconds: float = LIVE_PAGE_MAX_AGE_SECONDS,
+    ) -> None:
+        self._probe_factory = probe_factory
+        self._poll_seconds = poll_seconds
+        self._max_age_seconds = max_age_seconds
+        self._lock = threading.Lock()
+        self._targets: dict[str, str] = {}
+        self._rows: dict[str, list[dict[str, Any]]] = {}
+        self._updated_at: dict[str, float] = {}
+        self._errors: dict[str, str] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="challenger-live-page-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def set_targets(self, targets: dict[str, str]) -> None:
+        with self._lock:
+            self._targets = dict(targets)
+            for old_url in set(self._rows) - set(targets):
+                self._rows.pop(old_url, None)
+                self._updated_at.pop(old_url, None)
+                self._errors.pop(old_url, None)
+
+    def snapshot(self, url: str) -> tuple[list[dict[str, Any]], str, float | None]:
+        with self._lock:
+            updated_at = self._updated_at.get(url)
+            age = time.monotonic() - updated_at if updated_at is not None else None
+            rows = list(self._rows.get(url, [])) if age is not None and age <= self._max_age_seconds else []
+            return rows, self._errors.get(url, ""), age
+
+    def _run(self) -> None:
+        probe: FlashscoreLivePageProbe | None = None
+        try:
+            probe = self._probe_factory()
+            log("Live-page browser launched in independent monitor")
+            while not self._stop.is_set():
+                with self._lock:
+                    targets = dict(self._targets)
+                probe.retain(set(targets))
+                for url, label in targets.items():
+                    if self._stop.is_set():
+                        break
+                    try:
+                        rows = probe.rows(url, label)
+                    except Exception as exc:
+                        error_text = str(exc)
+                        with self._lock:
+                            prior_error = self._errors.get(url, "")
+                            self._errors[url] = error_text
+                        if error_text != prior_error:
+                            log(f"{label}: live-page overlay failed; feed monitoring continues: {error_text}")
+                        probe.discard(url)
+                        continue
+                    with self._lock:
+                        recovered = bool(self._errors.pop(url, ""))
+                        self._rows[url] = rows
+                        self._updated_at[url] = time.monotonic()
+                    if recovered:
+                        log(f"{label}: live-page overlay recovered")
+                self._stop.wait(self._poll_seconds)
+        except Exception as exc:
+            log(f"Live-page overlay unavailable; feed monitoring continues: {exc}")
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception as exc:
+                    log(f"Live-page browser cleanup failed: {exc}")
+
+    def close(self, timeout: float = 5.0) -> bool:
+        self._stop.set()
+        self._thread.join(timeout=max(0.0, timeout))
+        return not self._thread.is_alive()
+
+
 def overlay_live_rows(
     base_rows: dict[str, dict[str, Any]],
     live_rows: list[dict[str, Any]],
@@ -628,6 +716,18 @@ def overlay_live_rows(
         if match_id in merged:
             merged[match_id] = {**merged[match_id], **live_row}
     return merged
+
+
+def should_refresh_betfair_events(
+    loaded_at: float,
+    unmatched_scheduled: bool,
+    now: float | None = None,
+) -> bool:
+    if loaded_at <= 0:
+        return True
+    age = (time.monotonic() if now is None else now) - loaded_at
+    interval = BETFAIR_UNMATCHED_REFRESH_SECONDS if unmatched_scheduled else BETFAIR_REFRESH_SECONDS
+    return age >= interval
 
 
 def timestamp_is_at_least_seconds_old(
@@ -932,17 +1032,16 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     betfair_client: Any = None
     session = requests.Session()
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
-    live_probe: FlashscoreLivePageProbe | None = None
-    live_probe_errors: dict[str, str] = {}
-    live_probe_retry_at: dict[str, float] = {}
+    live_monitor = FlashscoreLivePageMonitor()
+    live_monitor.set_targets(
+        {url: tournament_label_from_url(url) for url in links}
+    )
 
     log(f"Starting direct Flashscore feed watcher for {len(links)} configured tournament(s)")
-    log("Reading the tournament feed with a live-page overlay for toss and start transitions")
-    try:
-        live_probe = FlashscoreLivePageProbe()
-        log("Live-page browser launched")
-    except Exception as exc:
-        log(f"Live-page overlay unavailable; feed monitoring will continue: {exc}")
+    log(
+        f"Reading the tournament feed every {poll_seconds:g} seconds "
+        "with an independent live-page overlay"
+    )
     write_runtime_state(
         matches,
         alerts,
@@ -981,10 +1080,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 item.get("status") == "scheduled" and not item.get("betfair_event_id")
                 for item in matches.values()
             )
-            should_refresh_betfair = (
-                betfair_loaded_at == 0.0
-                or unmatched_scheduled
-                or time.monotonic() - betfair_loaded_at >= BETFAIR_REFRESH_SECONDS
+            should_refresh_betfair = should_refresh_betfair_events(
+                betfair_loaded_at,
+                unmatched_scheduled,
             )
             if should_refresh_betfair:
                 try:
@@ -1010,10 +1108,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 feed_configs.pop(old_url, None)
                 fixture_rows.pop(old_url, None)
                 fixtures_loaded_at.pop(old_url, None)
-                live_probe_errors.pop(old_url, None)
-                live_probe_retry_at.pop(old_url, None)
-            if live_probe is not None:
-                live_probe.retain(set(links))
+            live_monitor.set_targets(
+                {url: tournament_label_from_url(url) for url in links}
+            )
 
             for url in links:
                 tournament = tournament_label_from_url(url)
@@ -1066,21 +1163,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         if item.get("id")
                     }
                 )
-                if live_probe is not None and time.monotonic() >= live_probe_retry_at.get(url, 0.0):
-                    try:
-                        live_rows = live_probe.rows(url, tournament)
-                        combined_matches = overlay_live_rows(combined_matches, live_rows)
-                        live_probe_retry_at.pop(url, None)
-                        if url in live_probe_errors:
-                            log(f"{tournament}: live-page overlay recovered")
-                            live_probe_errors.pop(url, None)
-                    except Exception as exc:
-                        error_text = str(exc)
-                        if live_probe_errors.get(url) != error_text:
-                            log(f"{tournament}: live-page overlay failed; using feed data: {error_text}")
-                        live_probe_errors[url] = error_text
-                        live_probe_retry_at[url] = time.monotonic() + 60
-                        live_probe.discard(url)
+                live_rows, _live_error, _live_age = live_monitor.snapshot(url)
+                if live_rows:
+                    combined_matches = overlay_live_rows(combined_matches, live_rows)
                 raw_matches = list(combined_matches.values())
 
                 now = utc_timestamp()
@@ -1211,11 +1296,8 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             STOP_EVENT.wait(max(0.5, poll_seconds - (time.monotonic() - sweep_started)))
     finally:
         session.close()
-        if live_probe is not None:
-            try:
-                live_probe.close()
-            except Exception as exc:
-                log(f"Live-page browser cleanup failed: {exc}")
+        if not live_monitor.close():
+            log("Live-page browser is still stopping; watcher shutdown will clean up its process group")
         if betfair_client is not None:
             try:
                 betfair_client.logout()
