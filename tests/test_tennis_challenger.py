@@ -318,6 +318,20 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertTrue(merged["abc123"]["is_live"])
         self.assertEqual(merged["abc123"]["server_side"], "away")
 
+    def test_live_page_overlay_adds_match_missing_from_stale_feed(self) -> None:
+        live = raw_match(
+            id="new-live-match",
+            raw_status="Set 1",
+            row_classes="event__match event__match--live",
+            is_live=True,
+            is_scheduled=False,
+        )
+
+        merged = overlay_live_rows({}, [live])
+
+        self.assertIn("new-live-match", merged)
+        self.assertTrue(merged["new-live-match"]["is_live"])
+
     def test_live_page_monitor_cannot_block_feed_scans(self) -> None:
         started = threading.Event()
         release = threading.Event()
