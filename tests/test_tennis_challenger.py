@@ -38,6 +38,7 @@ from scripts.Tennis_Challenger_Watcher import (
     parse_tournament_feed,
     pending_alerts,
     prune_expired_finished_matches,
+    should_scan_match_detail,
     should_refresh_betfair_events,
     slack_message,
     slack_webhook_url,
@@ -331,6 +332,22 @@ class TennisChallengerTests(unittest.TestCase):
 
         self.assertIn("new-live-match", merged)
         self.assertTrue(merged["new-live-match"]["is_live"])
+
+    def test_detail_pages_cover_live_and_imminent_matches(self) -> None:
+        now = datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc)
+        self.assertTrue(should_scan_match_detail(raw_match(is_live=True, is_scheduled=False), now))
+        self.assertTrue(
+            should_scan_match_detail(
+                raw_match(scheduled_at="2026-08-27T18:30:00Z"),
+                now,
+            )
+        )
+        self.assertFalse(
+            should_scan_match_detail(
+                raw_match(scheduled_at="2026-08-27T21:30:00Z"),
+                now,
+            )
+        )
 
     def test_live_page_monitor_cannot_block_feed_scans(self) -> None:
         started = threading.Event()

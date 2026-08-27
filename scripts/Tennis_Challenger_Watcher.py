@@ -68,6 +68,9 @@ LIVE_PAGE_POLL_SECONDS = 10
 LIVE_PAGE_MAX_AGE_SECONDS = 30
 LIVE_PAGE_SCAN_TIMEOUT_SECONDS = 30
 LIVE_PAGE_CONCURRENCY = 4
+DETAIL_PAGE_CONCURRENCY = 6
+DETAIL_PREMATCH_WINDOW_SECONDS = 2 * 60 * 60
+DETAIL_PAST_WINDOW_SECONDS = 8 * 60 * 60
 EVENT_ROW_SELECTOR = ".event__match[id]"
 UK_TIMEZONE = ZoneInfo("Europe/London")
 FLASHSCORE_USER_AGENT = (
@@ -115,6 +118,55 @@ rows => rows.map(row => {
     is_scheduled: classes.includes('event__match--scheduled')
   };
 }).filter(item => item.id && item.url && item.player1 && item.player2)
+"""
+
+
+DETAIL_EXTRACTOR = r"""
+base => {
+  const text = selector => {
+    const node = document.querySelector(selector);
+    return node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  };
+  const value = (side, suffix) => text(`.smh__${side}.smh__part--${suffix}`);
+  const rawStatus = text('.detailScore__status')
+    || text('.fixedHeaderDuel__detailStatus')
+    || String(base.raw_status || '');
+  const statusText = rawStatus.toLowerCase();
+  const currentSetMatch = rawStatus.match(/\bset\s*([1-5])/i);
+  const statusLabel = currentSetMatch ? `Set ${currentSetMatch[1]}` : rawStatus;
+  const table = document.querySelector('.smh__template.tennis, .smh__template[class*="tennis"]');
+  const isFinished = /\b(finished|final|retired|walkover|abandoned|cancelled|canceled|awarded)\b/.test(statusText);
+  const isLive = !isFinished && Boolean(
+    table && (document.querySelector('.smh__live') || /\b(set\s*\d+|live|tiebreak)\b/.test(statusText))
+  );
+  const homeServe = document.querySelector(
+    '.smh__service.smh__home [title*="Serving"], .duelParticipant__home [title*="Serving"]'
+  );
+  const awayServe = document.querySelector(
+    '.smh__service.smh__away [title*="Serving"], .duelParticipant__away [title*="Serving"]'
+  );
+  return {
+    ...base,
+    raw_status: isFinished ? rawStatus || 'Finished' : isLive ? statusLabel || 'Set 1' : String(base.raw_status || rawStatus),
+    row_classes: `event__match event__match--${isFinished ? 'finished' : isLive ? 'live' : 'scheduled'}`,
+    set_score: table ? {
+      home: value('home', 'current'),
+      away: value('away', 'current')
+    } : (base.set_score || {home: '', away: ''}),
+    set_parts: table ? [1, 2, 3, 4, 5].map(index => ({
+      home: value('home', index),
+      away: value('away', index)
+    })) : (base.set_parts || []),
+    current_points: table ? {
+      home: value('home', 'game'),
+      away: value('away', 'game')
+    } : (base.current_points || {home: '', away: ''}),
+    server_side: homeServe ? 'home' : awayServe ? 'away' : '',
+    is_live: isLive,
+    is_scheduled: !isFinished && !isLive,
+    _detail_source: true
+  };
+}
 """
 
 
@@ -204,6 +256,48 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
         "server": server,
         "server_side": server_side,
     }
+
+
+def should_scan_match_detail(
+    row: dict[str, Any],
+    now: datetime | None = None,
+) -> bool:
+    if bool(row.get("is_live")) or "event__match--live" in str(row.get("row_classes", "")):
+        return True
+    if not (bool(row.get("is_scheduled")) or "event__match--scheduled" in str(row.get("row_classes", ""))):
+        return False
+
+    reference = (now or datetime.now(timezone.utc)).astimezone(UK_TIMEZONE)
+    scheduled: datetime | None = None
+    scheduled_at = str(row.get("scheduled_at", "") or "").strip()
+    if scheduled_at:
+        try:
+            scheduled = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            if scheduled.tzinfo is None:
+                scheduled = scheduled.replace(tzinfo=timezone.utc)
+            scheduled = scheduled.astimezone(UK_TIMEZONE)
+        except ValueError:
+            scheduled = None
+
+    raw_status = str(row.get("raw_status", "") or "")
+    dated = re.search(r"\b(\d{1,2})\.(\d{1,2})\.\s+(\d{1,2}):(\d{2})\b", raw_status)
+    timed = re.search(r"\b(\d{1,2}):(\d{2})\b", raw_status)
+    if scheduled is None and dated:
+        day, month, hour, minute = map(int, dated.groups())
+        try:
+            scheduled = datetime(reference.year, month, day, hour, minute, tzinfo=UK_TIMEZONE)
+            if scheduled < reference and reference.month == 12 and month == 1:
+                scheduled = scheduled.replace(year=reference.year + 1)
+        except ValueError:
+            scheduled = None
+    elif scheduled is None and timed:
+        hour, minute = map(int, timed.groups())
+        scheduled = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if scheduled is None:
+        return False
+    seconds_until_start = (scheduled - reference).total_seconds()
+    return -DETAIL_PAST_WINDOW_SECONDS <= seconds_until_start <= DETAIL_PREMATCH_WINDOW_SECONDS
 
 
 def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
@@ -715,6 +809,38 @@ class FlashscoreLivePageMonitor:
                 except Exception as exc:
                     log(f"Live-page browser cleanup failed: {exc}")
 
+    async def _scan_detail_row(
+        self,
+        context: Any,
+        row: dict[str, Any],
+        label: str,
+    ) -> dict[str, Any]:
+        async with self._detail_semaphore:
+            page = await context.new_page()
+            try:
+                try:
+                    await page.goto(str(row.get("url", "")), wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                await page.wait_for_selector(
+                    ".smh__template.tennis, .duelParticipant",
+                    state="attached",
+                    timeout=10000,
+                )
+                # The detail-page live connection updates just after the main
+                # participant block arrives. Give it a short moment to apply
+                # the score and pre-match serving marker.
+                await asyncio.sleep(2)
+                result = await page.evaluate(DETAIL_EXTRACTOR, row)
+                if not isinstance(result, dict) or not result.get("id"):
+                    raise RuntimeError(f"{label} detail page returned no match data")
+                return result
+            finally:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3)
+                except Exception:
+                    pass
+
     async def _scan_target(self, context: Any, url: str, label: str) -> list[dict[str, Any]]:
         page = await context.new_page()
         try:
@@ -730,7 +856,18 @@ class FlashscoreLivePageMonitor:
             clean_rows = [row for row in rows or [] if isinstance(row, dict)]
             if not clean_rows:
                 raise RuntimeError(f"{label} live page returned no match rows")
-            return clean_rows
+            detail_candidates = [row for row in clean_rows if should_scan_match_detail(row)]
+            if not detail_candidates:
+                return clean_rows
+            detail_results = await asyncio.gather(
+                *(self._scan_detail_row(context, row, label) for row in detail_candidates),
+                return_exceptions=True,
+            )
+            detail_rows = [item for item in detail_results if isinstance(item, dict)]
+            return list(overlay_live_rows(
+                {str(row.get("id", "")): row for row in clean_rows if row.get("id")},
+                detail_rows,
+            ).values())
         finally:
             try:
                 await asyncio.wait_for(page.close(), timeout=3)
@@ -748,6 +885,7 @@ class FlashscoreLivePageMonitor:
                 headless=True,
                 args=["--disable-dev-shm-usage", "--no-sandbox"],
             )
+            self._detail_semaphore = asyncio.Semaphore(max(1, DETAIL_PAGE_CONCURRENCY))
             log("Fresh-page serve overlay launched in independent monitor")
             try:
                 while not self._stop.is_set():
@@ -764,6 +902,7 @@ class FlashscoreLivePageMonitor:
                     context = await browser.new_context(
                         viewport={"width": 1280, "height": 900},
                         user_agent=FLASHSCORE_USER_AGENT,
+                        timezone_id="Europe/London",
                     )
 
                     async def scan(url: str, label: str) -> None:
@@ -1257,6 +1396,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             links = configured_links()
             source_errors: dict[str, str] = {}
             fresh_overlay_urls: set[str] = set()
+            fresh_detail_matches: set[str] = set()
             authoritative_match_ids: dict[str, set[str]] = {}
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
@@ -1370,13 +1510,21 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 for raw in raw_matches:
                     scraped = normalize_scraped_match(raw, url, tournament)
                     match_id = scraped["id"]
+                    if raw.get("_detail_source"):
+                        fresh_detail_matches.add(match_id)
                     previous = matches.get(match_id) or prior_matches.get(match_id)
                     next_match = {
                         **(previous or {}),
                         **scraped,
                         "first_seen_at": (previous or {}).get("first_seen_at", now),
                         "last_checked_at": now,
-                        "score_source": "live_browser" if live_rows else "direct_feed",
+                        "score_source": (
+                            "match_detail"
+                            if raw.get("_detail_source")
+                            else "tournament_browser"
+                            if live_rows
+                            else "direct_feed"
+                        ),
                         "score_age_seconds": round(live_age or 0.0, 1) if live_rows else None,
                         "last_error": "",
                     }
@@ -1483,7 +1631,10 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                 f"{tournament_label_from_url(url)}: {error}"
                 for url, error in source_errors.items()
             )
-            overlay_status = f"serve overlay {len(fresh_overlay_urls)}/{len(links)} fresh"
+            overlay_status = (
+                f"live browser {len(fresh_overlay_urls)}/{len(links)} fresh · "
+                f"{len(fresh_detail_matches)} direct match page(s)"
+            )
             phase = (
                 f"Watching {len(links)} tournament feed(s) · {overlay_status}"
                 if not error_message
