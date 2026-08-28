@@ -155,12 +155,10 @@ base => {
     if (away >= 10 && away - home >= 2) return 'away';
     return '';
   };
-  const setWinners = setParts.map(completedSetWinner);
-  const scoreShowsFinished = setWinners.filter(side => side === 'home').length >= 2
-    || setWinners.filter(side => side === 'away').length >= 2;
-  const isFinished = /\b(finished|final|retired|walkover|abandoned|cancelled|canceled|awarded)\b/.test(statusText)
-    || scoreShowsFinished;
-  const isLive = !isFinished && Boolean(
+  const isPaused = /\b(suspended|interrupted|delayed)\b/.test(statusText);
+  const isFinished = !isPaused
+    && /\b(finished|final|retired|walkover|abandoned|cancelled|canceled|awarded)\b/.test(statusText);
+  const isLive = !isPaused && !isFinished && Boolean(
     table && (document.querySelector('.smh__live') || /\b(set\s*\d+|live|tiebreak)\b/.test(statusText))
   );
   const homeServe = document.querySelector(
@@ -171,8 +169,8 @@ base => {
   );
   return {
     ...base,
-    raw_status: isFinished ? rawStatus || 'Finished' : isLive ? statusLabel || 'Set 1' : String(base.raw_status || rawStatus),
-    row_classes: `event__match event__match--${isFinished ? 'finished' : isLive ? 'live' : 'scheduled'}`,
+    raw_status: isPaused ? rawStatus : isFinished ? rawStatus || 'Finished' : isLive ? statusLabel || 'Set 1' : String(base.raw_status || rawStatus),
+    row_classes: `event__match event__match--${isPaused ? 'suspended' : isFinished ? 'finished' : isLive ? 'live' : 'scheduled'}`,
     set_score: table ? {
       home: value('home', 'current'),
       away: value('away', 'current')
@@ -205,12 +203,12 @@ def clean_score_value(value: Any) -> str | int:
 
 def normalize_status(raw_status: str, row_classes: str = "", is_live: bool = False, is_scheduled: bool = False) -> str:
     text = " ".join(str(raw_status or "").casefold().split())
+    if re.search(r"\b(suspended|interrupted|delayed)\b", text):
+        return "suspended"
     if re.search(r"\b(retired|walkover|abandoned|cancelled|canceled|awarded)\b", text):
         return re.search(r"\b(retired|walkover|abandoned|cancelled|canceled|awarded)\b", text).group(1)  # type: ignore[union-attr]
     if re.search(r"\b(finished|final|ended)\b", text):
         return "finished"
-    if re.search(r"\b(suspended|interrupted|delayed)\b", text):
-        return "suspended"
     if is_live or "event__match--live" in row_classes or re.search(r"\b(set\s*\d+|live|tiebreak)\b", text):
         return "live"
     if is_scheduled or "event__match--scheduled" in row_classes or re.search(r"\b\d{1,2}:\d{2}\b", text):
@@ -256,7 +254,10 @@ def status_from_raw_match(raw: dict[str, Any]) -> str:
         bool(raw.get("is_live")),
         bool(raw.get("is_scheduled")),
     )
-    if status not in COMPLETED_STATUSES and score_shows_match_complete(raw.get("set_parts")):
+    # Flashscore can briefly show a score that resembles a completed match
+    # while its authoritative status is Interrupted/Suspended. A pause must
+    # always win over score inference or we will send a false completion alert.
+    if status in {"live", "unknown"} and score_shows_match_complete(raw.get("set_parts")):
         return "finished"
     return status
 
@@ -271,6 +272,12 @@ def current_set_number(raw_status: str, status: str) -> int | None:
 
 
 def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: str) -> dict[str, Any]:
+    observed_status = normalize_status(
+        str(raw.get("raw_status", "")),
+        str(raw.get("row_classes", "")),
+        bool(raw.get("is_live")),
+        bool(raw.get("is_scheduled")),
+    )
     status = status_from_raw_match(raw)
     current_set = current_set_number(str(raw.get("raw_status", "")), status)
     sets: list[dict[str, Any]] = []
@@ -296,6 +303,7 @@ def normalize_scraped_match(raw: dict[str, Any], source_url: str, tournament: st
         "player1": player1,
         "player2": player2,
         "status": "finished" if status in COMPLETED_STATUSES else status,
+        "completion_confirmed": observed_status in COMPLETED_STATUSES,
         "finish_reason": status if status in COMPLETED_STATUSES and status != "finished" else "",
         "display_status": str(raw.get("raw_status", "") or status.title()),
         "start_time": str(raw.get("raw_status", "") or "") if status == "scheduled" else "",
@@ -361,8 +369,17 @@ def should_scan_match_detail(
 
 def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
     status = str(match.get("status", ""))
+    provisional_finish = status == "finished" and not match.get("completion_confirmed")
+    if status == "suspended" or provisional_finish:
+        return {
+            "serve_detected": False,
+            "match_started": False,
+            "set_1_complete": False,
+            "set_2_complete": False,
+            "match_complete": False,
+        }
     current_set = int(match.get("current_set_number") or 0)
-    completed = status == "finished"
+    completed = status == "finished" and bool(match.get("completion_confirmed"))
     set_count = len(match.get("sets", []) or [])
     return {
         "serve_detected": bool(status == "scheduled" and match.get("server")),
@@ -374,8 +391,11 @@ def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
 
 
 def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> list[str]:
+    if match.get("status") == "suspended":
+        return []
     sent = dict((previous or {}).get("alerts_sent", {}) or {})
     satisfied = satisfied_alerts(match)
+    previously_satisfied = satisfied_alerts(previous or {})
     if previous is None:
         if match.get("status") == "finished":
             return []
@@ -384,16 +404,38 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
         if match.get("status") == "live":
             return ["match_started"]
         return []
-    if satisfied["match_complete"] and not sent.get(ALERT_FLAG_BY_TYPE["match_complete"]):
-        return ["match_complete"]
+    if satisfied["match_complete"]:
+        if (
+            previously_satisfied["match_complete"]
+            and not sent.get(ALERT_FLAG_BY_TYPE["match_complete"])
+        ):
+            return ["match_complete"]
+        return []
     order = ["serve_detected", "match_started", "set_1_complete", "set_2_complete", "match_complete"]
     alerts: list[str] = []
     for alert_type in order:
         if alert_type == "serve_detected" and match.get("status") != "scheduled":
             continue
+        if alert_type in {"set_1_complete", "set_2_complete"} and not previously_satisfied[alert_type]:
+            continue
         if satisfied[alert_type] and not sent.get(ALERT_FLAG_BY_TYPE[alert_type]):
             alerts.append(alert_type)
     return alerts
+
+
+def carry_alert_flags(
+    previous: dict[str, Any] | None,
+    match: dict[str, Any],
+) -> dict[str, bool]:
+    if previous is None:
+        return hydrate_initial_alert_flags(match)
+    flags = dict(previous.get("alerts_sent", {}) or {})
+    # A genuinely completed match cannot return to live or suspended. If it
+    # does, the completion flag came from a provisional/incorrect observation;
+    # clear it so the eventual real finish can still alert.
+    if match.get("status") in {"live", "suspended"} or not match.get("completion_confirmed"):
+        flags[ALERT_FLAG_BY_TYPE["match_complete"]] = False
+    return flags
 
 
 def hydrate_initial_alert_flags(match: dict[str, Any]) -> dict[str, bool]:
@@ -1527,10 +1569,7 @@ def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
                             "last_checked_at": now,
                             "last_error": "",
                         }
-                        if previous is None:
-                            next_match["alerts_sent"] = hydrate_initial_alert_flags(next_match)
-                        else:
-                            next_match["alerts_sent"] = dict(previous.get("alerts_sent", {}) or {})
+                        next_match["alerts_sent"] = carry_alert_flags(previous, next_match)
 
                         for alert_type in pending_alerts(previous, next_match):
                             try:
@@ -1878,10 +1917,7 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                                     "betfair_match_message": betfair_reason,
                                 }
                             )
-                    if previous is None:
-                        next_match["alerts_sent"] = hydrate_initial_alert_flags(next_match)
-                    else:
-                        next_match["alerts_sent"] = dict(previous.get("alerts_sent", {}) or {})
+                    next_match["alerts_sent"] = carry_alert_flags(previous, next_match)
 
                     for alert_type in pending_alerts(previous, next_match):
                         try:

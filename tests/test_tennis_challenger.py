@@ -28,6 +28,7 @@ from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
     EVENT_ROW_SELECTOR,
     FlashscoreLivePageMonitor,
+    carry_alert_flags,
     extract_feed_config,
     extract_fixtures_feed,
     fetch_tournament_feed,
@@ -43,6 +44,7 @@ from scripts.Tennis_Challenger_Watcher import (
     should_refresh_betfair_events,
     slack_message,
     slack_webhook_url,
+    status_from_raw_match,
 )
 
 
@@ -503,8 +505,11 @@ class TennisChallengerTests(unittest.TestCase):
         )
         live_set_2["alerts_sent"] = dict(live_set_1["alerts_sent"])
         alerts = pending_alerts(live_set_1, live_set_2)
+        self.assertEqual(alerts, [])
+        confirmed_set_2 = {**live_set_2, "alerts_sent": dict(live_set_2["alerts_sent"])}
+        alerts = pending_alerts(live_set_2, confirmed_set_2)
         self.assertEqual(alerts, ["set_1_complete"])
-        apply_sent(live_set_2, alerts)
+        apply_sent(confirmed_set_2, alerts)
 
         live_set_3 = normalize_scraped_match(
             raw_match(
@@ -518,10 +523,13 @@ class TennisChallengerTests(unittest.TestCase):
             AUGSBURG_URL,
             "Augsburg (Singles)",
         )
-        live_set_3["alerts_sent"] = dict(live_set_2["alerts_sent"])
-        alerts = pending_alerts(live_set_2, live_set_3)
+        live_set_3["alerts_sent"] = dict(confirmed_set_2["alerts_sent"])
+        alerts = pending_alerts(confirmed_set_2, live_set_3)
+        self.assertEqual(alerts, [])
+        confirmed_set_3 = {**live_set_3, "alerts_sent": dict(live_set_3["alerts_sent"])}
+        alerts = pending_alerts(live_set_3, confirmed_set_3)
         self.assertEqual(alerts, ["set_2_complete"])
-        apply_sent(live_set_3, alerts)
+        apply_sent(confirmed_set_3, alerts)
 
         finished = normalize_scraped_match(
             raw_match(
@@ -535,8 +543,10 @@ class TennisChallengerTests(unittest.TestCase):
             AUGSBURG_URL,
             "Augsburg (Singles)",
         )
-        finished["alerts_sent"] = dict(live_set_3["alerts_sent"])
-        self.assertEqual(pending_alerts(live_set_3, finished), ["match_complete"])
+        finished["alerts_sent"] = dict(confirmed_set_3["alerts_sent"])
+        self.assertEqual(pending_alerts(confirmed_set_3, finished), [])
+        confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
+        self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
     def test_straight_sets_finish_sends_only_match_complete(self) -> None:
         previous = normalize_scraped_match(
@@ -564,7 +574,9 @@ class TennisChallengerTests(unittest.TestCase):
             "Augsburg (Singles)",
         )
         finished["alerts_sent"] = dict(previous["alerts_sent"])
-        self.assertEqual(pending_alerts(previous, finished), ["match_complete"])
+        self.assertEqual(pending_alerts(previous, finished), [])
+        confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
+        self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
     def test_final_score_overrides_a_stale_live_status(self) -> None:
         finished = normalize_scraped_match(
@@ -581,6 +593,148 @@ class TennisChallengerTests(unittest.TestCase):
         )
 
         self.assertEqual(finished["status"], "finished")
+
+    def test_interrupted_status_overrides_a_score_that_looks_finished(self) -> None:
+        interrupted_raw = raw_match(
+            raw_status="Interrupted",
+            row_classes="event__match event__match--live",
+            is_live=True,
+            is_scheduled=False,
+            set_score={"home": "2", "away": "0"},
+            set_parts=[{"home": "6", "away": "4"}, {"home": "6", "away": "3"}],
+        )
+
+        self.assertEqual(status_from_raw_match(interrupted_raw), "suspended")
+        self.assertEqual(
+            status_from_raw_match({**interrupted_raw, "raw_status": "Finished - Interrupted"}),
+            "suspended",
+        )
+        interrupted = normalize_scraped_match(
+            interrupted_raw,
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        self.assertEqual(interrupted["status"], "suspended")
+
+    def test_interrupted_match_never_triggers_set_or_match_complete_alerts(self) -> None:
+        previous = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 2",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "5", "away": "5"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        previous["alerts_sent"] = {
+            "serve_detected": True,
+            "match_started": True,
+            "set_1_complete": True,
+            "set_2_complete": False,
+            "match_complete": False,
+        }
+        provisional_finished = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 3",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "2", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "6", "away": "3"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        provisional_finished["alerts_sent"] = carry_alert_flags(previous, provisional_finished)
+        self.assertEqual(provisional_finished["status"], "finished")
+        self.assertFalse(provisional_finished["completion_confirmed"])
+        self.assertEqual(pending_alerts(previous, provisional_finished), [])
+        repeated_provisional = {
+            **provisional_finished,
+            "alerts_sent": dict(provisional_finished["alerts_sent"]),
+        }
+        self.assertEqual(pending_alerts(provisional_finished, repeated_provisional), [])
+
+        interrupted = normalize_scraped_match(
+            raw_match(
+                raw_status="Interrupted Set 3",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "1"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "4", "away": "6"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        interrupted["alerts_sent"] = carry_alert_flags(provisional_finished, interrupted)
+
+        self.assertEqual(interrupted["status"], "suspended")
+        self.assertEqual(pending_alerts(provisional_finished, interrupted), [])
+
+    def test_resumed_match_clears_false_completion_and_alerts_on_real_finish(self) -> None:
+        interrupted = normalize_scraped_match(
+            raw_match(
+                raw_status="Interrupted",
+                row_classes="event__match event__match--suspended",
+                is_live=False,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "1"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "4", "away": "6"}],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        interrupted["alerts_sent"] = {
+            "serve_detected": True,
+            "match_started": True,
+            "set_1_complete": True,
+            "set_2_complete": True,
+            "match_complete": True,
+        }
+        resumed = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 3",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "1"},
+                set_parts=[
+                    {"home": "6", "away": "4"},
+                    {"home": "4", "away": "6"},
+                    {"home": "3", "away": "2"},
+                ],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        resumed["alerts_sent"] = carry_alert_flags(interrupted, resumed)
+        self.assertFalse(resumed["alerts_sent"]["match_complete"])
+
+        finished = normalize_scraped_match(
+            raw_match(
+                raw_status="Finished",
+                row_classes="event__match event__match--finished",
+                is_live=False,
+                is_scheduled=False,
+                set_score={"home": "2", "away": "1"},
+                set_parts=[
+                    {"home": "6", "away": "4"},
+                    {"home": "4", "away": "6"},
+                    {"home": "6", "away": "2"},
+                ],
+            ),
+            AUGSBURG_URL,
+            "Augsburg (Singles)",
+        )
+        finished["alerts_sent"] = carry_alert_flags(resumed, finished)
+
+        self.assertEqual(pending_alerts(resumed, finished), [])
+        confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
+        self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
     def test_doubles_match_tiebreak_waits_for_ten_points(self) -> None:
         common = {
