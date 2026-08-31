@@ -90,6 +90,17 @@ class GolfBetfairCheckTests(unittest.TestCase):
 
         self.assertTrue(result["matching"])
 
+    def test_player_comparison_keeps_full_names_with_same_initial_and_surname(self) -> None:
+        with patch.object(checker, "load_name_aliases", return_value={}):
+            result = checker.compare_player_lists(
+                ["Sergio Garcia", "Sebastian Garcia"],
+                ["Sergio Garcia", "Sebastian Garcia"],
+            )
+
+        self.assertTrue(result["matching"])
+        self.assertEqual(result["official_count"], 2)
+        self.assertEqual(result["betfair_compared_count"], 2)
+
     def test_betfair_count_keeps_ignored_market_options_visible(self) -> None:
         with patch.object(checker, "load_name_aliases", return_value={}):
             result = checker.compare_player_lists(

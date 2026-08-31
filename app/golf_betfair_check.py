@@ -208,14 +208,10 @@ def player_key(value: str, aliases: dict[str, str] | None = None) -> str:
     normalized = _base_normalize_player(value)
     if aliases:
         normalized = aliases.get(normalized, normalized)
-    tokens = normalized.split()
-    if not tokens:
-        return ""
-    if len(tokens) == 1:
-        return tokens[0]
-    surname_prefixes = {"de", "del", "da", "di", "la", "le", "van", "von", "der"}
-    surname = " ".join(tokens[-2:]) if len(tokens) >= 3 and tokens[-2] in surname_prefixes else tokens[-1]
-    return f"{tokens[0][0]} {surname}"
+    # Keep the full normalized name. Reducing names to an initial and surname
+    # incorrectly merged distinct golfers such as Sergio Garcia and Sebastian
+    # Garcia into one comparison entry.
+    return normalized
 
 
 def compare_player_lists(official_names: list[str], betfair_names: list[str]) -> dict[str, Any]:
