@@ -97,10 +97,14 @@ SITE_DEFINITIONS: dict[str, dict[str, Any]] = {
         "link_pattern": r"/players/",
         "link_selector": 'main table a[href*="/players/"]',
         "name_text_mode": "first-line",
+        "excluded_name_pattern": r"\b(?:invitation|invite)s?\b",
         "boundary_pattern": r"cut.?off",
         "min_field_before_boundary_check": 20,
         "required_confirm_streak": 2,
         "allow_auto_giveup": True,
+        # Rebuild the baseline silently when non-player invitation headings
+        # are removed from the entry-list reader.
+        "reader_revision": "dpworld-ignore-invite-headings-v1",
     },
     "lpga": {
         "label": "LPGA",
@@ -342,6 +346,11 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
     membership_ancestor_pattern = site_def.get("membership_ancestor_pattern") or ""
     reserve_ancestor_pattern = site_def.get("reserve_ancestor_pattern") or ""
     allow_name_suffix_digit = bool(site_def.get("allow_name_suffix_digit"))
+    excluded_name_pattern = (
+        re.compile(site_def["excluded_name_pattern"], re.IGNORECASE)
+        if site_def.get("excluded_name_pattern")
+        else None
+    )
     seen: set[str] = set()
     field_names: list[str] = []
     alternate_names: list[str] = []
@@ -503,7 +512,11 @@ def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) ->
             if not item.get("fromRow") and not link_pattern.search(item["href"]):
                 continue
             name = format_name(item["text"])
-            if is_valid_name(name, allow_name_suffix_digit) and name not in seen:
+            if (
+                is_valid_name(name, allow_name_suffix_digit)
+                and not (excluded_name_pattern and excluded_name_pattern.search(name))
+                and name not in seen
+            ):
                 seen.add(name)
                 (alternate_names if past_boundary or item.get("isReserve") else field_names).append(name)
 

@@ -123,6 +123,28 @@ class GolfFieldCheckerTests(unittest.TestCase):
         self.assertEqual(result.proposed_state["confirmed_alternates"], ["Reserve Person"])
         self.assertEqual(result.proposed_state["reader_revision"], site["reader_revision"])
 
+    def test_dp_reader_revision_removes_invitation_headings_silently(self) -> None:
+        site = golf.SITE_DEFINITIONS["dpworld"]
+        url = "https://www.europeantour.com/dpworld-tour/test/entry-list"
+        self.states["dpworld"] = {
+            "confirmed_field": [
+                "Alice Player",
+                "Amateur Tournament Invitations",
+                "Professional Invite",
+            ],
+            "confirmed_alternates": [],
+            "baseline_url": url,
+        }
+
+        result = golf.evaluate_reading(
+            "dpworld", site, url, ["Alice Player"], []
+        )
+
+        self.assertFalse(result.slack_needed)
+        self.assertIn("reader updated", result.status_lines[0])
+        self.assertEqual(result.proposed_state["confirmed_field"], ["Alice Player"])
+        self.assertEqual(result.proposed_state["reader_revision"], site["reader_revision"])
+
     def test_confirmed_changes_are_appended_to_history(self) -> None:
         self.evaluate_and_commit(["Alice Player", "Bob Golfer"], ["Cara Golfer"])
         self.evaluate_and_commit(["Alice Player", "Cara Golfer"])
@@ -213,7 +235,9 @@ class GolfFieldCheckerTests(unittest.TestCase):
         <body>
           <a href="/players/unrelated-1/">Unrelated Ranking Player</a>
           <main><table><tbody>
+            <tr><td><a href="/players/amateur-invitations/">Amateur Tournament Invitations</a></td></tr>
             <tr><td><a href="/players/alice-1/"><strong>PLAYER</strong>, Alice<div>Home Golf Club</div></a></td></tr>
+            <tr><td><a href="/players/professional-invite/">Professional Invite</a></td></tr>
             <tr><td>Current Cut Off Position - subject to change</td></tr>
             <tr><td><a href="/players/reserve-2/"><strong>PERSON</strong>, Reserve<div>Other Club</div></a></td></tr>
           </tbody></table></main>
