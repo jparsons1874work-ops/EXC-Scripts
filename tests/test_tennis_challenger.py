@@ -697,6 +697,21 @@ class TennisChallengerTests(unittest.TestCase):
         repeated_live_set_2 = {**live_set_2, "alerts_sent": dict(live_set_2["alerts_sent"])}
 
         self.assertFalse(set_alerts_enabled(live_set_2))
+        concatenated_itf = {
+            **live_set_2,
+            "tournament": (
+                "TennisITF WOMEN - SINGLESW50 Saint-Palais-sur-Mer, "
+                "clay - 1/16-finalsNew window"
+            ),
+            "source_url": MATCH_URL,
+            "player1": "Sieg M.",
+            "player2": "Wolff V.",
+        }
+        self.assertFalse(set_alerts_enabled(concatenated_itf))
+        self.assertEqual(
+            pending_alerts(concatenated_itf, {**concatenated_itf}),
+            [],
+        )
         self.assertEqual(pending_alerts(live_set_2, repeated_live_set_2), [])
         self.assertTrue(set_alerts_enabled({"tournament": "ATP US Open"}))
         self.assertTrue(set_alerts_enabled({"tournament": "WTA US Open"}))

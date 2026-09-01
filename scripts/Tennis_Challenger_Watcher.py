@@ -132,7 +132,7 @@ DETAIL_EXTRACTOR = r"""
 base => {
   const text = selector => {
     const node = document.querySelector(selector);
-    return node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    return node ? String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim() : '';
   };
   const value = (side, suffix) => text(`.smh__${side}.smh__part--${suffix}`);
   const observedRawStatus = text('.detailScore__status')
@@ -197,7 +197,7 @@ SINGLE_MATCH_BASE_EXTRACTOR = r"""
 input => {
   const text = selector => {
     const node = document.querySelector(selector);
-    return node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    return node ? String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim() : '';
   };
   const participant = side => {
     for (const selector of [
@@ -206,7 +206,7 @@ input => {
       `.duelParticipant__${side} [class*="participantName"]`
     ]) {
       const names = Array.from(document.querySelectorAll(selector))
-        .map(node => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+        .map(node => String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
         .filter(Boolean);
       if (names.length) return Array.from(new Set(names)).join(' / ');
     }
@@ -466,12 +466,8 @@ def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
 
 
 def set_alerts_enabled(match: dict[str, Any]) -> bool:
-    competition = " ".join(
-        [
-            str(match.get("tournament", "") or ""),
-            str(match.get("source_url", "") or ""),
-        ]
-    )
+    competition = str(match.get("tournament", "") or "")
+    source_url = str(match.get("source_url", "") or "")
     participants = " ".join(
         [
             str(match.get("player1", "") or ""),
@@ -479,8 +475,15 @@ def set_alerts_enabled(match: dict[str, Any]) -> bool:
         ]
     )
     is_doubles_pair = "/" in participants or bool(re.search(r"\s(?:&|\+)\s", participants))
-    excluded_competition = bool(
-        re.search(r"\b(?:itf|doubles?)\b", competition, re.IGNORECASE)
+    # Flashscore's detail-page heading can concatenate nested nodes into values
+    # such as "TennisITF WOMEN - SINGLESW50...". Compare a compact key so the
+    # ITF/doubles policy does not depend on spaces or punctuation in that DOM.
+    competition_key = re.sub(r"[^a-z0-9]+", "", competition.casefold())
+    source_path = urlparse(source_url).path.casefold()
+    excluded_competition = (
+        "itf" in competition_key
+        or "doubles" in competition_key
+        or bool(re.search(r"/tennis/itf-[^/]+/|/tennis/[^/]*doubles[^/]*/", source_path))
     )
     return not excluded_competition and not is_doubles_pair
 
