@@ -472,7 +472,17 @@ def set_alerts_enabled(match: dict[str, Any]) -> bool:
             str(match.get("source_url", "") or ""),
         ]
     )
-    return re.search(r"\bitf\b", competition, re.IGNORECASE) is None
+    participants = " ".join(
+        [
+            str(match.get("player1", "") or ""),
+            str(match.get("player2", "") or ""),
+        ]
+    )
+    is_doubles_pair = "/" in participants or bool(re.search(r"\s(?:&|\+)\s", participants))
+    excluded_competition = bool(
+        re.search(r"\b(?:itf|doubles?)\b", competition, re.IGNORECASE)
+    )
+    return not excluded_competition and not is_doubles_pair
 
 
 def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> list[str]:

@@ -711,6 +711,48 @@ class TennisChallengerTests(unittest.TestCase):
         confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
         self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
+    def test_all_doubles_matches_skip_set_alerts(self) -> None:
+        challenger_doubles = {
+            "status": "live",
+            "current_set_number": 2,
+            "sets": [{"home": 6, "away": 4}, {"home": 0, "away": 0}],
+            "alerts_sent": {"match_started": True},
+            "tournament": "Kingston 2 (Challenger Doubles)",
+            "source_url": "https://www.flashscore.com/tennis/challenger-men-doubles/kingston-2/",
+        }
+        direct_doubles = {
+            **challenger_doubles,
+            "tournament": "ATP - DOUBLES: US Open",
+            "source_url": MATCH_URL,
+        }
+        direct_pair_without_competition_label = {
+            **challenger_doubles,
+            "tournament": "Single match r7R6cLgK",
+            "source_url": MATCH_URL,
+            "player1": "Player A. / Partner B.",
+            "player2": "Player C. / Partner D.",
+        }
+
+        self.assertFalse(set_alerts_enabled(challenger_doubles))
+        self.assertFalse(set_alerts_enabled(direct_doubles))
+        self.assertFalse(set_alerts_enabled(direct_pair_without_competition_label))
+        self.assertEqual(
+            pending_alerts(challenger_doubles, {**challenger_doubles}),
+            [],
+        )
+        self.assertEqual(
+            pending_alerts(direct_doubles, {**direct_doubles}),
+            [],
+        )
+        self.assertTrue(
+            set_alerts_enabled(
+                {
+                    "tournament": "US Open (ATP Singles)",
+                    "source_url": ATP_URL,
+                }
+            )
+        )
+
     def test_straight_sets_finish_sends_only_match_complete(self) -> None:
         previous = normalize_scraped_match(
             raw_match(
@@ -1161,7 +1203,7 @@ class TennisChallengerTests(unittest.TestCase):
         )
         html = hub.templates.get_template("tennis_challenger.html").render(context)
         self.assertIn("Manual Tennis Watcher", html)
-        self.assertIn("ITF alerts", html)
+        self.assertIn("ITF and all doubles alerts", html)
         self.assertIn("Start watcher", html)
         self.assertNotIn("Check game betting", html)
         self.assertNotIn("Game betting", html)
