@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from itertools import permutations
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import betfairlightweight
@@ -27,7 +27,6 @@ TENNIS_EVENT_TYPE_ID = "2"
 SCRIPT_ID = "tennis-challenger-watcher"
 CONFIG_PATH = CONFIG_DIR / "tennis_challenger_watcher.json"
 STATE_PATH = OUTPUT_DIR / "tennis_challenger_watcher_state.json"
-ALLOWED_CATEGORY_SEGMENTS = {"challenger-men-singles", "challenger-men-doubles"}
 
 
 def utc_timestamp(value: datetime | None = None) -> str:
@@ -56,12 +55,25 @@ def normalize_tournament_url(value: str) -> str:
     parsed = urlparse(raw)
     hostname = (parsed.hostname or "").casefold()
     if parsed.scheme != "https" or hostname not in {"flashscore.com", "www.flashscore.com"}:
-        raise ValueError("Tournament links must be HTTPS Flashscore links.")
+        raise ValueError("Watcher links must be HTTPS Flashscore links.")
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 3 or parts[0].casefold() != "tennis" or parts[1].casefold() not in ALLOWED_CATEGORY_SEGMENTS:
-        raise ValueError("Only Flashscore ATP Challenger men's singles or doubles tournament links are supported.")
-    clean_path = "/" + "/".join(parts[:3]) + "/"
-    return urlunparse(("https", "www.flashscore.com", clean_path, "", "", ""))
+    if len(parts) >= 3 and parts[0].casefold() == "tennis":
+        clean_path = "/" + "/".join(parts[:3]) + "/"
+        return urlunparse(("https", "www.flashscore.com", clean_path, "", "", ""))
+    if len(parts) >= 3 and parts[0].casefold() == "match" and parts[1].casefold() == "tennis":
+        match_id = str(parse_qs(parsed.query).get("mid", [""])[0] or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9]+", match_id):
+            raise ValueError("A Flashscore single-match link must include its mid match ID.")
+        # Canonical match URLs contain two participant slugs. Discard any tab
+        # suffix and unrelated tracking parameters while preserving those slugs.
+        path_parts = parts[:4] if len(parts) >= 4 else parts[:3]
+        clean_path = "/" + "/".join(path_parts) + "/"
+        return urlunparse(
+            ("https", "www.flashscore.com", clean_path, "", urlencode({"mid": match_id}), "")
+        )
+    raise ValueError(
+        "Use a Flashscore tennis tournament link or a Flashscore tennis match link."
+    )
 
 
 def parse_tournament_links(text: str) -> list[str]:
@@ -77,13 +89,42 @@ def parse_tournament_links(text: str) -> list[str]:
     return links
 
 
+def is_single_match_url(value: str) -> bool:
+    parts = [part for part in urlparse(str(value or "")).path.split("/") if part]
+    return len(parts) >= 2 and parts[0].casefold() == "match" and parts[1].casefold() == "tennis"
+
+
+def flashscore_match_id(value: str) -> str:
+    if not is_single_match_url(value):
+        return ""
+    return str(parse_qs(urlparse(value).query).get("mid", [""])[0] or "").strip()
+
+
 def tournament_label_from_url(url: str) -> str:
-    parts = [part for part in urlparse(url).path.split("/") if part]
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0].casefold() == "match" and parts[1].casefold() == "tennis":
+        match_id = flashscore_match_id(url)
+        return f"Single match {match_id}" if match_id else "Single match"
     if len(parts) < 3:
         return url
     event = parts[2].replace("-", " ").title()
-    draw = "Doubles" if "doubles" in parts[1] else "Singles"
-    return f"{event} ({draw})"
+    category = parts[1].casefold()
+    draw = "Doubles" if "doubles" in category else "Singles" if "singles" in category else ""
+    if category.startswith("challenger"):
+        level = "Challenger"
+    elif category.startswith("itf-women"):
+        level = "ITF Women"
+    elif category.startswith("itf-men"):
+        level = "ITF Men"
+    elif category.startswith("wta"):
+        level = "WTA"
+    elif category.startswith("atp"):
+        level = "ATP"
+    else:
+        level = category.replace("-singles", "").replace("-doubles", "").replace("-", " ").title()
+    category_label = " ".join(part for part in [level, draw] if part)
+    return f"{event} ({category_label})"
 
 
 def read_config() -> dict[str, Any]:
@@ -199,7 +240,7 @@ def match_start_sort_key(match: dict[str, Any]) -> tuple[float, str]:
 def group_matches_by_tournament(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for match in matches:
-        tournament = str(match.get("tournament", "") or "ATP Challenger")
+        tournament = str(match.get("tournament", "") or "Manual tennis")
         grouped.setdefault(tournament, []).append(match)
     return [
         {"tournament": tournament, "matches": sorted(grouped[tournament], key=match_start_sort_key)}

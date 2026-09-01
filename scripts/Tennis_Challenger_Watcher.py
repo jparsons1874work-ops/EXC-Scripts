@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor configured Flashscore ATP Challenger tournaments and alert Slack."""
+"""Monitor configured Flashscore tennis tournaments and matches and alert Slack."""
 
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ from app.tennis_challenger import (
     atomic_write_json,
     create_betfair_client,
     fetch_upcoming_betfair_tennis_events,
+    flashscore_match_id,
+    is_single_match_url,
     match_betfair_event,
     normalize_tournament_url,
     read_config,
@@ -186,6 +188,54 @@ base => {
     is_live: isLive,
     is_scheduled: !isFinished && !isLive,
     _detail_source: true
+  };
+}
+"""
+
+
+SINGLE_MATCH_BASE_EXTRACTOR = r"""
+input => {
+  const text = selector => {
+    const node = document.querySelector(selector);
+    return node ? String(node.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  };
+  const participant = side => {
+    for (const selector of [
+      `.smh__participantName.smh__${side} .participant__participantName`,
+      `.duelParticipant__${side} .participant__participantName`,
+      `.duelParticipant__${side} [class*="participantName"]`
+    ]) {
+      const names = Array.from(document.querySelectorAll(selector))
+        .map(node => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      if (names.length) return Array.from(new Set(names)).join(' / ');
+    }
+    return '';
+  };
+  const rawStatus = text('.detailScore__status')
+    || text('.fixedHeaderDuel__detailStatus')
+    || text('[class*="detailStatus"]')
+    || text('.duelParticipant__startTime')
+    || text('[class*="startTime"]');
+  const tournament = text('.tournamentHeader__country')
+    || text('.detail__breadcrumbs')
+    || text('[data-testid*="tournament"]')
+    || text('[data-testid*="breadcrumb"]')
+    || `Single match ${input.id}`;
+  return {
+    id: input.id,
+    url: input.url,
+    player1: participant('home'),
+    player2: participant('away'),
+    tournament,
+    raw_status: rawStatus,
+    row_classes: 'event__match event__match--scheduled',
+    set_score: {home: '', away: ''},
+    set_parts: [],
+    current_points: {home: '', away: ''},
+    server_side: '',
+    is_live: false,
+    is_scheduled: true
   };
 }
 """
@@ -415,6 +465,16 @@ def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+def set_alerts_enabled(match: dict[str, Any]) -> bool:
+    competition = " ".join(
+        [
+            str(match.get("tournament", "") or ""),
+            str(match.get("source_url", "") or ""),
+        ]
+    )
+    return re.search(r"\bitf\b", competition, re.IGNORECASE) is None
+
+
 def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> list[str]:
     if match.get("status") == "suspended":
         return []
@@ -440,6 +500,8 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
     alerts: list[str] = []
     for alert_type in order:
         if alert_type == "serve_detected" and match.get("status") != "scheduled":
+            continue
+        if alert_type in {"set_1_complete", "set_2_complete"} and not set_alerts_enabled(match):
             continue
         if alert_type in {"set_1_complete", "set_2_complete"} and not previously_satisfied[alert_type]:
             continue
@@ -517,7 +579,7 @@ def match_scan_log_line(match: dict[str, Any], change: str = "same") -> str:
     age_text = f"{float(age):.1f}s" if isinstance(age, (int, float)) else "-"
     payload_hash = str(match.get("source_payload_hash", "") or "-")
     return (
-        f"Match processed [{match.get('tournament', 'ATP Challenger')}] "
+        f"Match processed [{match.get('tournament', 'Manual tennis')}] "
         f"{match.get('player1', '?')} v {match.get('player2', '?')} "
         f"({match.get('id', '-')}) -> {match.get('status', 'unknown')} | "
         f"sets {aggregate.get('home', '')}-{aggregate.get('away', '')} "
@@ -530,7 +592,7 @@ def match_scan_log_line(match: dict[str, Any], change: str = "same") -> str:
 
 def slack_message(alert_type: str, match: dict[str, Any]) -> str:
     players = f"{match.get('player1', '?')} v {match.get('player2', '?')}"
-    tournament = str(match.get("tournament", "ATP Challenger"))
+    tournament = str(match.get("tournament", "Manual tennis"))
     url = str(match.get("url", ""))
     betfair_event_id = str(match.get("betfair_event_id", "") or "")
     common = [
@@ -539,20 +601,20 @@ def slack_message(alert_type: str, match: dict[str, Any]) -> str:
         f"*Betfair event ID:* `{betfair_event_id}`" if betfair_event_id else "*Betfair event ID:* Not matched",
     ]
     if alert_type == "serve_detected":
-        lines = ["🎾 *ATP Challenger — toss decided*", *common]
+        lines = ["🎾 *Manual tennis — toss decided*", *common]
         lines.append(f"*First server:* {match.get('server', 'Detected')}")
         if match.get("start_time"):
             lines.append(f"*Scheduled:* {match['start_time']}")
         lines.append("Prepare to turn the match in play when play begins.")
     elif alert_type == "match_started":
-        lines = ["🟢 *ATP Challenger — match started*", *common, f"*Score:* {score_text(match)}", "*Action:* TIP required."]
+        lines = ["🟢 *Manual tennis — match started*", *common, f"*Score:* {score_text(match)}", "*Action:* TIP required."]
     elif alert_type == "set_1_complete":
-        lines = ["✅ *ATP Challenger — Set 1 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 1 settlement required."]
+        lines = ["✅ *Manual tennis — Set 1 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 1 settlement required."]
     elif alert_type == "set_2_complete":
-        lines = ["✅ *ATP Challenger — Set 2 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 2 settlement required."]
+        lines = ["✅ *Manual tennis — Set 2 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 2 settlement required."]
     else:
         reason = str(match.get("finish_reason", "") or "")
-        heading = "🏁 *ATP Challenger — match complete*" if not reason else f"⚠️ *ATP Challenger — match ended ({reason.upper()})*"
+        heading = "🏁 *Manual tennis — match complete*" if not reason else f"⚠️ *Manual tennis — match ended ({reason.upper()})*"
         action = "*Action:* Match settlement required." if not reason else "*Action:* Manual review and match settlement required."
         lines = [heading, *common, f"*Final score:* {score_text(match)}", action]
     if url:
@@ -576,7 +638,7 @@ def configured_links() -> list[str]:
         try:
             links.append(normalize_tournament_url(str(value)))
         except ValueError as exc:
-            log(f"Ignoring invalid saved tournament link: {exc}")
+            log(f"Ignoring invalid saved Flashscore link: {exc}")
     return list(dict.fromkeys(links))
 
 
@@ -767,6 +829,53 @@ def extract_page_rows(page: Any) -> list[dict[str, Any]]:
     return [row for row in rows or [] if isinstance(row, dict)]
 
 
+def extract_single_match_row(page: Any, url: str) -> dict[str, Any]:
+    match_id = flashscore_match_id(url)
+    if not match_id:
+        raise RuntimeError("Single-match source has no Flashscore match ID")
+    base = page.evaluate(SINGLE_MATCH_BASE_EXTRACTOR, {"id": match_id, "url": url})
+    if not isinstance(base, dict) or not base.get("player1") or not base.get("player2"):
+        raise RuntimeError(f"Single-match page returned no participants ({page_diagnostic(page)})")
+    row = page.evaluate(DETAIL_EXTRACTOR, base)
+    if not isinstance(row, dict):
+        raise RuntimeError("Single-match page returned no match data")
+    row["_tournament"] = str(base.get("tournament", "") or f"Single match {match_id}")
+    return row
+
+
+def load_single_match_rows(page: Any, url: str, label: str = "Single match") -> list[dict[str, Any]]:
+    log(f"{label}: requesting direct match page (wait mode: commit)")
+    try:
+        response = page.goto(url, wait_until="commit", timeout=15000)
+        response_status = getattr(response, "status", None)
+        log(
+            f"{label}: direct page navigation committed"
+            + (f" with HTTP {response_status}" if response_status is not None else "")
+        )
+    except Exception as exc:
+        log(f"{label}: direct page navigation did not commit cleanly ({exc}); checking the DOM")
+    page.wait_for_selector(
+        ".smh__participantName, .duelParticipant__home .participant__participantName",
+        state="attached",
+        timeout=15000,
+    )
+    row = extract_single_match_row(page, url)
+    log(f"{label}: direct match connected: {row['player1']} v {row['player2']}")
+    return [row]
+
+
+def extract_source_rows(page: Any, url: str) -> list[dict[str, Any]]:
+    if is_single_match_url(url):
+        return [extract_single_match_row(page, url)]
+    return extract_page_rows(page)
+
+
+def load_source_rows(page: Any, url: str, label: str) -> list[dict[str, Any]]:
+    if is_single_match_url(url):
+        return load_single_match_rows(page, url, label)
+    return load_tournament_rows(page, url, label)
+
+
 def page_diagnostic(page: Any) -> str:
     details: list[str] = []
     try:
@@ -893,10 +1002,10 @@ class FlashscoreLivePageProbe:
             page.set_default_timeout(8000)
             self._pages[url] = page
             self._opened_at[url] = time.monotonic()
-            rows = load_tournament_rows(page, url, f"{label} live page")
-            log(f"{label}: live push page connected for current scores, toss and start detection")
+            rows = load_source_rows(page, url, f"{label} live page")
+            log(f"{label}: live page connected for current scores, toss and start detection")
             return rows
-        rows = extract_page_rows(page)
+        rows = extract_source_rows(page, url)
         if not rows:
             raise RuntimeError(f"Live page returned no rows ({page_diagnostic(page)})")
         return rows
@@ -1476,7 +1585,7 @@ def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
             "Slack is not configured. Set Webhook_Challenger in the Hub environment."
         )
     if not configured_links():
-        raise RuntimeError("No ATP Challenger tournament links are saved in the Hub.")
+        raise RuntimeError("No Flashscore tennis tournament or match links are saved in the Hub.")
 
     try:
         from playwright.sync_api import Page, sync_playwright
@@ -1680,7 +1789,7 @@ def run_watcher(
         raise RuntimeError("Slack is not configured. Set Webhook_Challenger in the Hub environment.")
     links = configured_links()
     if not links:
-        raise RuntimeError("No ATP Challenger tournament links are saved in the Hub.")
+        raise RuntimeError("No Flashscore tennis tournament or match links are saved in the Hub.")
 
     prior = read_state()
     prior_matches = {
@@ -1715,7 +1824,11 @@ def run_watcher(
     session.headers.update({"User-Agent": FLASHSCORE_USER_AGENT, "Accept": "*/*"})
     fixture_monitor = FlashscoreFixtureMonitor()
     fixture_monitor.set_targets(
-        {url: tournament_label_from_url(url) for url in links}
+        {
+            url: tournament_label_from_url(url)
+            for url in links
+            if not is_single_match_url(url)
+        }
     )
     live_page_monitor = FlashscoreLivePageMonitor(
         probe_factory=FlashscoreLivePageProbe,
@@ -1729,7 +1842,7 @@ def run_watcher(
     reset_deadline = time.monotonic() + reset_seconds
     restart_reason = ""
 
-    log(f"Starting Flashscore push-backed watcher for {len(links)} configured tournament(s)")
+    log(f"Starting Flashscore push-backed watcher for {len(links)} configured source(s)")
     log(
         f"Every {poll_seconds:g} seconds: read each live push page, publish the hub state, then wait; "
         "refreshing tournament discovery and Betfair matching every 10 minutes"
@@ -1764,7 +1877,7 @@ def run_watcher(
             match_scan_lines: list[str] = []
             if sweep_number == 1 or sweep_number % 10 == 0:
                 log(
-                    f"State sweep {sweep_number} started: {len(links)} tournament(s), "
+                    f"State sweep {sweep_number} started: {len(links)} source(s), "
                     f"{len(matches)} known match(es)"
                 )
 
@@ -1774,8 +1887,8 @@ def run_watcher(
                     alerts,
                     [],
                     expired_finished_matches=expired_finished_matches,
-                    last_error="No tournament links are configured.",
-                    phase="Waiting for tournament links",
+                    last_error="No tournament or match links are configured.",
+                    phase="Waiting for Flashscore links",
                 )
                 STOP_EVENT.wait(max(1.0, poll_seconds))
                 continue
@@ -1808,67 +1921,18 @@ def run_watcher(
                         betfair_client = None
                     log(f"Betfair event refresh failed; Flashscore monitoring will continue: {exc}")
 
-            for old_url in set(feed_configs) - set(links):
+            tournament_links = [url for url in links if not is_single_match_url(url)]
+            for old_url in set(feed_configs) - set(tournament_links):
                 feed_configs.pop(old_url, None)
                 feed_failures.pop(old_url, None)
             monitor_targets = {url: tournament_label_from_url(url) for url in links}
-            fixture_monitor.set_targets(monitor_targets)
+            fixture_monitor.set_targets(
+                {url: monitor_targets[url] for url in tournament_links}
+            )
             live_page_monitor.set_targets(monitor_targets)
 
             for url in links:
                 tournament = tournament_label_from_url(url)
-                config = feed_configs.get(url)
-                needs_reload = (
-                    config is None
-                    or time.monotonic() - float(config.get("loaded_at", 0)) >= reload_minutes * 60
-                )
-                try:
-                    if needs_reload:
-                        write_runtime_state(
-                            matches,
-                            alerts,
-                            [],
-                            expired_finished_matches=expired_finished_matches,
-                            last_error="",
-                            phase=f"Configuring {tournament}",
-                        )
-                        config = load_feed_config(session, url, tournament)
-                        config["loaded_at"] = time.monotonic()
-                        feed_configs[url] = config
-                    summary_matches = fetch_tournament_feed(session, config, tournament)
-                    fresh_feed_urls.add(url)
-                    recovered = bool(feed_failures.pop(url, ""))
-                    if recovered:
-                        log(f"{tournament}: fresh score feed recovered")
-                except Exception as exc:
-                    error_text = str(exc)
-                    source_errors[url] = error_text
-                    prior_error = feed_failures.get(url, "")
-                    feed_failures[url] = error_text
-                    if "401" in error_text or "403" in error_text:
-                        feed_configs.pop(url, None)
-                    if error_text != prior_error:
-                        log(f"{tournament}: fresh score feed failed: {error_text}")
-                    continue
-
-                future_rows, _fixture_error = fixture_monitor.snapshot(url)
-                future_rows = [
-                    {**item, "_score_source": "flashscore_fixture_page"}
-                    for item in future_rows
-                ]
-
-                combined_matches = {
-                    str(item.get("id", "")): item
-                    for item in future_rows
-                    if item.get("id")
-                }
-                combined_matches.update(
-                    {
-                        str(item.get("id", "")): item
-                        for item in summary_matches
-                        if item.get("id")
-                    }
-                )
                 live_rows, live_page_error, live_page_age = live_page_monitor.snapshot_after(
                     url,
                     sweep_started,
@@ -1883,8 +1947,82 @@ def run_watcher(
                         "closing all watcher resources for an immediate reset"
                     )
                     break
-                if live_rows:
+
+                if is_single_match_url(url):
+                    if not live_rows:
+                        error_text = live_page_error or "Direct match page is still loading."
+                        source_errors[url] = error_text
+                        prior_error = feed_failures.get(url, "")
+                        feed_failures[url] = error_text
+                        if live_page_error and error_text != prior_error:
+                            log(f"{tournament}: direct match source failed: {error_text}")
+                        continue
                     fresh_live_page_urls.add(url)
+                    if feed_failures.pop(url, ""):
+                        log(f"{tournament}: direct match source recovered")
+                    combined_matches = {
+                        str(item.get("id", "")): {
+                            **item,
+                            "_score_source": "flashscore_direct_match_page",
+                            "_score_age_seconds": float(live_page_age or 0.0),
+                        }
+                        for item in live_rows
+                        if item.get("id")
+                    }
+                else:
+                    config = feed_configs.get(url)
+                    needs_reload = (
+                        config is None
+                        or time.monotonic() - float(config.get("loaded_at", 0)) >= reload_minutes * 60
+                    )
+                    try:
+                        if needs_reload:
+                            write_runtime_state(
+                                matches,
+                                alerts,
+                                [],
+                                expired_finished_matches=expired_finished_matches,
+                                last_error="",
+                                phase=f"Configuring {tournament}",
+                            )
+                            config = load_feed_config(session, url, tournament)
+                            config["loaded_at"] = time.monotonic()
+                            feed_configs[url] = config
+                        summary_matches = fetch_tournament_feed(session, config, tournament)
+                        fresh_feed_urls.add(url)
+                        recovered = bool(feed_failures.pop(url, ""))
+                        if recovered:
+                            log(f"{tournament}: fresh score feed recovered")
+                    except Exception as exc:
+                        error_text = str(exc)
+                        source_errors[url] = error_text
+                        prior_error = feed_failures.get(url, "")
+                        feed_failures[url] = error_text
+                        if "401" in error_text or "403" in error_text:
+                            feed_configs.pop(url, None)
+                        if error_text != prior_error:
+                            log(f"{tournament}: fresh score feed failed: {error_text}")
+                        continue
+
+                    future_rows, _fixture_error = fixture_monitor.snapshot(url)
+                    future_rows = [
+                        {**item, "_score_source": "flashscore_fixture_page"}
+                        for item in future_rows
+                    ]
+                    combined_matches = {
+                        str(item.get("id", "")): item
+                        for item in future_rows
+                        if item.get("id")
+                    }
+                    combined_matches.update(
+                        {
+                            str(item.get("id", "")): item
+                            for item in summary_matches
+                            if item.get("id")
+                        }
+                    )
+                    if live_rows:
+                        fresh_live_page_urls.add(url)
                     relevant_live_rows: list[dict[str, Any]] = []
                     for live_row in live_rows:
                         live_match_id = str(live_row.get("id", "") or "")
@@ -1905,7 +2043,8 @@ def run_watcher(
 
                 now = utc_timestamp()
                 for raw in raw_matches:
-                    scraped = normalize_scraped_match(raw, url, tournament)
+                    match_tournament = str(raw.get("_tournament", "") or tournament)
+                    scraped = normalize_scraped_match(raw, url, match_tournament)
                     match_id = scraped["id"]
                     previous = matches.get(match_id) or prior_matches.get(match_id)
                     next_match = {
@@ -1986,7 +2125,7 @@ def run_watcher(
                             "type": alert_type,
                             "match_id": match_id,
                             "match": f"{next_match['player1']} v {next_match['player2']}",
-                            "tournament": tournament,
+                            "tournament": match_tournament,
                             "message": message,
                         }
                         alerts.append(alert)
@@ -2037,12 +2176,13 @@ def run_watcher(
                 for url, error in source_errors.items()
             )
             overlay_status = (
-                f"live push page {len(fresh_live_page_urls)}/{len(links)} · "
-                f"snapshot feed {len(fresh_feed_urls)}/{len(links)} · "
+                f"live page {len(fresh_live_page_urls)}/{len(links)} · "
+                f"tournament feed {len(fresh_feed_urls)}/{len(tournament_links)} · "
+                f"{len(links) - len(tournament_links)} direct match link(s) · "
                 "discovery/Betfair every 10m"
             )
             phase = (
-                f"Watching {len(links)} tournament(s) · {overlay_status}"
+                f"Watching {len(links)} source(s) · {overlay_status}"
                 if not error_message
                 else (
                     f"Feed scan completed with {len(source_errors)} source error(s) · "
@@ -2064,7 +2204,8 @@ def run_watcher(
             log(
                 f"Published sweep {sweep_number} to the hub in {time.monotonic() - sweep_started:.1f}s: "
                 f"{len(fresh_live_page_urls)}/{len(links)} live push page(s), "
-                f"{len(fresh_feed_urls)}/{len(links)} feed(s), {len(matches)} match(es), "
+                f"{len(fresh_feed_urls)}/{len(tournament_links)} tournament feed(s), "
+                f"{len(links) - len(tournament_links)} direct link(s), {len(matches)} match(es), "
                 f"{scheduled_count} scheduled, {live_count} live, "
                 f"{changed_match_count} changed, {len(source_errors)} error(s)"
             )

@@ -11,14 +11,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from playwright.sync_api import sync_playwright
 from starlette.requests import Request
 
 import app.main as hub
 from app.registry import SCRIPTS_BY_ID
 from app.tennis_challenger import (
     BetfairTennisEvent,
+    flashscore_match_id,
     group_matches_by_tournament,
     is_future_scheduled_match,
+    is_single_match_url,
     match_betfair_event,
     normalize_tournament_url,
     parse_tournament_links,
@@ -33,6 +36,7 @@ from scripts.Tennis_Challenger_Watcher import (
     WATCHER_RESTART_EXIT_CODE,
     build_parser,
     carry_alert_flags,
+    extract_single_match_row,
     extract_feed_config,
     extract_fixtures_feed,
     fetch_tournament_feed,
@@ -46,6 +50,7 @@ from scripts.Tennis_Challenger_Watcher import (
     parse_tournament_feed,
     pending_alerts,
     prune_expired_finished_matches,
+    set_alerts_enabled,
     should_scan_match_detail,
     should_refresh_betfair_events,
     slack_message,
@@ -55,6 +60,13 @@ from scripts.Tennis_Challenger_Watcher import (
 
 
 AUGSBURG_URL = "https://www.flashscore.com/tennis/challenger-men-singles/augsburg/"
+ITF_URL = "https://www.flashscore.com/tennis/itf-women-singles/w35-roehampton/"
+ATP_URL = "https://www.flashscore.com/tennis/atp-singles/us-open/"
+WTA_URL = "https://www.flashscore.com/tennis/wta-singles/us-open/"
+MATCH_URL = (
+    "https://www.flashscore.com/match/tennis/martin-andres-h2AG5rdm/"
+    "mayo-aidan-2mEGNcVp/?mid=r7R6cLgK"
+)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -119,7 +131,7 @@ class TennisChallengerTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("Monitor configured Flashscore ATP Challenger tournaments", completed.stdout)
+        self.assertIn("Monitor configured Flashscore tennis tournaments and matches", completed.stdout)
 
     def test_tournament_loader_waits_for_attached_not_visible_rows(self) -> None:
         class FakePage:
@@ -288,8 +300,96 @@ class TennisChallengerTests(unittest.TestCase):
             parse_tournament_links(AUGSBURG_URL + "\n" + AUGSBURG_URL + "draw"),
             [AUGSBURG_URL],
         )
+        self.assertEqual(normalize_tournament_url(ITF_URL + "results/"), ITF_URL)
+        self.assertEqual(normalize_tournament_url(ATP_URL + "fixtures/"), ATP_URL)
+        self.assertEqual(normalize_tournament_url(WTA_URL + "draw/"), WTA_URL)
+
+    def test_single_match_links_are_normalized_and_keep_the_match_id(self) -> None:
+        source = MATCH_URL + "&utm_source=operations"
+        self.assertEqual(normalize_tournament_url(source), MATCH_URL)
+        self.assertTrue(is_single_match_url(MATCH_URL))
+        self.assertEqual(flashscore_match_id(MATCH_URL), "r7R6cLgK")
+        self.assertEqual(parse_tournament_links(f"{MATCH_URL}\n{MATCH_URL}"), [MATCH_URL])
         with self.assertRaises(ValueError):
-            normalize_tournament_url("https://www.flashscore.com/tennis/atp-singles/us-open/")
+            normalize_tournament_url(MATCH_URL.split("?", 1)[0])
+
+    def test_single_match_page_is_converted_to_a_watcher_row(self) -> None:
+        class FakePage:
+            def evaluate(self, expression, argument):
+                if "const participant = side" in expression:
+                    return {
+                        "id": argument["id"],
+                        "url": argument["url"],
+                        "player1": "Martin A.",
+                        "player2": "Mayo A.",
+                        "tournament": "ATP - SINGLES: US Open",
+                        "raw_status": "Set 1",
+                        "row_classes": "event__match event__match--scheduled",
+                        "set_score": {"home": "", "away": ""},
+                        "set_parts": [],
+                        "current_points": {"home": "", "away": ""},
+                        "server_side": "",
+                        "is_live": False,
+                        "is_scheduled": True,
+                    }
+                return {
+                    **argument,
+                    "row_classes": "event__match event__match--live",
+                    "is_live": True,
+                    "is_scheduled": False,
+                    "server_side": "home",
+                }
+
+        row = extract_single_match_row(FakePage(), MATCH_URL)
+
+        self.assertEqual(row["id"], "r7R6cLgK")
+        self.assertEqual(row["player1"], "Martin A.")
+        self.assertEqual(row["server_side"], "home")
+        self.assertEqual(row["_tournament"], "ATP - SINGLES: US Open")
+
+    def test_single_match_dom_extractor_reads_itf_players_score_and_server(self) -> None:
+        html = """
+        <div class="tournamentHeader__country">ITF WOMEN - SINGLES: W35 Roehampton</div>
+        <div class="detailScore__status">Set 2</div>
+        <div class="smh__template tennis">
+          <div class="smh__service smh__home"><div title="Serving player"></div></div>
+          <div class="smh__participantName smh__home">
+            <a class="participant__participantName">Martin A.</a>
+          </div>
+          <div class="smh__part smh__score smh__live smh__home smh__part--current">1</div>
+          <div class="smh__part smh__home smh__part--1">6</div>
+          <div class="smh__part smh__home smh__part--2">2</div>
+          <div class="smh__part smh__home smh__part--game">30</div>
+          <div class="smh__service smh__away"></div>
+          <div class="smh__participantName smh__away">
+            <a class="participant__participantName">Mayo A.</a>
+          </div>
+          <div class="smh__part smh__score smh__live smh__away smh__part--current">0</div>
+          <div class="smh__part smh__away smh__part--1">4</div>
+          <div class="smh__part smh__away smh__part--2">1</div>
+          <div class="smh__part smh__away smh__part--game">15</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(html)
+                row = extract_single_match_row(page, MATCH_URL)
+            finally:
+                browser.close()
+
+        self.assertEqual(row["player1"], "Martin A.")
+        self.assertEqual(row["player2"], "Mayo A.")
+        self.assertEqual(row["raw_status"], "Set 2")
+        self.assertEqual(row["set_score"], {"home": "1", "away": "0"})
+        self.assertEqual(row["server_side"], "home")
+        self.assertTrue(row["is_live"])
+        self.assertIn("ITF WOMEN", row["_tournament"])
+
+    def test_non_tennis_flashscore_links_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_tournament_url("https://www.flashscore.com/football/england/premier-league/")
 
     def test_future_match_split_uses_the_uk_calendar_date(self) -> None:
         reference = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -577,6 +677,37 @@ class TennisChallengerTests(unittest.TestCase):
         )
         finished["alerts_sent"] = dict(confirmed_set_3["alerts_sent"])
         self.assertEqual(pending_alerts(confirmed_set_3, finished), [])
+        confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
+        self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
+
+    def test_itf_matches_skip_set_alerts_but_keep_match_complete(self) -> None:
+        live_set_2 = normalize_scraped_match(
+            raw_match(
+                raw_status="Set 2",
+                row_classes="event__match event__match--live",
+                is_live=True,
+                is_scheduled=False,
+                set_score={"home": "1", "away": "0"},
+                set_parts=[{"home": "6", "away": "4"}, {"home": "0", "away": "0"}],
+            ),
+            ITF_URL,
+            "W35 Roehampton (ITF Women Singles)",
+        )
+        live_set_2["alerts_sent"] = {"match_started": True}
+        repeated_live_set_2 = {**live_set_2, "alerts_sent": dict(live_set_2["alerts_sent"])}
+
+        self.assertFalse(set_alerts_enabled(live_set_2))
+        self.assertEqual(pending_alerts(live_set_2, repeated_live_set_2), [])
+        self.assertTrue(set_alerts_enabled({"tournament": "ATP US Open"}))
+        self.assertTrue(set_alerts_enabled({"tournament": "WTA US Open"}))
+
+        finished = {
+            **repeated_live_set_2,
+            "status": "finished",
+            "completion_confirmed": True,
+            "current_set_number": None,
+        }
+        self.assertEqual(pending_alerts(repeated_live_set_2, finished), [])
         confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
         self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
@@ -1029,6 +1160,8 @@ class TennisChallengerTests(unittest.TestCase):
             tennis_challenger=challenger,
         )
         html = hub.templates.get_template("tennis_challenger.html").render(context)
+        self.assertIn("Manual Tennis Watcher", html)
+        self.assertIn("ITF alerts", html)
         self.assertIn("Start watcher", html)
         self.assertNotIn("Check game betting", html)
         self.assertNotIn("Game betting", html)

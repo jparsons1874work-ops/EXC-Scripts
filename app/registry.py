@@ -51,9 +51,10 @@ def script(
     auto_stop_times: tuple[str, ...] = (),
     auto_start_on_hub_start: bool = False,
     automation_timezone: str = "Europe/London",
+    id_override: str | None = None,
 ) -> ScriptSpec:
     return ScriptSpec(
-        id=slugify(name),
+        id=id_override or slugify(name),
         name=name,
         category=category,
         description=description,
@@ -171,13 +172,14 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         auto_start_on_hub_start=True,
     ),
     script(
-        "Tennis - Challenger Watcher",
+        "Tennis - Manual Coverage Watcher",
         "Tennis",
-        "Monitors selected ATP Challenger tournaments and sends operational Slack alerts.",
+        "Monitors selected Flashscore tennis tournaments or matches and sends operational Slack alerts.",
         "scripts/Tennis_Challenger_Watcher.py",
         ("--poll-seconds", "10", "--reload-minutes", "15"),
         long_running=True,
         timeout_seconds=10 * 365 * 24 * 60 * 60,
+        id_override="tennis-challenger-watcher",
     ),
     script(
         "Cricket - Time Check Today",

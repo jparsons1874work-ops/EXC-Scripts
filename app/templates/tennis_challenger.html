@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}ATP Challenger Watcher · Scripts Hub{% endblock %}
+{% block title %}Manual Tennis Watcher · Scripts Hub{% endblock %}
 {% block content %}
 <header class="page-header">
   <div class="page-title-block">
@@ -7,8 +7,8 @@
     <img class="header-logo compact" src="{{ assets.logo }}" alt="Betfair">
     {% endif %}
     <span class="eyebrow">Tennis operations</span>
-    <h1>ATP Challenger Watcher</h1>
-    <p>Monitor manual-coverage tournaments, follow live scores and send actionable Slack alerts.</p>
+    <h1>Manual Tennis Watcher</h1>
+    <p>Monitor manual-coverage tennis tournaments or individual matches, follow live scores and send actionable Slack alerts.</p>
   </div>
   <div id="status-badge" hx-get="/scripts/{{ spec.id }}/status" hx-trigger="every 2s" hx-swap="innerHTML">
     {% include "partials/status_badge.html" %}
@@ -16,22 +16,22 @@
 </header>
 
 {% if request.query_params.get("error") == "missing-tournament-links" %}
-<div class="error">Save at least one ATP Challenger tournament link before starting the watcher.</div>
+<div class="error">Save at least one Flashscore tennis tournament or match link before starting the watcher.</div>
 {% elif request.query_params.get("error") == "invalid-tournament-link" %}
-<div class="error">Use one Flashscore Challenger Men singles or doubles tournament link per line.</div>
+<div class="error">Use one Flashscore tennis tournament or individual match link per line.</div>
 {% endif %}
 
 <section class="challenger-controls">
   <div class="panel">
     <div class="panel-header">
-      <h2>Weekly tournament links</h2>
+      <h2>Watched Flashscore links</h2>
       {% if tennis_challenger.last_saved_at %}<span class="meta">Saved {{ tennis_challenger.last_saved_at }}</span>{% endif %}
     </div>
-    <p class="meta">Paste the Flashscore tournament summary, fixtures, results or draw link. One tournament per line.</p>
+    <p class="meta">Paste any Flashscore tennis tournament page or individual tennis match link. One link per line.</p>
     <form method="post" action="/scripts/{{ spec.id }}/config" class="form-stack controls">
-      <label for="tournament_links">Manual ATP Challenger tournaments</label>
-      <textarea id="tournament_links" name="tournament_links" rows="7" placeholder="https://www.flashscore.com/tennis/challenger-men-singles/example/">{{ tennis_challenger.links_text }}</textarea>
-      <button class="button button-ghost" type="submit">Save tournament links</button>
+      <label for="tournament_links">Manual tennis tournaments and matches</label>
+      <textarea id="tournament_links" name="tournament_links" rows="7" placeholder="Tournament or match link from flashscore.com">{{ tennis_challenger.links_text }}</textarea>
+      <button class="button button-ghost" type="submit">Save watcher links</button>
     </form>
   </div>
 
@@ -49,7 +49,7 @@
       </form>
     </div>
     <div class="message compact-message">
-      Slack alerts: toss/first server, match started, Set 1 complete, Set 2 complete and match complete.
+      ATP, WTA and Challenger alerts: toss/first server, match started, Set 1 complete, Set 2 complete and match complete. ITF alerts: toss/first server, match started and match complete.
     </div>
     {% if state.message %}<div class="message compact-message">{{ state.message }}</div>{% endif %}
   </div>
