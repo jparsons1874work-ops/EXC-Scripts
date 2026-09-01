@@ -61,6 +61,8 @@ ALERT_FLAG_BY_TYPE = {
 }
 DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_RELOAD_MINUTES = 15.0
+DEFAULT_RESET_HOURS = 2.0
+WATCHER_RESTART_EXIT_CODE = 75
 MAX_ALERT_HISTORY = 100
 BETFAIR_REFRESH_SECONDS = 10 * 60
 BETFAIR_UNMATCHED_REFRESH_SECONDS = BETFAIR_REFRESH_SECONDS
@@ -190,7 +192,30 @@ base => {
 
 
 def log(message: str) -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+    try:
+        print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+    except BrokenPipeError:
+        # A dead Hub log reader must not prevent resource cleanup or a planned
+        # process recycle.
+        pass
+
+
+def is_broken_pipe_error(value: Any) -> bool:
+    text = str(value or "").casefold()
+    return "broken pipe" in text or "errno 32" in text
+
+
+def restart_watcher_process() -> None:
+    """Replace this process after all watcher resources have been closed."""
+    executable = sys.executable
+    argv = [executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    log("Starting a fresh watcher process now")
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    os.execv(executable, argv)
 
 
 def clean_score_value(value: Any) -> str | int:
@@ -1198,9 +1223,14 @@ class FlashscoreLivePageMonitor:
                         with self._lock:
                             prior_error = self._detail_errors.get(match_id, "")
                             self._detail_errors[match_id] = error_text
+                            if is_broken_pipe_error(error_text):
+                                self._fatal_error = error_text
                         if error_text != prior_error:
                             players = f"{row.get('player1', '?')} v {row.get('player2', '?')}"
                             log(f"{players}: direct match page failed: {error_text}")
+                        if is_broken_pipe_error(error_text):
+                            log("Direct match browser pipe failed; ending its worker for a full reset")
+                            return
                     else:
                         successful_checks += 1
                         with self._lock:
@@ -1640,7 +1670,11 @@ def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
     return 0
 
 
-def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
+def run_watcher(
+    poll_seconds: float,
+    reload_minutes: float,
+    reset_hours: float = DEFAULT_RESET_HOURS,
+) -> int:
     webhook = slack_webhook_url()
     if not webhook:
         raise RuntimeError("Slack is not configured. Set Webhook_Challenger in the Hub environment.")
@@ -1691,12 +1725,16 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     live_page_monitor.set_targets(
         {url: tournament_label_from_url(url) for url in links}
     )
+    reset_seconds = max(60.0, reset_hours * 60 * 60)
+    reset_deadline = time.monotonic() + reset_seconds
+    restart_reason = ""
 
     log(f"Starting Flashscore push-backed watcher for {len(links)} configured tournament(s)")
     log(
         f"Every {poll_seconds:g} seconds: read each live push page, publish the hub state, then wait; "
         "refreshing tournament discovery and Betfair matching every 10 minutes"
     )
+    log(f"Full watcher process recycle scheduled every {reset_hours:g} hour(s)")
     write_runtime_state(
         matches,
         alerts,
@@ -1709,6 +1747,12 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
     sweep_number = 0
     try:
         while not STOP_EVENT.is_set():
+            if time.monotonic() >= reset_deadline:
+                restart_reason = f"scheduled {reset_hours:g}-hour process recycle"
+                log(
+                    f"Scheduled {reset_hours:g}-hour reset reached; closing all watcher resources"
+                )
+                break
             sweep_number += 1
             sweep_started = time.monotonic()
             links = configured_links()
@@ -1825,11 +1869,20 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         if item.get("id")
                     }
                 )
-                live_rows, _live_page_error, live_page_age = live_page_monitor.snapshot_after(
+                live_rows, live_page_error, live_page_age = live_page_monitor.snapshot_after(
                     url,
                     sweep_started,
                     timeout=min(3.0, max(1.0, poll_seconds / 2)),
                 )
+                if is_broken_pipe_error(live_page_error):
+                    restart_reason = (
+                        f"{tournament} live browser reported {live_page_error}"
+                    )
+                    log(
+                        f"{tournament}: broken browser pipe detected; "
+                        "closing all watcher resources for an immediate reset"
+                    )
+                    break
                 if live_rows:
                     fresh_live_page_urls.add(url)
                     relevant_live_rows: list[dict[str, Any]] = []
@@ -1948,6 +2001,9 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
                         )
                     )
 
+            if restart_reason:
+                break
+
             active_urls = set(links)
             matches = {
                 key: value
@@ -2025,6 +2081,18 @@ def run_watcher(poll_seconds: float, reload_minutes: float) -> int:
             except Exception:
                 log("Betfair logout failed while stopping watcher")
 
+    if restart_reason and not STOP_EVENT.is_set():
+        write_runtime_state(
+            matches,
+            alerts,
+            [],
+            expired_finished_matches=expired_finished_matches,
+            last_error="",
+            phase=f"Restarting watcher · {restart_reason}",
+        )
+        log("Watcher reset cleanup complete")
+        return WATCHER_RESTART_EXIT_CODE
+
     write_runtime_state(
         matches,
         alerts,
@@ -2041,6 +2109,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
     parser.add_argument("--reload-minutes", type=float, default=DEFAULT_RELOAD_MINUTES)
+    parser.add_argument("--reset-hours", type=float, default=DEFAULT_RESET_HOURS)
     return parser
 
 
@@ -2049,8 +2118,18 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
     try:
-        return run_watcher(max(1.0, args.poll_seconds), max(1.0, args.reload_minutes))
+        result = run_watcher(
+            max(1.0, args.poll_seconds),
+            max(1.0, args.reload_minutes),
+            max(1 / 60, args.reset_hours),
+        )
+        if result == WATCHER_RESTART_EXIT_CODE and not STOP_EVENT.is_set():
+            restart_watcher_process()
+        return result
     except Exception as exc:
+        if is_broken_pipe_error(exc) and not STOP_EVENT.is_set():
+            log(f"Broken pipe reached the main watcher; forcing an immediate reset: {exc}")
+            restart_watcher_process()
         previous = read_state()
         atomic_write_json(
             STATE_PATH,
