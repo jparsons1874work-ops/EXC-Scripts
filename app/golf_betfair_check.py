@@ -290,12 +290,37 @@ def list_betfair_events(client: betfairlightweight.APIClient) -> list[BetfairEve
 
 
 def betfair_selection_names(event: BetfairEvent) -> list[str]:
-    """Return every selection displayed in the Exchange market catalogue."""
+    """Return every named selection in the Exchange market catalogue."""
     return [
         str(getattr(runner, "runner_name", "") or "")
         for runner in event.runners
         if str(getattr(runner, "runner_name", "") or "").strip()
     ]
+
+
+def active_betfair_selection_names(
+    client: betfairlightweight.APIClient,
+    event: BetfairEvent,
+) -> list[str]:
+    """Return only selections that are currently active in the Exchange market."""
+    market_books = client.betting.list_market_book(market_ids=[event.market_id])
+    if not market_books:
+        raise RuntimeError("Betfair returned no live market state; skipped to avoid a false discrepancy")
+
+    active_selection_ids = {
+        str(getattr(runner, "selection_id", "") or "")
+        for runner in list(getattr(market_books[0], "runners", None) or [])
+        if str(getattr(runner, "status", "") or "").upper() == "ACTIVE"
+    }
+    names = [
+        str(getattr(runner, "runner_name", "") or "")
+        for runner in event.runners
+        if str(getattr(runner, "selection_id", "") or "") in active_selection_ids
+        and str(getattr(runner, "runner_name", "") or "").strip()
+    ]
+    if not names:
+        raise RuntimeError("Betfair returned 0 active market selections; skipped to avoid a false discrepancy")
+    return names
 
 
 def betfair_login(environment: dict[str, str]) -> betfairlightweight.APIClient:
@@ -435,9 +460,7 @@ def perform_check() -> dict[str, Any]:
                 continue
             used_event_ids.add(event.event_id)
             try:
-                betfair_names = betfair_selection_names(event)
-                if not betfair_names:
-                    raise RuntimeError("Betfair returned 0 market selections; skipped to avoid a false discrepancy")
+                betfair_names = active_betfair_selection_names(client, event)
                 comparison = compare_player_lists(official["official_names"], betfair_names)
             except Exception as exc:
                 rows.append(

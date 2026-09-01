@@ -151,6 +151,37 @@ class GolfBetfairCheckTests(unittest.TestCase):
 
         self.assertEqual(names, ["Alice Player", "Withdrawn Golfer"])
 
+    def test_only_active_betfair_selections_are_returned(self) -> None:
+        event = checker.BetfairEvent(
+            "event-1",
+            "Test Open",
+            "1.123",
+            "Winner",
+            [
+                SimpleNamespace(selection_id=1, runner_name="Alice Player"),
+                SimpleNamespace(selection_id=2, runner_name="Callum Tarren"),
+            ],
+        )
+        client = SimpleNamespace(
+            betting=SimpleNamespace(
+                list_market_book=Mock(
+                    return_value=[
+                        SimpleNamespace(
+                            runners=[
+                                SimpleNamespace(selection_id=1, status="ACTIVE"),
+                                SimpleNamespace(selection_id=2, status="REMOVED"),
+                            ]
+                        )
+                    ]
+                )
+            )
+        )
+
+        names = checker.active_betfair_selection_names(client, event)
+
+        self.assertEqual(names, ["Alice Player"])
+        client.betting.list_market_book.assert_called_once_with(market_ids=["1.123"])
+
     def test_perform_check_sends_fresh_slack_for_mismatch(self) -> None:
         official = [
             {
@@ -176,7 +207,7 @@ class GolfBetfairCheckTests(unittest.TestCase):
             patch.object(checker, "child_environment", return_value={}),
             patch.object(checker, "betfair_login", return_value=client),
             patch.object(checker, "list_betfair_events", return_value=[event]),
-            patch.object(checker, "betfair_selection_names", return_value=["Alice Player"]),
+            patch.object(checker, "active_betfair_selection_names", return_value=["Alice Player"]),
             patch.object(checker, "load_name_aliases", return_value={}),
             patch.object(checker, "send_discrepancy_slack", return_value="sent") as slack,
         ):
