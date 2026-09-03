@@ -175,7 +175,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         "Tennis - Manual Coverage Watcher",
         "Tennis",
         "Monitors selected Flashscore tennis tournaments or matches and sends operational Slack alerts.",
-        "scripts/Tennis_Challenger_Watcher.py",
+        "scripts/Tennis_Manual_Watcher_Supervisor.py",
         ("--poll-seconds", "10", "--reload-minutes", "15"),
         long_running=True,
         timeout_seconds=10 * 365 * 24 * 60 * 60,

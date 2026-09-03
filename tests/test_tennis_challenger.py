@@ -29,7 +29,6 @@ from app.tennis_challenger import (
 )
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
-    DEFAULT_RESET_HOURS,
     EVENT_ROW_SELECTOR,
     FlashscoreLivePageMonitor,
     STOP_EVENT,
@@ -95,18 +94,17 @@ def apply_sent(match, alert_types):
 
 
 class TennisChallengerTests(unittest.TestCase):
-    def test_watcher_defaults_to_two_hour_process_reset(self) -> None:
+    def test_watcher_no_longer_schedules_its_own_two_hour_reset(self) -> None:
         args = build_parser().parse_args([])
-        self.assertEqual(args.reset_hours, DEFAULT_RESET_HOURS)
-        self.assertEqual(args.reset_hours, 2.0)
+        self.assertFalse(hasattr(args, "reset_hours"))
 
     def test_broken_pipe_errors_request_immediate_reset(self) -> None:
         self.assertTrue(is_broken_pipe_error("[Errno 32] Broken pipe"))
         self.assertTrue(is_broken_pipe_error("Browser transport: BROKEN PIPE"))
         self.assertFalse(is_broken_pipe_error("Page.goto timed out"))
 
-    def test_main_replaces_process_after_clean_reset(self) -> None:
-        args = SimpleNamespace(poll_seconds=10.0, reload_minutes=15.0, reset_hours=2.0)
+    def test_main_returns_reset_request_to_separate_supervisor(self) -> None:
+        args = SimpleNamespace(poll_seconds=10.0, reload_minutes=15.0)
         STOP_EVENT.clear()
         with (
             patch("scripts.Tennis_Challenger_Watcher.build_parser") as parser,
@@ -114,12 +112,10 @@ class TennisChallengerTests(unittest.TestCase):
                 "scripts.Tennis_Challenger_Watcher.run_watcher",
                 return_value=WATCHER_RESTART_EXIT_CODE,
             ),
-            patch("scripts.Tennis_Challenger_Watcher.restart_watcher_process") as restart,
             patch("scripts.Tennis_Challenger_Watcher.signal.signal"),
         ):
             parser.return_value.parse_args.return_value = args
             self.assertEqual(watcher_main(), WATCHER_RESTART_EXIT_CODE)
-        restart.assert_called_once_with()
 
     def test_watcher_can_start_from_its_script_path(self) -> None:
         completed = subprocess.run(
@@ -289,6 +285,7 @@ class TennisChallengerTests(unittest.TestCase):
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
         self.assertTrue(spec.long_running)
         self.assertFalse(spec.auto_start_on_hub_start)
+        self.assertEqual(spec.relative_path, "scripts/Tennis_Manual_Watcher_Supervisor.py")
         self.assertEqual(spec.default_args[:2], ("--poll-seconds", "10"))
 
     def test_tournament_links_are_normalized_to_summary_page(self) -> None:

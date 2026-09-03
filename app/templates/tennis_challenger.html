@@ -48,6 +48,7 @@
         <button class="button button-danger" type="submit" {% if state.status not in ["running", "stopping"] %}disabled{% endif %}>Stop watcher</button>
       </form>
     </div>
+    <p class="meta">Automatic hard reset at :25 and :55 each hour (UK time), followed by a 30-second pause. Stop watcher also cancels automatic restarts.</p>
     <div class="message compact-message">
       ATP, WTA and Challenger singles alerts: toss/first server, match started, Set 1 complete, Set 2 complete and match complete. ITF and all doubles alerts: toss/first server, match started and match complete.
     </div>

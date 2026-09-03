@@ -63,7 +63,6 @@ ALERT_FLAG_BY_TYPE = {
 }
 DEFAULT_POLL_SECONDS = 10.0
 DEFAULT_RELOAD_MINUTES = 15.0
-DEFAULT_RESET_HOURS = 2.0
 WATCHER_RESTART_EXIT_CODE = 75
 MAX_ALERT_HISTORY = 100
 BETFAIR_REFRESH_SECONDS = 10 * 60
@@ -253,19 +252,6 @@ def log(message: str) -> None:
 def is_broken_pipe_error(value: Any) -> bool:
     text = str(value or "").casefold()
     return "broken pipe" in text or "errno 32" in text
-
-
-def restart_watcher_process() -> None:
-    """Replace this process after all watcher resources have been closed."""
-    executable = sys.executable
-    argv = [executable, str(Path(__file__).resolve()), *sys.argv[1:]]
-    log("Starting a fresh watcher process now")
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    except (BrokenPipeError, OSError):
-        pass
-    os.execv(executable, argv)
 
 
 def clean_score_value(value: Any) -> str | int:
@@ -1795,7 +1781,6 @@ def run_browser_watcher(poll_seconds: float, reload_minutes: float) -> int:
 def run_watcher(
     poll_seconds: float,
     reload_minutes: float,
-    reset_hours: float = DEFAULT_RESET_HOURS,
 ) -> int:
     webhook = slack_webhook_url()
     if not webhook:
@@ -1851,8 +1836,6 @@ def run_watcher(
     live_page_monitor.set_targets(
         {url: tournament_label_from_url(url) for url in links}
     )
-    reset_seconds = max(60.0, reset_hours * 60 * 60)
-    reset_deadline = time.monotonic() + reset_seconds
     restart_reason = ""
 
     log(f"Starting Flashscore push-backed watcher for {len(links)} configured source(s)")
@@ -1860,7 +1843,6 @@ def run_watcher(
         f"Every {poll_seconds:g} seconds: read each live push page, publish the hub state, then wait; "
         "refreshing tournament discovery and Betfair matching every 10 minutes"
     )
-    log(f"Full watcher process recycle scheduled every {reset_hours:g} hour(s)")
     write_runtime_state(
         matches,
         alerts,
@@ -1873,12 +1855,6 @@ def run_watcher(
     sweep_number = 0
     try:
         while not STOP_EVENT.is_set():
-            if time.monotonic() >= reset_deadline:
-                restart_reason = f"scheduled {reset_hours:g}-hour process recycle"
-                log(
-                    f"Scheduled {reset_hours:g}-hour reset reached; closing all watcher resources"
-                )
-                break
             sweep_number += 1
             sweep_started = time.monotonic()
             links = configured_links()
@@ -1957,7 +1933,7 @@ def run_watcher(
                     )
                     log(
                         f"{tournament}: broken browser pipe detected; "
-                        "closing all watcher resources for an immediate reset"
+                        "closing all watcher resources for a supervised restart"
                     )
                     break
 
@@ -2263,7 +2239,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--poll-seconds", type=float, default=DEFAULT_POLL_SECONDS)
     parser.add_argument("--reload-minutes", type=float, default=DEFAULT_RELOAD_MINUTES)
-    parser.add_argument("--reset-hours", type=float, default=DEFAULT_RESET_HOURS)
     return parser
 
 
@@ -2272,18 +2247,14 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
     try:
-        result = run_watcher(
+        return run_watcher(
             max(1.0, args.poll_seconds),
             max(1.0, args.reload_minutes),
-            max(1 / 60, args.reset_hours),
         )
-        if result == WATCHER_RESTART_EXIT_CODE and not STOP_EVENT.is_set():
-            restart_watcher_process()
-        return result
     except Exception as exc:
         if is_broken_pipe_error(exc) and not STOP_EVENT.is_set():
-            log(f"Broken pipe reached the main watcher; forcing an immediate reset: {exc}")
-            restart_watcher_process()
+            log(f"Broken pipe reached the main watcher; requesting a supervised restart: {exc}")
+            return WATCHER_RESTART_EXIT_CODE
         previous = read_state()
         atomic_write_json(
             STATE_PATH,

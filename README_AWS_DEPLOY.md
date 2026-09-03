@@ -301,6 +301,8 @@ Follow logs:
 journalctl -u betfair-scripts -f
 ```
 
+After deploying the manual tennis watcher supervisor, select **Start watcher** on its Hub page. Its separate controller resets only the tennis watcher at :25 and :55 each hour (UK time), with a 30-second pause after stopping. This replaces the previous two-hour reset. Restarting the Hub does not automatically start this manual watcher.
+
 ## 9. Logs and Debugging
 
 App health:
