@@ -792,7 +792,7 @@ class BetfairEventReminderTests(unittest.TestCase):
                 "NRL 9s",
                 "Womens NRL 9s",
             ),
-            "Rugby Union": ("Super Rugby - Pacific", "NZ NPC", "Bledisloe Cup"),
+            "Rugby Union": ("Super Rugby - Pacific", "NZ NPC", "New Zealand NPC", "Bledisloe Cup"),
         }
         for sport, names in competitions.items():
             for competition_name in names:
@@ -831,21 +831,23 @@ class BetfairEventReminderTests(unittest.TestCase):
         item = reminder("Soccer", "match", datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc))
         self.assertFalse(reminders.is_disallowed_market(item))
 
-    def test_au_market_is_excluded_from_event_and_market_selection(self) -> None:
-        item = reminder(
-            "Golf",
-            "au-event",
-            datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
-            market_name="Tournament Winner",
-            market_type_code="OUTRIGHT_WINNER",
-            country_code="AU",
-        )
-        self.assertEqual(select_market_reminders([item], "Golf"), [])
-        self.assertEqual(select_reminders([item], reminders.SPORT_RULE_ALL), [])
-        self.assertEqual(
-            reminders.outright_market_selection(item),
-            (False, "disallowed_australian_market:country_code=AU"),
-        )
+    def test_au_nz_market_is_excluded_from_event_and_market_selection(self) -> None:
+        for country_code in ("AU", "NZ"):
+            with self.subTest(country_code=country_code):
+                item = reminder(
+                    "Golf",
+                    f"{country_code}-event",
+                    datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc),
+                    market_name="Tournament Winner",
+                    market_type_code="OUTRIGHT_WINNER",
+                    country_code=country_code,
+                )
+                self.assertEqual(select_market_reminders([item], "Golf"), [])
+                self.assertEqual(select_reminders([item], reminders.SPORT_RULE_ALL), [])
+                self.assertEqual(
+                    reminders.outright_market_selection(item),
+                    (False, f"disallowed_australian_market:country_code={country_code}"),
+                )
 
     def test_australian_wallet_market_is_excluded_when_country_is_wrong(self) -> None:
         item = reminder(
@@ -919,9 +921,9 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(item.wallet, "Australian wallet")
         self.assertEqual(item.regulator, "TASMANIAN GAMING COMMISSION")
 
-    def test_market_country_allowlist_excludes_au(self) -> None:
+    def test_market_country_allowlist_excludes_au_nz(self) -> None:
         self.assertEqual(
-            reminders.allowed_market_country_codes(["GB", "au", "IE", "AU", ""]),
+            reminders.allowed_market_country_codes(["GB", "au", "IE", "AU", "nz", "NZ", ""]),
             ("GB", "IE"),
         )
 
@@ -940,7 +942,7 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertEqual(reminders.list_market_country_codes(client, window), ("AU", "GB"))
         self.assertIn("marketStartTime", betting.filter)
 
-    def test_market_catalogue_query_applies_non_au_country_allowlist(self) -> None:
+    def test_market_catalogue_query_applies_non_au_nz_country_allowlist(self) -> None:
         class FakeBetting:
             def list_market_catalogue(self, **kwargs):
                 self.filter = kwargs["filter"]
@@ -954,10 +956,11 @@ class BetfairEventReminderTests(unittest.TestCase):
             "3",
             window,
             market_type_codes=("WINNER",),
-            market_countries=("GB", "IE"),
+            market_countries=reminders.allowed_market_country_codes(["AU", "NZ", "GB", "IE"]),
         )
         self.assertEqual(betting.filter["marketCountries"], ["GB", "IE"])
         self.assertNotIn("AU", betting.filter["marketCountries"])
+        self.assertNotIn("NZ", betting.filter["marketCountries"])
 
     def test_market_catalogue_too_much_data_retries_smaller_windows_and_dedupes(self) -> None:
         class FakeBetting:

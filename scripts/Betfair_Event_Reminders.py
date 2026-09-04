@@ -60,7 +60,7 @@ WINNER = "WINNER"
 OUTRIGHT_WINNER = "OUTRIGHT_WINNER"
 STAGE_WINNER = "STAGE_WINNER"
 ATHLETICS_OUTRIGHT_MARKET_TYPES = frozenset({WINNER, OUTRIGHT_WINNER, "GOLD_MEDAL_WINNER"})
-DISALLOWED_COUNTRY_CODES = frozenset({"AU"})
+DISALLOWED_COUNTRY_CODES = frozenset({"AU", "NZ"})
 AUSTRALIAN_WALLET_NAMES = frozenset({"australian wallet", "aus wallet", "au wallet"})
 AUSTRALIAN_REGULATOR_TERMS = (
     "australia",
@@ -96,6 +96,7 @@ BLACKLISTED_RUGBY_COMPETITIONS: dict[str, frozenset[str]] = {
         {
             "super rugby pacific",
             "nz npc",
+            "new zealand npc",
             "bledisloe cup",
         }
     ),
