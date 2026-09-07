@@ -42,8 +42,8 @@ LOG_DIR = PROJECT_ROOT / "logs"
 
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
-# Keep next-day retimes visible so their previously queued reminders can be replaced.
-DEFAULT_LOOKAHEAD_HOURS = 48
+# Keep retimes within the next three days visible so queued reminders can be replaced.
+DEFAULT_LOOKAHEAD_HOURS = 72
 REMINDER_LEAD_MINUTES = 5
 MANUAL_MANAGEMENT_LEAD_MINUTES = 30
 BOXING_REMINDER_LEAD_MINUTES = (60, 30)
@@ -2118,7 +2118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
     parser.add_argument(
         "--lookahead-hours", type=float, default=DEFAULT_LOOKAHEAD_HOURS,
-        help="Hours to scan ahead (default: 48), including events retimed to tomorrow.",
+        help="Hours to scan ahead (default: 72), including events postponed by one or two days.",
     )
     parser.add_argument(
         "--start-now",

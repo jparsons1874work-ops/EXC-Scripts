@@ -78,34 +78,34 @@ class BetfairEventReminderTests(unittest.TestCase):
         now = datetime(2026, 7, 9, 12, 37, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 12:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-11 12:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-12 12:00 BST")
 
     def test_uk_scan_window_converts_to_utc(self) -> None:
         now = datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_utc, datetime(2026, 7, 9, 11, 0, tzinfo=timezone.utc))
-        self.assertEqual(window.end_utc, datetime(2026, 7, 11, 11, 0, tzinfo=timezone.utc))
+        self.assertEqual(window.end_utc, datetime(2026, 7, 12, 11, 0, tzinfo=timezone.utc))
 
     def test_1500_uk_scan_window(self) -> None:
         now = datetime(2026, 7, 9, 15, 2, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 15:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-11 15:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-12 15:00 BST")
 
     def test_2300_uk_scan_window(self) -> None:
         now = datetime(2026, 7, 9, 23, 2, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-09 23:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-11 23:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-12 23:00 BST")
 
     def test_early_morning_uses_current_hour_scan_window(self) -> None:
         now = datetime(2026, 7, 10, 6, 59, tzinfo=UK_TZ)
         window = build_scan_window(now_uk=now)
         self.assertEqual(window.start_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-10 06:00 BST")
-        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-12 06:00 BST")
+        self.assertEqual(window.end_uk.strftime("%Y-%m-%d %H:%M %Z"), "2026-07-13 06:00 BST")
 
     def test_cli_scan_window_default_and_override(self) -> None:
-        for arguments, expected_hours in (([], 48), (["--lookahead-hours", "72"], 72)):
+        for arguments, expected_hours in (([], 72), (["--lookahead-hours", "48"], 48)):
             with self.subTest(arguments=arguments), patch.object(sys, "argv", ["reminders", *arguments]):
                 args = reminders.parse_args()
                 self.assertEqual(args.lookahead_hours, expected_hours)
@@ -126,23 +126,30 @@ class BetfairEventReminderTests(unittest.TestCase):
         old_record = reminders.state_record(
             old_market, duplicate_key(old_market, old_post_epoch, "C123"), old_post_epoch, "Q-old",
         )
-        retimed = replace(
-            old_market,
-            event_start_utc=datetime(2026, 9, 8, 12, 5, tzinfo=UK_TZ).astimezone(timezone.utc),
-        )
+        for retimed_day, shorter_window in ((8, 24), (9, 48)):
+            with self.subTest(retimed_day=retimed_day):
+                retimed = replace(
+                    old_market,
+                    event_start_utc=datetime(2026, 9, retimed_day, 12, 5, tzinfo=UK_TZ).astimezone(timezone.utc),
+                )
 
-        # The former 24-hour scan missed the retime and left today's message queued.
-        self.assertEqual(select_market_reminders([retimed], "Cycling", build_scan_window(now, 24)), [])
-        selected = select_market_reminders([retimed], "Cycling", build_scan_window(now))
-        self.assertEqual(len(selected), 1)
-        new_post_epoch = int(reminder_time(selected[0].event_start_utc).timestamp())
-        self.assertEqual(datetime.fromtimestamp(new_post_epoch, UK_TZ), datetime(2026, 9, 8, 12, 0, tzinfo=UK_TZ))
-        self.assertEqual(
-            reminders.superseded_scheduled_records(
-                {"scheduled": [old_record]}, selected[0], new_post_epoch, "C123", int(now.timestamp()),
-            ),
-            [old_record],
-        )
+                # Shorter scans miss the retime and leave today's message queued.
+                self.assertEqual(
+                    select_market_reminders([retimed], "Cycling", build_scan_window(now, shorter_window)), [],
+                )
+                selected = select_market_reminders([retimed], "Cycling", build_scan_window(now))
+                self.assertEqual(len(selected), 1)
+                new_post_epoch = int(reminder_time(selected[0].event_start_utc).timestamp())
+                self.assertEqual(
+                    datetime.fromtimestamp(new_post_epoch, UK_TZ),
+                    datetime(2026, 9, retimed_day, 12, 0, tzinfo=UK_TZ),
+                )
+                self.assertEqual(
+                    reminders.superseded_scheduled_records(
+                        {"scheduled": [old_record]}, selected[0], new_post_epoch, "C123", int(now.timestamp()),
+                    ),
+                    [old_record],
+                )
 
     def test_event_start_minus_five_minutes(self) -> None:
         event_start = datetime(2026, 7, 9, 14, 0, tzinfo=timezone.utc)
@@ -476,7 +483,7 @@ class BetfairEventReminderTests(unittest.TestCase):
 
     def test_politics_market_outside_window_is_excluded(self) -> None:
         window = build_scan_window(datetime(2026, 7, 9, 12, 0, tzinfo=UK_TZ))
-        item = reminder("Politics", "event-1", datetime(2026, 7, 11, 12, 1, tzinfo=UK_TZ))
+        item = reminder("Politics", "event-1", datetime(2026, 7, 12, 12, 1, tzinfo=UK_TZ))
         self.assertEqual(select_market_reminders([item], "Politics", window), [])
 
     def test_politics_reminder_is_five_minutes_before_market_start_and_dedupes_by_market_id(self) -> None:
