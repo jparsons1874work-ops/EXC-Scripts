@@ -272,11 +272,31 @@ def is_valid_name(name: str, allow_suffix_digit: bool = False) -> bool:
     return not NAME_LOOKS_ABBREVIATED.match(name)
 
 
-def _available_xvfb_display() -> str:
-    for number in range(90, 190):
-        if not Path(f"/tmp/.X11-unix/X{number}").exists():
+def _available_xvfb_display(excluded: set[int] | None = None) -> str:
+    excluded = excluded or set()
+    # Starting from a PID-derived number makes simultaneous Hub jobs much less
+    # likely to select the same display before either has created its socket.
+    start = os.getpid() % 100
+    for offset in range(100):
+        number = 90 + ((start + offset) % 100)
+        if number in excluded:
+            continue
+        socket_path = Path(f"/tmp/.X11-unix/X{number}")
+        lock_path = Path(f"/tmp/.X{number}-lock")
+        if not socket_path.exists() and not lock_path.exists():
             return f":{number}"
     return f":{200 + (os.getpid() % 700)}"
+
+
+def _stop_xvfb(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
 
 
 @contextmanager
@@ -301,34 +321,51 @@ def browser_display() -> Iterator[bool]:
         yield True
         return
 
-    display = _available_xvfb_display()
-    process = subprocess.Popen(
-        [xvfb, display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    socket_path = Path(f"/tmp/.X11-unix/X{display.lstrip(':')}")
-    try:
-        for _ in range(50):
-            if process.poll() is not None:
-                raise RuntimeError("Xvfb stopped before its display became ready")
+    process = None
+    display = ""
+    attempted_displays: set[int] = set()
+    failure_reason = "did not create its display socket"
+    for attempt in range(1, 4):
+        display = _available_xvfb_display(attempted_displays)
+        attempted_displays.add(int(display.lstrip(":")))
+        candidate = subprocess.Popen(
+            [xvfb, display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        socket_path = Path(f"/tmp/.X11-unix/X{display.lstrip(':')}")
+        ready = False
+        for _ in range(150):
+            if candidate.poll() is not None:
+                break
             if socket_path.exists():
+                ready = True
                 break
             time.sleep(0.1)
-        else:
-            raise RuntimeError("Xvfb did not become ready within five seconds")
+        if ready:
+            process = candidate
+            break
+
+        _stop_xvfb(candidate)
+        stderr = candidate.stderr.read().strip() if candidate.stderr is not None else ""
+        if candidate.stderr is not None:
+            candidate.stderr.close()
+        failure_reason = stderr.splitlines()[-1] if stderr else "did not create its display socket within 15 seconds"
+        log(f"WARNING: Xvfb attempt {attempt}/3 on {display} failed: {failure_reason}")
+
+    if process is None:
+        raise RuntimeError(f"Xvfb did not become ready after three attempts ({failure_reason})")
+
+    try:
         os.environ["DISPLAY"] = display
         log(f"Golf browser virtual display ready on {display}.")
         yield False
     finally:
         os.environ.pop("DISPLAY", None)
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
+        _stop_xvfb(process)
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def read_field(page: Page, site_def: dict[str, Any], timeout_s: float = 60.0) -> dict[str, list[str]]:

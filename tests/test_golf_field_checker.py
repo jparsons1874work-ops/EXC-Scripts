@@ -194,6 +194,19 @@ class GolfFieldCheckerTests(unittest.TestCase):
             golf.validate_site_url("pgatour", "https://www.pgatour.com/tournaments/2026/EXAMPLE/field")
         )
 
+    def test_xvfb_display_selection_avoids_socket_and_lock_collisions(self) -> None:
+        def path_exists(path) -> bool:
+            value = str(path)
+            return value.endswith("X124") or value.endswith(".X125-lock")
+
+        with (
+            patch.object(golf.os, "getpid", return_value=1234),
+            patch.object(golf.Path, "exists", autospec=True, side_effect=path_exists),
+        ):
+            display = golf._available_xvfb_display()
+
+        self.assertEqual(display, ":126")
+
     def test_page_reader_splits_field_and_reserve_in_document_order(self) -> None:
         try:
             from playwright.sync_api import sync_playwright
