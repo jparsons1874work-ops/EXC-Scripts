@@ -42,6 +42,8 @@ LOG_DIR = PROJECT_ROOT / "logs"
 
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
+# Keep next-day retimes visible so their previously queued reminders can be replaced.
+DEFAULT_LOOKAHEAD_HOURS = 48
 REMINDER_LEAD_MINUTES = 5
 MANUAL_MANAGEMENT_LEAD_MINUTES = 30
 BOXING_REMINDER_LEAD_MINUTES = (60, 30)
@@ -547,7 +549,11 @@ def latest_scheduled_scan_start(now_uk: datetime) -> datetime:
     return now.replace(minute=0, second=0, microsecond=0)
 
 
-def build_scan_window(now_uk: datetime | None = None, lookahead_hours: float = 24, start_now: bool = False) -> ScanWindow:
+def build_scan_window(
+    now_uk: datetime | None = None,
+    lookahead_hours: float = DEFAULT_LOOKAHEAD_HOURS,
+    start_now: bool = False,
+) -> ScanWindow:
     now = now_uk.astimezone(UK_TZ) if now_uk else datetime.now(UK_TZ)
     if start_now:
         start_uk = now
@@ -2110,7 +2116,10 @@ def parse_args() -> argparse.Namespace:
         help="Print a broad Cycling catalogue scan, without scheduling Slack or writing reminder state.",
     )
     parser.add_argument("--pause-on-exit", action="store_true", help="Wait for Enter before closing the console.")
-    parser.add_argument("--lookahead-hours", type=float, default=24)
+    parser.add_argument(
+        "--lookahead-hours", type=float, default=DEFAULT_LOOKAHEAD_HOURS,
+        help="Hours to scan ahead (default: 48), including events retimed to tomorrow.",
+    )
     parser.add_argument(
         "--start-now",
         action="store_true",

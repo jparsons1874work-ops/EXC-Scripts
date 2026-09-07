@@ -218,10 +218,12 @@ journalctl -u betfair-scripts -f
 ### Betfair event reminders timer
 
 The reminders scan runs hourly from a separate systemd timer in Europe/London time.
-Every launch scans the next 24 hours from the start of that hour. The
+Every launch scans the next 48 hours from the start of that hour. The
 shared reminder state file prevents an event found in overlapping scans from being
 scheduled in Slack more than once. If Betfair moves an event time, the scan removes the
-outdated scheduled Slack message before scheduling its replacement.
+outdated scheduled Slack message before scheduling its replacement. The wider window
+keeps next-day retimes visible during morning scans; retimes beyond the scan window
+are still only reconciled when they re-enter it.
 
 Install and start the timer:
 
