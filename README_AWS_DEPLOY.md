@@ -51,6 +51,15 @@ cd /opt/betfair-scripts
 
 If Selenium Manager cannot fetch or start a driver on the server, install a matching ChromeDriver and set `CHROMEDRIVER_PATH` in `/opt/betfair-scripts/.env`.
 
+For `session not created` / `chrome not reachable`, test actual browser startup as the Hub's service user without logging into either fixture provider:
+
+```bash
+cd /opt/betfair-scripts
+/opt/betfair-scripts/.venv/bin/python scripts/exc-cric-time-check/web_time_check_runner.py --check-browser
+```
+
+The checker creates a fresh session profile beneath `CHROME_PROFILE_DIR` (or `runtime/output/chrome_profiles`) and removes that child profile on normal shutdown or failed startup. It first connects through a DevTools pipe; connection/startup failures get one retry using an automatically allocated port and another fresh profile. Driver discovery, version mismatch, and configuration errors fail immediately. Warning-level ChromeDriver logs are saved under `runtime/output/cricket_time_debug`, with the exact paths included in startup errors. If both attempts fail, inspect those logs and the server's memory/disk/kernel diagnostics; an unreachable browser alone does not establish the underlying cause.
+
 Install Nginx only when you are ready for the reverse proxy:
 
 ```bash

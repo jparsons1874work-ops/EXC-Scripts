@@ -12,6 +12,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import traceback
 import urllib.request
 from dataclasses import dataclass, field
@@ -269,13 +270,18 @@ def parse_args() -> argparse.Namespace:
         help="Print Chrome, ChromeDriver, OS, and architecture diagnostics without logging into Betfair or Decimal.",
     )
     parser.add_argument(
+        "--check-browser",
+        action="store_true",
+        help="Start Chrome and check a local blank page without logging into Betfair or Decimal.",
+    )
+    parser.add_argument(
         "--debug-decimal",
         action="store_true",
         help="Print Decimal fixture scraping diagnostics and write safe debug artifacts under runtime/output.",
     )
     args = parser.parse_args()
-    if not args.debug_browser and not args.today and not args.tomorrow:
-        parser.error("one of --today or --tomorrow is required unless --debug-browser is used")
+    if not args.debug_browser and not args.check_browser and not args.today and not args.tomorrow:
+        parser.error("one of --today or --tomorrow is required unless --debug-browser or --check-browser is used")
     return args
 
 
@@ -808,16 +814,30 @@ def fetch_betfair_fixtures(target_day: date, verbose: bool) -> list[Fixture]:
     return sorted(fixtures_by_event.values(), key=lambda item: item.start_time)
 
 
-def build_chrome_driver() -> WebDriver:
-    """Create a Chrome WebDriver instance."""
-    machine = (platform.machine() or "").lower()
-    if platform.system().lower() == "linux" and machine and machine not in SUPPORTED_LINUX_MACHINES:
-        raise RuntimeError(f"Unsupported Linux architecture for Chrome automation: {machine}")
+class DecimalChromeDriver(webdriver.Chrome):
+    """Release only this session's temporary profile when its browser closes."""
 
-    chrome_binary = detect_chrome_binary()
-    chromedriver_binary = detect_chromedriver_binary()
+    def __init__(self, *, profile: tempfile.TemporaryDirectory, **kwargs):
+        self._decimal_profile = profile
+        super().__init__(**kwargs)
+
+    def quit(self) -> None:
+        try:
+            super().quit()
+        finally:
+            self._decimal_profile.cleanup()
+
+
+def chrome_options(chrome_binary: str, profile_dir: str, transport: str) -> ChromeOptions:
+    """Use an isolated profile and an explicit DevTools connection method."""
     options = ChromeOptions()
     options.binary_location = chrome_binary
+    options.add_argument(f"--user-data-dir={profile_dir}")
+    options.add_argument(
+        "--remote-debugging-pipe" if transport == "pipe" else "--remote-debugging-port=0"
+    )
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
     if DECIMAL_HEADLESS:
         options.add_argument("--headless=new")
     options.page_load_strategy = "eager"
@@ -841,17 +861,70 @@ def build_chrome_driver() -> WebDriver:
             "profile.default_content_setting_values.images": 2,
         },
     )
-    try:
-        if chromedriver_binary:
-            return webdriver.Chrome(service=Service(executable_path=chromedriver_binary), options=options)
-        return webdriver.Chrome(options=options)
-    except WebDriverException as exc:
-        diagnostics = format_browser_diagnostics(browser_diagnostics(chrome_binary, chromedriver_binary))
-        raise RuntimeError(
-            "ChromeDriver/Selenium Manager failed to start Chrome.\n"
-            f"{diagnostics}\n"
-            f"Root error: {exc}"
-        ) from exc
+    return options
+
+
+def build_chrome_driver() -> WebDriver:
+    """Start Chrome with one fresh-profile fallback for connection/startup failures."""
+    machine = (platform.machine() or "").lower()
+    if platform.system().lower() == "linux" and machine and machine not in SUPPORTED_LINUX_MACHINES:
+        raise RuntimeError(f"Unsupported Linux architecture for Chrome automation: {machine}")
+
+    chrome_binary = detect_chrome_binary()
+    chromedriver_binary = detect_chromedriver_binary()
+    profile_root = Path(
+        os.getenv("CHROME_PROFILE_DIR", "").strip()
+        or PROJECT_ROOT / "runtime" / "output" / "chrome_profiles"
+    ).resolve()
+    profile_root.mkdir(parents=True, exist_ok=True)
+    DECIMAL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    failures = []
+    for attempt, transport in enumerate(("pipe", "port"), start=1):
+        # A child directory prevents concurrent runs and retries sharing profile locks.
+        profile = tempfile.TemporaryDirectory(
+            prefix="decimal_", dir=profile_root, ignore_cleanup_errors=True
+        )
+        log_path = DECIMAL_DEBUG_DIR / f"{Path(profile.name).name}_chromedriver.log"
+        service = None
+        try:
+            options = chrome_options(chrome_binary, profile.name, transport)
+            # Warning level avoids logging WebDriver commands containing login credentials.
+            service = Service(
+                executable_path=chromedriver_binary or None,
+                log_output=str(log_path),
+                service_args=["--log-level=WARNING"],
+            )
+            # Selenium may fail during driver discovery before creating this attribute.
+            service.process = None
+            return DecimalChromeDriver(profile=profile, service=service, options=options)
+        except Exception as exc:
+            if service is not None:
+                service.stop()
+            profile.cleanup()
+            failures.append(
+                f"Attempt {attempt} ({transport}): {exc}\nChromeDriver log: {log_path}"
+            )
+            message = str(exc).lower()
+            retryable = isinstance(exc, WebDriverException) and any(
+                marker in message for marker in (
+                    "chrome not reachable", "chrome failed to start", "chrome instance exited",
+                    "devtoolsactiveport", "cannot connect to chrome",
+                    "unable to discover open pages", "timed out receiving message from renderer",
+                )
+            )
+            if attempt == 1 and retryable:
+                print(
+                    "[decimal-browser] Chrome startup failed using pipe; retrying once "
+                    f"using an automatic port and a fresh profile. Startup log: {log_path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            diagnostics = format_browser_diagnostics(browser_diagnostics(chrome_binary, chromedriver_binary))
+            raise RuntimeError(
+                "ChromeDriver/Selenium Manager failed to start Chrome.\n"
+                f"{diagnostics}\n" + "\n".join(failures)
+            ) from exc
 
 
 def wait_for_first_present(
@@ -2751,8 +2824,18 @@ def main() -> int:
     args = parse_args()
     total_start = perf_counter()
     try:
-        if args.debug_browser:
+        if args.debug_browser or args.check_browser:
             print_browser_diagnostics()
+            if args.check_browser:
+                driver = build_chrome_driver()
+                try:
+                    driver.set_page_load_timeout(15)
+                    driver.get("about:blank")
+                    if driver.execute_script("return document.readyState") != "complete":
+                        raise RuntimeError("Chrome started but the blank-page check did not complete.")
+                    print("Chrome startup check: OK")
+                finally:
+                    driver.quit()
             return 0
 
         validate_config()
