@@ -451,7 +451,7 @@ class TennisChallengerTests(unittest.TestCase):
         alerts = pending_alerts(None, match)
         self.assertEqual(alerts, ["serve_detected"])
         self.assertEqual(match["server"], "Kopp S.")
-        self.assertIn(":alert-party:", slack_message("serve_detected", match))
+        self.assertIn(":alert_party:", slack_message("serve_detected", match))
         self.assertIn("toss decided", slack_message("serve_detected", match))
 
     def test_scheduled_server_then_live_row_sends_separate_toss_and_start_alerts(self) -> None:

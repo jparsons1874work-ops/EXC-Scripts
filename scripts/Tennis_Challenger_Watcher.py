@@ -565,7 +565,7 @@ def slack_message(alert_type: str, match: dict[str, Any]) -> str:
         f"*Betfair event ID:* `{betfair_event_id}`" if betfair_event_id else "*Betfair event ID:* Not matched",
     ]
     if alert_type == "serve_detected":
-        lines = [":alert-party: 🎾 *Manual tennis — toss decided*", *common]
+        lines = [":alert_party: 🎾 *Manual tennis — toss decided*", *common]
         lines.append(f"*First server:* {match.get('server', 'Detected')}")
         if match.get("start_time"):
             lines.append(f"*Scheduled:* {match['start_time']}")

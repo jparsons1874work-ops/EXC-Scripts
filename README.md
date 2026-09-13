@@ -124,7 +124,7 @@ The tennis integrity scanner needs an operational `integrity_list.xlsx` file in 
 
 Open **Tennis - Challenger Watcher** in the Hub, paste one Flashscore Challenger Men singles or doubles tournament link per line, save the weekly list, and select **Start watcher**. The page shows every discovered match, current live scores, the detected server, and recent Slack alerts.
 
-The watcher sends exactly-once Slack alerts when the first server appears before play, when the match starts, and when the match ends. Set 1 and Set 2 do not produce Slack alerts in any competition. The toss message includes the `:alert-party:` Slack emoji. **Check game betting** makes a read-only Betfair API comparison for scheduled matches; a red cross means game-by-game markets are still present, while a green tick means none were returned for the matched Betfair event.
+The watcher sends exactly-once Slack alerts when the first server appears before play, when the match starts, and when the match ends. Set 1 and Set 2 do not produce Slack alerts in any competition. The toss message includes the `:alert_party:` Slack emoji. **Check game betting** makes a read-only Betfair API comparison for scheduled matches; a red cross means game-by-game markets are still present, while a green tick means none were returned for the matched Betfair event.
 
 Davis Cup individual-match pages are supported through the player-level Flashscore ATP singles page, such as `https://www.flashscore.com/tennis/atp-singles/davis-cup-world-group/`.
 
