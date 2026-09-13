@@ -49,7 +49,6 @@ from scripts.Tennis_Challenger_Watcher import (
     parse_tournament_feed,
     pending_alerts,
     prune_expired_finished_matches,
-    set_alerts_enabled,
     should_scan_match_detail,
     should_refresh_betfair_events,
     slack_message,
@@ -62,6 +61,7 @@ AUGSBURG_URL = "https://www.flashscore.com/tennis/challenger-men-singles/augsbur
 ITF_URL = "https://www.flashscore.com/tennis/itf-women-singles/w35-roehampton/"
 ATP_URL = "https://www.flashscore.com/tennis/atp-singles/us-open/"
 WTA_URL = "https://www.flashscore.com/tennis/wta-singles/us-open/"
+DAVIS_CUP_URL = "https://www.flashscore.com/tennis/atp-singles/davis-cup-world-group/"
 MATCH_URL = (
     "https://www.flashscore.com/match/tennis/martin-andres-h2AG5rdm/"
     "mayo-aidan-2mEGNcVp/?mid=r7R6cLgK"
@@ -301,6 +301,27 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(normalize_tournament_url(ATP_URL + "fixtures/"), ATP_URL)
         self.assertEqual(normalize_tournament_url(WTA_URL + "draw/"), WTA_URL)
 
+    def test_davis_cup_individual_matches_page_uses_the_tournament_feed_pipeline(self) -> None:
+        self.assertEqual(
+            normalize_tournament_url(DAVIS_CUP_URL + "fixtures/"),
+            DAVIS_CUP_URL,
+        )
+        html = (
+            'sport_id":2; country_id = 8;tournament_id = "Davis26"; '
+            '"feed_sign":"DavisFeed"'
+        )
+        config = extract_feed_config(html, DAVIS_CUP_URL)
+        self.assertEqual(config["source_url"], DAVIS_CUP_URL)
+        self.assertIn("t_2_8_Davis26_", config["feed_url"])
+
+        payload = (
+            "SA÷2¬~"
+            "AA÷davis-match-1¬AD÷1789286400¬AB÷1¬AE÷Evans D.¬AF÷Moutet C.¬~"
+        )
+        rows = parse_tournament_feed(payload, DAVIS_CUP_URL)
+        self.assertEqual([(row["player1"], row["player2"]) for row in rows], [("Evans D.", "Moutet C.")])
+        self.assertEqual(rows[0]["url"], "https://www.flashscore.com/match/tennis/davis-match-1/")
+
     def test_single_match_links_are_normalized_and_keep_the_match_id(self) -> None:
         source = MATCH_URL + "&utm_source=operations"
         self.assertEqual(normalize_tournament_url(source), MATCH_URL)
@@ -430,6 +451,7 @@ class TennisChallengerTests(unittest.TestCase):
         alerts = pending_alerts(None, match)
         self.assertEqual(alerts, ["serve_detected"])
         self.assertEqual(match["server"], "Kopp S.")
+        self.assertIn(":alert-party:", slack_message("serve_detected", match))
         self.assertIn("toss decided", slack_message("serve_detected", match))
 
     def test_scheduled_server_then_live_row_sends_separate_toss_and_start_alerts(self) -> None:
@@ -598,7 +620,7 @@ class TennisChallengerTests(unittest.TestCase):
         ):
             self.assertEqual(slack_webhook_url(), "https://hooks.slack.test/challenger")
 
-    def test_match_transitions_alert_in_operational_order(self) -> None:
+    def test_match_transitions_only_alert_for_start_and_finish(self) -> None:
         scheduled = normalize_scraped_match(raw_match(), AUGSBURG_URL, "Augsburg (Singles)")
         scheduled["alerts_sent"] = hydrate_initial_alert_flags(scheduled)
 
@@ -637,7 +659,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(alerts, [])
         confirmed_set_2 = {**live_set_2, "alerts_sent": dict(live_set_2["alerts_sent"])}
         alerts = pending_alerts(live_set_2, confirmed_set_2)
-        self.assertEqual(alerts, ["set_1_complete"])
+        self.assertEqual(alerts, [])
         apply_sent(confirmed_set_2, alerts)
 
         live_set_3 = normalize_scraped_match(
@@ -657,7 +679,7 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(alerts, [])
         confirmed_set_3 = {**live_set_3, "alerts_sent": dict(live_set_3["alerts_sent"])}
         alerts = pending_alerts(live_set_3, confirmed_set_3)
-        self.assertEqual(alerts, ["set_2_complete"])
+        self.assertEqual(alerts, [])
         apply_sent(confirmed_set_3, alerts)
 
         finished = normalize_scraped_match(
@@ -677,7 +699,7 @@ class TennisChallengerTests(unittest.TestCase):
         confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
         self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
-    def test_itf_matches_skip_set_alerts_but_keep_match_complete(self) -> None:
+    def test_itf_match_has_no_midmatch_alert_but_keeps_match_complete(self) -> None:
         live_set_2 = normalize_scraped_match(
             raw_match(
                 raw_status="Set 2",
@@ -693,7 +715,6 @@ class TennisChallengerTests(unittest.TestCase):
         live_set_2["alerts_sent"] = {"match_started": True}
         repeated_live_set_2 = {**live_set_2, "alerts_sent": dict(live_set_2["alerts_sent"])}
 
-        self.assertFalse(set_alerts_enabled(live_set_2))
         concatenated_itf = {
             **live_set_2,
             "tournament": (
@@ -704,14 +725,11 @@ class TennisChallengerTests(unittest.TestCase):
             "player1": "Sieg M.",
             "player2": "Wolff V.",
         }
-        self.assertFalse(set_alerts_enabled(concatenated_itf))
         self.assertEqual(
             pending_alerts(concatenated_itf, {**concatenated_itf}),
             [],
         )
         self.assertEqual(pending_alerts(live_set_2, repeated_live_set_2), [])
-        self.assertTrue(set_alerts_enabled({"tournament": "ATP US Open"}))
-        self.assertTrue(set_alerts_enabled({"tournament": "WTA US Open"}))
 
         finished = {
             **repeated_live_set_2,
@@ -723,7 +741,7 @@ class TennisChallengerTests(unittest.TestCase):
         confirmed_finished = {**finished, "alerts_sent": dict(finished["alerts_sent"])}
         self.assertEqual(pending_alerts(finished, confirmed_finished), ["match_complete"])
 
-    def test_all_doubles_matches_skip_set_alerts(self) -> None:
+    def test_doubles_matches_have_no_midmatch_alerts(self) -> None:
         challenger_doubles = {
             "status": "live",
             "current_set_number": 2,
@@ -737,17 +755,6 @@ class TennisChallengerTests(unittest.TestCase):
             "tournament": "ATP - DOUBLES: US Open",
             "source_url": MATCH_URL,
         }
-        direct_pair_without_competition_label = {
-            **challenger_doubles,
-            "tournament": "Single match r7R6cLgK",
-            "source_url": MATCH_URL,
-            "player1": "Player A. / Partner B.",
-            "player2": "Player C. / Partner D.",
-        }
-
-        self.assertFalse(set_alerts_enabled(challenger_doubles))
-        self.assertFalse(set_alerts_enabled(direct_doubles))
-        self.assertFalse(set_alerts_enabled(direct_pair_without_competition_label))
         self.assertEqual(
             pending_alerts(challenger_doubles, {**challenger_doubles}),
             [],
@@ -756,14 +763,12 @@ class TennisChallengerTests(unittest.TestCase):
             pending_alerts(direct_doubles, {**direct_doubles}),
             [],
         )
-        self.assertTrue(
-            set_alerts_enabled(
-                {
-                    "tournament": "US Open (ATP Singles)",
-                    "source_url": ATP_URL,
-                }
-            )
-        )
+
+    def test_set_complete_slack_messages_are_not_supported(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unsupported manual tennis alert type"):
+            slack_message("set_1_complete", raw_match())
+        with self.assertRaisesRegex(ValueError, "Unsupported manual tennis alert type"):
+            slack_message("set_2_complete", raw_match())
 
     def test_straight_sets_finish_sends_only_match_complete(self) -> None:
         previous = normalize_scraped_match(
@@ -1215,7 +1220,7 @@ class TennisChallengerTests(unittest.TestCase):
         )
         html = hub.templates.get_template("tennis_challenger.html").render(context)
         self.assertIn("Manual Tennis Watcher", html)
-        self.assertIn("ITF and all doubles alerts", html)
+        self.assertIn("All competitions send three alerts", html)
         self.assertIn("Start watcher", html)
         self.assertNotIn("Check game betting", html)
         self.assertNotIn("Game betting", html)

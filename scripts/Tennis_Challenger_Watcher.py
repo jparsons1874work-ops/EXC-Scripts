@@ -57,8 +57,6 @@ COMPLETED_STATUSES = {"finished", "retired", "walkover", "abandoned", "cancelled
 ALERT_FLAG_BY_TYPE = {
     "serve_detected": "serve_detected",
     "match_started": "match_started",
-    "set_1_complete": "set_1_complete",
-    "set_2_complete": "set_2_complete",
     "match_complete": "match_complete",
 }
 DEFAULT_POLL_SECONDS = 10.0
@@ -435,43 +433,14 @@ def satisfied_alerts(match: dict[str, Any]) -> dict[str, bool]:
         return {
             "serve_detected": False,
             "match_started": False,
-            "set_1_complete": False,
-            "set_2_complete": False,
             "match_complete": False,
         }
-    current_set = int(match.get("current_set_number") or 0)
     completed = status == "finished" and bool(match.get("completion_confirmed"))
-    set_count = len(match.get("sets", []) or [])
     return {
         "serve_detected": bool(status == "scheduled" and match.get("server")),
         "match_started": status == "live" or completed,
-        "set_1_complete": current_set >= 2 or (completed and set_count >= 1),
-        "set_2_complete": current_set >= 3 or (completed and set_count >= 2),
         "match_complete": completed,
     }
-
-
-def set_alerts_enabled(match: dict[str, Any]) -> bool:
-    competition = str(match.get("tournament", "") or "")
-    source_url = str(match.get("source_url", "") or "")
-    participants = " ".join(
-        [
-            str(match.get("player1", "") or ""),
-            str(match.get("player2", "") or ""),
-        ]
-    )
-    is_doubles_pair = "/" in participants or bool(re.search(r"\s(?:&|\+)\s", participants))
-    # Flashscore's detail-page heading can concatenate nested nodes into values
-    # such as "TennisITF WOMEN - SINGLESW50...". Compare a compact key so the
-    # ITF/doubles policy does not depend on spaces or punctuation in that DOM.
-    competition_key = re.sub(r"[^a-z0-9]+", "", competition.casefold())
-    source_path = urlparse(source_url).path.casefold()
-    excluded_competition = (
-        "itf" in competition_key
-        or "doubles" in competition_key
-        or bool(re.search(r"/tennis/itf-[^/]+/|/tennis/[^/]*doubles[^/]*/", source_path))
-    )
-    return not excluded_competition and not is_doubles_pair
 
 
 def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> list[str]:
@@ -495,14 +464,12 @@ def pending_alerts(previous: dict[str, Any] | None, match: dict[str, Any]) -> li
         ):
             return ["match_complete"]
         return []
-    order = ["serve_detected", "match_started", "set_1_complete", "set_2_complete", "match_complete"]
+    # Set scores remain visible in the Hub and final message, but operations
+    # only receives the toss, match-started and match-complete alerts.
+    order = ["serve_detected", "match_started", "match_complete"]
     alerts: list[str] = []
     for alert_type in order:
         if alert_type == "serve_detected" and match.get("status") != "scheduled":
-            continue
-        if alert_type in {"set_1_complete", "set_2_complete"} and not set_alerts_enabled(match):
-            continue
-        if alert_type in {"set_1_complete", "set_2_complete"} and not previously_satisfied[alert_type]:
             continue
         if satisfied[alert_type] and not sent.get(ALERT_FLAG_BY_TYPE[alert_type]):
             alerts.append(alert_type)
@@ -530,8 +497,6 @@ def hydrate_initial_alert_flags(match: dict[str, Any]) -> dict[str, bool]:
         return satisfied
     if match.get("status") == "live":
         satisfied["serve_detected"] = True
-        satisfied["set_1_complete"] = False
-        satisfied["set_2_complete"] = False
         satisfied["match_complete"] = False
         satisfied["match_started"] = False
         return satisfied
@@ -600,22 +565,20 @@ def slack_message(alert_type: str, match: dict[str, Any]) -> str:
         f"*Betfair event ID:* `{betfair_event_id}`" if betfair_event_id else "*Betfair event ID:* Not matched",
     ]
     if alert_type == "serve_detected":
-        lines = ["🎾 *Manual tennis — toss decided*", *common]
+        lines = [":alert-party: 🎾 *Manual tennis — toss decided*", *common]
         lines.append(f"*First server:* {match.get('server', 'Detected')}")
         if match.get("start_time"):
             lines.append(f"*Scheduled:* {match['start_time']}")
         lines.append("Prepare to turn the match in play when play begins.")
     elif alert_type == "match_started":
         lines = ["🟢 *Manual tennis — match started*", *common, f"*Score:* {score_text(match)}", "*Action:* TIP required."]
-    elif alert_type == "set_1_complete":
-        lines = ["✅ *Manual tennis — Set 1 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 1 settlement required."]
-    elif alert_type == "set_2_complete":
-        lines = ["✅ *Manual tennis — Set 2 complete*", *common, f"*Score:* {score_text(match)}", "*Action:* Set 2 settlement required."]
-    else:
+    elif alert_type == "match_complete":
         reason = str(match.get("finish_reason", "") or "")
         heading = "🏁 *Manual tennis — match complete*" if not reason else f"⚠️ *Manual tennis — match ended ({reason.upper()})*"
         action = "*Action:* Match settlement required." if not reason else "*Action:* Manual review and match settlement required."
         lines = [heading, *common, f"*Final score:* {score_text(match)}", action]
+    else:
+        raise ValueError(f"Unsupported manual tennis alert type: {alert_type}")
     if url:
         lines.append(f"<{url}|Open Flashscore match>")
     return "\n".join(lines)
