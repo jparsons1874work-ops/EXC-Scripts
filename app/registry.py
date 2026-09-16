@@ -85,13 +85,6 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         auto_start_on_hub_start=True,
     ),
     script(
-        "Cricket - Decimal Fixture Scrape",
-        "Cricket",
-        "Scrapes Decimal cricket fixtures and writes the latest output workbook.",
-        "scripts/Decimal_Cricket_Scrape_Auto.py",
-        timeout_seconds=20 * 60,
-    ),
-    script(
         "SAMM - Selection Name Check",
         "SAMM",
         "Extracts selection names and probabilities from Polymarket or Kalshi.",
