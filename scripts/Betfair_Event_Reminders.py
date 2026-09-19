@@ -85,6 +85,7 @@ BLACKLISTED_RUGBY_COMPETITIONS: dict[str, frozenset[str]] = {
     "rugby league": frozenset(
         {
             "nrl",
+            "nrlw",
             "womens nrl",
             "state of origin",
             "womens state of origin",

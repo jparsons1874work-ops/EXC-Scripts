@@ -831,6 +831,7 @@ class BetfairEventReminderTests(unittest.TestCase):
         competitions = {
             "Rugby League": (
                 "NRL",
+                "NRLW",
                 "Womens NRL",
                 "State of Origin",
                 "Womens State of Origin",
