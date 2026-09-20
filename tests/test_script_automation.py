@@ -95,6 +95,19 @@ class ScriptAutomationTests(unittest.TestCase):
 
         runner.start.assert_called_once_with(spec.id, [])
 
+    def test_manual_watcher_starts_with_hub_day_and_night_without_duplicates(self) -> None:
+        spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
+        for hour in (0, 12, 23):
+            with self.subTest(hour=hour):
+                runner = automation_runner()
+                at = datetime(2026, 8, 1, hour, 10, tzinfo=UK_TZ)
+                with patch.dict(runner_module.SCRIPTS_BY_ID, {spec.id: spec}, clear=True):
+                    runner.run_automations(catch_up=True, at=at)
+                    runner.start.assert_called_once_with(spec.id, list(spec.default_args))
+                    runner.get_state.return_value = SimpleNamespace(status="running")
+                    runner.run_automations(catch_up=True, at=at)
+                    runner.start.assert_called_once()
+
     def test_restart_stops_active_job_before_starting_fresh_process(self) -> None:
         runner = ScriptRunner.__new__(ScriptRunner)
         runner.get_state = Mock(

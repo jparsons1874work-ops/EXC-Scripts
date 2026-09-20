@@ -172,6 +172,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
         ("--poll-seconds", "10", "--reload-minutes", "15"),
         long_running=True,
         timeout_seconds=10 * 365 * 24 * 60 * 60,
+        auto_start_on_hub_start=True,
         id_override="tennis-challenger-watcher",
     ),
     script(

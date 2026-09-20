@@ -284,7 +284,7 @@ class TennisChallengerTests(unittest.TestCase):
     def test_registry_contains_manual_challenger_watcher(self) -> None:
         spec = SCRIPTS_BY_ID["tennis-challenger-watcher"]
         self.assertTrue(spec.long_running)
-        self.assertFalse(spec.auto_start_on_hub_start)
+        self.assertTrue(spec.auto_start_on_hub_start)
         self.assertEqual(spec.relative_path, "scripts/Tennis_Manual_Watcher_Supervisor.py")
         self.assertEqual(spec.default_args[:2], ("--poll-seconds", "10"))
 
