@@ -48,6 +48,19 @@ class GolfBetfairCheckTests(unittest.TestCase):
 
         self.assertGreaterEqual(score, checker.EVENT_MATCH_THRESHOLD)
 
+    def test_event_match_handles_concatenated_lpga_sponsored_slug(self) -> None:
+        score = checker.event_match_score(
+            "walmartnwarkansaschampionshippresentedbypg",
+            "LPGA NW Arkansas Championship 2026",
+        )
+        sponsor_only_score = checker.event_match_score(
+            "walmartnwarkansaschampionshippresentedbypg",
+            "LPGA Walmart Championship 2026",
+        )
+
+        self.assertGreaterEqual(score, checker.EVENT_MATCH_THRESHOLD)
+        self.assertGreater(score - sponsor_only_score, 0.08)
+
     def test_ambiguous_event_match_is_rejected(self) -> None:
         events = [
             checker.BetfairEvent("1", "Example Open North", "1.1", "Winner", []),

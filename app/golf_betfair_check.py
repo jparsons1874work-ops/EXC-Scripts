@@ -31,6 +31,7 @@ NAME_OVERRIDES_PATH = PROJECT_ROOT / "scripts" / "name_overrides.csv"
 EVENT_MATCH_THRESHOLD = 0.48
 GENERIC_EVENT_WORDS = {
     "golf",
+    "lpga",
     "pga",
     "tour",
     "championship",
@@ -113,6 +114,12 @@ def event_match_score(hint: str, event_name: str) -> float:
     hint_tokens = set(normalized_hint.split()) - GENERIC_EVENT_WORDS
     event_tokens = set(normalized_event.split()) - GENERIC_EVENT_WORDS
     shared_tokens = hint_tokens & event_tokens
+    compact_hint = normalized_hint.replace(" ", "")
+    compact_event = normalized_event.replace(" ", "")
+    hint_core_tokens = [token for token in normalized_hint.split() if token not in GENERIC_EVENT_WORDS]
+    event_core_tokens = [token for token in normalized_event.split() if token not in GENERIC_EVENT_WORDS]
+    hint_core = "".join(hint_core_tokens)
+    event_core = "".join(event_core_tokens)
     if hint_tokens and event_tokens:
         # Official URLs often include a current title sponsor and a long
         # "hosted by" suffix while Betfair keeps an older sponsor name. Score
@@ -128,6 +135,14 @@ def event_match_score(hint: str, event_name: str) -> float:
         token_score = len(set(normalized_hint.split()) & set(normalized_event.split())) / max(
             1, len(set(normalized_hint.split()))
         )
+    # Some LPGA URLs concatenate the full sponsored title without separators,
+    # for example walmartnwarkansaschampionshippresentedbypg. Betfair keeps
+    # only the stable tournament words (NW Arkansas). Treat that compact core
+    # as a strong token match when it appears intact inside the URL slug.
+    if len(event_core_tokens) >= 2 and len(event_core) >= 5 and event_core in compact_hint:
+        token_score = 1.0
+    elif len(hint_core_tokens) >= 2 and len(hint_core) >= 5 and hint_core in compact_event:
+        token_score = 1.0
     containment_bonus = 0.12 if normalized_hint in normalized_event or normalized_event in normalized_hint else 0.0
     return min(1.0, (0.55 * sequence_score) + (0.45 * token_score) + containment_bonus)
 
