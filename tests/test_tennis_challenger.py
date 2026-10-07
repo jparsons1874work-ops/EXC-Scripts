@@ -26,6 +26,7 @@ from app.tennis_challenger import (
     normalize_tournament_url,
     parse_tournament_links,
     participant_match_score,
+    tournament_label_from_url,
 )
 from scripts.Tennis_Challenger_Watcher import (
     ALERT_FLAG_BY_TYPE,
@@ -330,6 +331,19 @@ class TennisChallengerTests(unittest.TestCase):
         self.assertEqual(parse_tournament_links(f"{MATCH_URL}\n{MATCH_URL}"), [MATCH_URL])
         with self.assertRaises(ValueError):
             normalize_tournament_url(MATCH_URL.split("?", 1)[0])
+
+    def test_short_single_match_links_keep_the_path_match_id(self) -> None:
+        url = "https://www.flashscore.com/match/tennis/2mxPYMHk/"
+        self.assertEqual(normalize_tournament_url(url), url)
+        self.assertTrue(is_single_match_url(url))
+        self.assertEqual(flashscore_match_id(url), "2mxPYMHk")
+        self.assertEqual(tournament_label_from_url(url), "Single match 2mxPYMHk")
+        variant = url + "summary/?utm_source=operations#details"
+        self.assertEqual(normalize_tournament_url(variant), url)
+        self.assertEqual(parse_tournament_links(f"{url}\n{variant}"), [url])
+        for invalid_id in ("short", "2mxPYMHk-extra"):
+            with self.assertRaises(ValueError):
+                normalize_tournament_url(f"https://www.flashscore.com/match/tennis/{invalid_id}/")
 
     def test_single_match_page_is_converted_to_a_watcher_row(self) -> None:
         class FakePage:

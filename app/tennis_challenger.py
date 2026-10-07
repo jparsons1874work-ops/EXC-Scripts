@@ -61,6 +61,9 @@ def normalize_tournament_url(value: str) -> str:
         clean_path = "/" + "/".join(parts[:3]) + "/"
         return urlunparse(("https", "www.flashscore.com", clean_path, "", "", ""))
     if len(parts) >= 3 and parts[0].casefold() == "match" and parts[1].casefold() == "tennis":
+        if re.fullmatch(r"[A-Za-z0-9]{8}", parts[2]):
+            clean_path = "/" + "/".join(parts[:3]) + "/"
+            return urlunparse(("https", "www.flashscore.com", clean_path, "", "", ""))
         match_id = str(parse_qs(parsed.query).get("mid", [""])[0] or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9]+", match_id):
             raise ValueError("A Flashscore single-match link must include its mid match ID.")
@@ -97,6 +100,9 @@ def is_single_match_url(value: str) -> bool:
 def flashscore_match_id(value: str) -> str:
     if not is_single_match_url(value):
         return ""
+    parts = [part for part in urlparse(value).path.split("/") if part]
+    if len(parts) >= 3 and re.fullmatch(r"[A-Za-z0-9]{8}", parts[2]):
+        return parts[2]
     return str(parse_qs(urlparse(value).query).get("mid", [""])[0] or "").strip()
 
 
