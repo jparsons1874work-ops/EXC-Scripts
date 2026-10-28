@@ -170,6 +170,7 @@ DECIMAL_LEGACY_READY_ROOT_SELECTORS = (
 )
 DECIMAL_HEADLESS = True
 DECIMAL_WAIT_SECONDS = 8
+DECIMAL_FIXTURE_WAIT_SECONDS = 60
 DECIMAL_QUICK_WAIT_SECONDS = 2
 CHROME_BINARY_CANDIDATES = (
     "google-chrome",
@@ -1868,7 +1869,7 @@ def wait_for_decimal_legacy_rows_via_js(
     verbose: bool,
     target_section_override: str | None = None,
 ) -> dict[str, object]:
-    """Wait for Decimal Legacy Developer rows to become available."""
+    """Wait for parseable fixtures, not toolbar elements or unpopulated rows."""
     payload: dict[str, object] = {}
 
     def poll(current_driver: WebDriver) -> bool:
@@ -1879,21 +1880,24 @@ def wait_for_decimal_legacy_rows_via_js(
             verbose,
             target_section_override,
         )
-        return (
-            bool(payload.get("allRowsCount"))
-            or bool(payload.get("candidateRowsCount"))
-            or bool(payload.get("todayRowsCount"))
-            or bool(payload.get("tomorrowRowsCount"))
-            or bool(payload.get("inPlayRowsCount"))
-            or bool(payload.get("thisMonthRowsCount"))
-            or bool(payload.get("nextMonthRowsCount"))
-            or bool(payload.get("beyondRowsCount"))
+        rows = [
+            *(payload.get("preferred_fixtures") or []),
+            *(payload.get("all_fixtures") or []),
+            *(payload.get("candidate_fixtures") or []),
+        ]
+        if target_section_override == "upcoming":
+            return bool(build_decimal_legacy_upcoming_fixtures_from_rows(rows, target_day, False))
+        return any(
+            parse_decimal_legacy_fixture_payload(dict(row), target_day, False) is not None
+            for row in rows
         )
 
     try:
         WebDriverWait(driver, timeout).until(poll)
-    except TimeoutException as exc:
-        raise RuntimeError("Decimal Legacy Developer fixture sections could not be found.") from exc
+    except TimeoutException:
+        # Let the caller report the failed scrape and save the final page/debug
+        # artifacts instead of discarding the last snapshot on a slow/empty page.
+        verbose_log(verbose, f"Decimal fixtures did not become ready within {timeout}s; inspecting final snapshot")
     return payload
 
 
@@ -1937,7 +1941,7 @@ def open_decimal_legacy_developer(
     payload = wait_for_decimal_legacy_rows_via_js(
         driver,
         target_day,
-        DECIMAL_WAIT_SECONDS,
+        DECIMAL_FIXTURE_WAIT_SECONDS,
         verbose,
         target_section_override,
     )
