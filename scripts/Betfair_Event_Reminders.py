@@ -380,7 +380,7 @@ def is_winner_like_market_type(market_type_code: str) -> bool:
 
 def rugby_competition_blacklist_reason(reminder: EventReminder) -> str:
     sport = normalize_text(reminder.sport)
-    competition = normalize_text(reminder.competition_name.replace("'", "").replace("’", ""))
+    competition = normalize_text(reminder.competition_name.replace("'", "").replace("'", ""))
     if competition and competition in BLACKLISTED_RUGBY_COMPETITIONS.get(sport, frozenset()):
         return f"rugby_competition:{competition}"
     return ""
@@ -1200,7 +1200,7 @@ def list_market_catalogues_adaptive(
     max_split_depth: int,
 ) -> list[Any]:
     try:
-        return list_market_catalogues_once(
+        catalogues = list_market_catalogues_once(
             client,
             event_type_id,
             start_utc,
@@ -1208,6 +1208,10 @@ def list_market_catalogues_adaptive(
             market_type_codes=market_type_codes,
             market_countries=market_countries,
         )
+        if len(catalogues) < 1000:
+            return catalogues
+        if depth >= max_split_depth:
+            raise RuntimeError("Market catalogue still reaches the 1000-result limit after bounded splits")
     except Exception as exc:
         if not is_too_much_data_error(exc) or depth >= max_split_depth:
             raise
@@ -1215,7 +1219,7 @@ def list_market_catalogues_adaptive(
     midpoint = start_utc + (end_utc - start_utc) / 2
     label = sport_name or f"eventTypeId={event_type_id}"
     log(
-        f"{label}: TOO_MUCH_DATA for {format_utc(start_utc)} -> {format_utc(end_utc)}; "
+        f"{label}: TOO_MUCH_DATA or catalogue result limit for {format_utc(start_utc)} -> {format_utc(end_utc)}; "
         "retrying as two smaller catalogue windows."
     )
     left = list_market_catalogues_adaptive(
@@ -1272,7 +1276,9 @@ def list_market_catalogues(
 
 def api_market_type_filter_for_sport(sport_name: str, rule: str) -> tuple[str, ...] | None:
     if sport_name == "Cricket":
-        return (TO_WIN_THE_TOSS,)
+        # Use the local type/name selector: filtering here prevents its name
+        # fallback from ever seeing toss markets with an unexpected type code.
+        return None
     if sport_name in {"Athletics", "Politics", "Cycling", "Golf"}:
         return None
     if rule == SPORT_RULE_WINNER_MARKETS:
@@ -1295,7 +1301,10 @@ def list_sport_market_catalogues(
             event_type_id,
             window,
             market_type_codes=api_market_type_filter_for_sport(sport_name, rule),
-            market_countries=market_countries,
+            # A positive country allowlist silently drops uncategorised events.
+            # Cricket is small enough to fetch all markets; the shared blacklist
+            # still rejects AU/NZ and Australian-wallet markets before scheduling.
+            market_countries=None if sport_name == "Cricket" else market_countries,
             sport_name=sport_name,
         )
     except Exception as exc:

@@ -226,7 +226,10 @@ journalctl -u betfair-scripts -f
 
 ### Betfair event reminders timer
 
-The reminders scan runs hourly from a separate systemd timer in Europe/London time.
+The reminders scan runs every five minutes from a separate systemd timer in Europe/London time.
+Cricket discovery includes events without a country code and applies toss type/name
+selection locally. AU/NZ and Australian-wallet exclusions still apply before scheduling.
+Catalogue responses reaching the 1,000-market cap are split into smaller time windows.
 Every launch scans the next 72 hours from the start of that hour. The
 shared reminder state file prevents an event found in overlapping scans from being
 scheduled in Slack more than once. If Betfair moves an event time, the scan removes the

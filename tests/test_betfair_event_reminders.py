@@ -756,10 +756,9 @@ class BetfairEventReminderTests(unittest.TestCase):
         self.assertIsNone(reminders.api_market_type_filter_for_sport("Cycling", reminders.SPORT_RULE_WINNER_MARKETS))
         self.assertIsNone(reminders.api_market_type_filter_for_sport("Golf", reminders.SPORT_RULE_WINNER_MARKETS))
 
-    def test_cricket_catalogue_uses_api_side_toss_market_filter(self) -> None:
-        self.assertEqual(
+    def test_cricket_catalogue_allows_local_toss_name_fallback(self) -> None:
+        self.assertIsNone(
             reminders.api_market_type_filter_for_sport("Cricket", reminders.SPORT_RULE_CRICKET_TOSS),
-            (reminders.TO_WIN_THE_TOSS,),
         )
 
     def test_cycling_winner_reminder_is_five_minutes_before_start_and_dedupes_by_market_id(self) -> None:

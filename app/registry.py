@@ -129,7 +129,7 @@ SCRIPT_REGISTRY: tuple[ScriptSpec, ...] = (
     script(
         "Betfair Event Reminders",
         "Reminders",
-        "Runs hourly and schedules Slack reminders for selected Betfair sports events.",
+        "Schedules Slack reminders for selected Betfair sports events; timer runs every five minutes.",
         "scripts/Betfair_Event_Reminders.py",
         ("--pause-on-exit",),
         timeout_seconds=30 * 60,
